@@ -9,5 +9,9 @@ requests
 psutil
 cryptography
 pyffx
+scikit-learn
+scipy
+matplotlib
+seaborn
 pytest
-pytest-cov  
+pytest-cov
