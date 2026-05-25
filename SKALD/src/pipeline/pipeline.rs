@@ -33,6 +33,36 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     let (chunk_paths, rows_per_chunk) = split_csv_by_ram(&root.join("data"), &root.join("chunks"))?;
     log.info("chunking", &format!("{} chunk(s), ~{} rows/chunk", chunk_paths.len(), rows_per_chunk));
 
+    // ── Preprocess-only path (no k-anonymity configured) ─────────────────────
+    if !cfg.enable_k_anonymity {
+        log.info("preprocessing", &format!(
+            "k-anonymity disabled — preprocess-only: suppress={}, hash_salt={}, hash={}, mask={}, encrypt={}, charcloak={}, tokenize={}, fpe={}",
+            cfg.suppress.len(), cfg.hashing_with_salt.len(), cfg.hashing_without_salt.len(),
+            cfg.masking.len(), cfg.encrypt.len(), cfg.charcloak.len(),
+            cfg.tokenization.len(), cfg.fpe.len(),
+        ));
+        preprocess_chunks(&chunk_paths, &cfg)?;
+        log.info("preprocessing", "Preprocessing complete");
+
+        ensure_output_dir(&output_dir_path)?;
+        let final_output_path = output_dir_path.join(&cfg.output_path);
+        merge_chunks_to_output(&chunk_paths, &final_output_path)?;
+        log.info("output", &format!("Preprocess-only output written to {}", final_output_path.display()));
+
+        return Ok(StatusPayload {
+            status: "success".to_string(),
+            phase: Some("done".to_string()),
+            outputs: Some(json!({
+                "pass": "preprocess_only",
+                "chunk_count": chunk_paths.len(),
+                "final_output_path": final_output_path.display().to_string(),
+                "sample_generalized_rows": read_csv_sample(&final_output_path.display().to_string(), 10),
+            })),
+            error: None,
+            log_file: "output/pipeline.log".to_string(),
+        });
+    }
+
     // ── Preprocessing (pass2 and no_bounds only) ─────────────────────────────
     if pass != "pass1" {
         log.info("preprocessing", &format!(
@@ -209,6 +239,34 @@ fn read_csv_sample(path: &str, n: usize) -> serde_json::Value {
         rows.push(serde_json::Value::Object(obj));
     }
     serde_json::Value::Array(rows)
+}
+
+/// Concatenate chunk CSVs into a single output file (header from first chunk, data from all).
+fn merge_chunks_to_output(chunks: &[std::path::PathBuf], out_path: &std::path::Path) -> Result<(), PipelineError> {
+    use std::io::{BufRead, Write};
+    let mut out = std::io::BufWriter::new(fs::File::create(out_path).map_err(|e| {
+        crate::pipeline::bootstrap::validation("IO_ERROR", &e.to_string(), "merge_chunks")
+    })?);
+    let mut header_written = false;
+    for chunk in chunks {
+        let f = match fs::File::open(chunk) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut lines = std::io::BufReader::new(f).lines();
+        if let Some(Ok(header)) = lines.next() {
+            if !header_written {
+                writeln!(out, "{}", header).ok();
+                header_written = true;
+            }
+        }
+        for line in lines {
+            if let Ok(l) = line {
+                writeln!(out, "{}", l).ok();
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_parameter_grid_table(grid: &[GridEntry], output_dir: &std::path::Path) {

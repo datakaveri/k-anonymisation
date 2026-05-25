@@ -510,8 +510,11 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         }
     }
 
+    let has_k_anonymize = section.get("k_anonymize").is_some();
+    let has_qis = !numerical_qis.is_empty() || !categorical_qis.is_empty();
+
     Ok(RuntimeConfig {
-        enable_k_anonymity: true,
+        enable_k_anonymity: has_k_anonymize && has_qis,
         pass,
         k: if k <= 0 { 0 } else { k },
         suppression_limit,

@@ -64,3 +64,5 @@ RELEASE_NOTES.md
 error_codes.txt
 
 .codex
+
+tests/
