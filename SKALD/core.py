@@ -406,6 +406,199 @@ def run_pipeline(
 
 
 # ==================================================================
+# IN-MEMORY API  (adapter / library use)
+# ==================================================================
+
+def _preprocess_df(df: pd.DataFrame, config) -> pd.DataFrame:
+    """Apply all configured preprocess steps to a DataFrame in-memory."""
+    if config.suppress:
+        df = suppress(df, config.suppress)
+    if config.hashing_with_salt or config.hashing_without_salt:
+        df = hash_columns(df, config.hashing_with_salt, config.hashing_without_salt)
+    if config.masking:
+        df = mask_columns(df, config.masking)
+    if config.charcloak:
+        df = charcloak_columns(df, config.charcloak)
+    if config.tokenization:
+        df = tokenize_columns(df, config.tokenization, config.output_directory)
+    if config.fpe:
+        df = fpe_encrypt_columns(df, config.fpe, config.output_directory)
+    if config.encrypt:
+        df = encrypt_columns(df, config.encrypt, config.output_directory)
+    return df
+
+
+def _encode_df_in_memory(
+    df: pd.DataFrame,
+    numerical_columns_info: list,
+) -> tuple:
+    """
+    Build encoding_maps and dynamic_min_max from a single in-memory DataFrame,
+    then apply the same transformations that encode_numerical_columns + chunk
+    processing would do from disk.
+
+    Returns (df_processed, encoding_maps, dynamic_min_max).
+    """
+    import numpy as np
+
+    encoding_maps = {}
+    dynamic_min_max = {}
+    df = df.copy()
+
+    for info in numerical_columns_info:
+        col     = info["column"]
+        encode  = bool(info.get("encode", False))
+        scale   = bool(info.get("scale", False))
+        s       = int(info.get("s", 0)) if scale else 0
+        dtype   = info.get("type", "int")
+
+        if col not in df.columns:
+            raise KeyError(f"Column '{col}' not found in records")
+
+        raw = df[col].replace(r"^\s*$", np.nan, regex=True)
+        numeric = pd.to_numeric(raw, errors="coerce")
+
+        col_min = float(numeric.min())
+        col_max = float(numeric.max())
+        dynamic_min_max[col] = [col_min, col_max]
+
+        if encode:
+            scaled = np.floor(numeric / (10 ** s)).astype("Int64") if scale else numeric.astype("Int64")
+            unique_vals = sorted(scaled.dropna().unique().tolist())
+            enc_map = {v: i for i, v in enumerate(unique_vals)}
+            enc_col = f"{col}_scaled_encoded" if scale else f"{col}_encoded"
+            df[enc_col] = scaled.map(enc_map)
+            encoding_maps[col] = {"encoding_map": enc_map, "scale": scale, "s": s}
+        else:
+            df[col] = numeric
+
+    return df, encoding_maps, dynamic_min_max
+
+
+def run_on_records(records: list, config) -> list:
+    """
+    Run the full SKALD pipeline on an in-memory list of dicts.
+
+    No file I/O — all steps (preprocess + optional k-anon) execute in RAM.
+    The config object is a ``Config`` instance from ``config_validation``.
+
+    Returns a list of dicts with the same keys (minus suppressed columns,
+    plus generalized QI columns if k-anon is enabled).
+    """
+    import numpy as np
+    from SKALD.generalization_ri import OLA_1
+    from SKALD.generalization_rf import OLA_2
+    from SKALD.build_QI import build_quasi_identifiers
+
+    if not records:
+        return records
+
+    df = pd.DataFrame(records)
+
+    # ── Preprocess ────────────────────────────────────────────────
+    try:
+        df = _preprocess_df(df, config)
+    except Exception as e:
+        raise SKALDError(
+            code="PREPROCESSING_FAILED",
+            message="Preprocessing failed",
+            details=str(e),
+        )
+
+    if not config.enable_k_anonymity:
+        return df.to_dict(orient="records")
+
+    # ── K-anonymity (in-memory) ───────────────────────────────────
+    categorical_columns = [q.column for q in config.quasi_identifiers.categorical]
+    numerical_columns_info = [
+        {"column": q.column, "scale": q.scale, "s": q.s, "encode": q.encode, "type": q.type}
+        for q in config.quasi_identifiers.numerical
+    ]
+
+    # Split: rows with any null/empty in a QI column bypass k-anon and pass through unchanged.
+    qi_cols = [i["column"] for i in numerical_columns_info] + categorical_columns
+    existing_qi_cols = [c for c in qi_cols if c in df.columns]
+    null_mask = df[existing_qi_cols].apply(
+        lambda col: col.isna() | (col.astype(str).str.strip() == "")
+    ).any(axis=1)
+
+    df_skip = df[null_mask].copy()      # rows with incomplete QIs — passed through as-is
+    df = df[~null_mask].copy()          # rows eligible for k-anon
+
+    if df.empty:
+        logger.warning("All records have null/empty QI values — k-anonymity skipped for entire batch")
+        return pd.concat([df, df_skip], ignore_index=True).to_dict(orient="records")
+
+    if null_mask.any():
+        logger.info("Skipping k-anonymity for %d record(s) with null/empty QI values", null_mask.sum())
+
+    try:
+        df, encoding_maps, dynamic_min_max = _encode_df_in_memory(df, numerical_columns_info)
+    except Exception as e:
+        raise SKALDError(code="ENCODING_FAILED", message="Numerical encoding failed", details=str(e))
+
+    try:
+        quasi_identifiers, _ = build_quasi_identifiers(
+            numerical_columns_info, categorical_columns, encoding_maps, dynamic_min_max
+        )
+    except Exception as e:
+        raise SKALDError(code="CONFIG_INVALID", message="Failed to build quasi-identifiers", details=str(e))
+
+    try:
+        available_ram = psutil.virtual_memory().available
+        max_eq = max(1, available_ram // 32)
+        ola_1 = OLA_1(quasi_identifiers, 1, max_eq, config.size or {})
+        ola_1.build_tree()
+        ola_1.find_smallest_passing_ri()
+        initial_ri = ola_1.get_optimal_ri()
+    except Exception as e:
+        raise SKALDError(code="GENERALIZATION_FAILED", message="OLA_1 failed", details=str(e))
+
+    try:
+        ola_2 = OLA_2(
+            quasi_identifiers,
+            len(df),
+            config.suppression_limit,
+            config.size or {},
+            config.sensitive_parameter,
+            enable_l_diversity=config.enable_l_diversity,
+        )
+        ola_2.build_tree(initial_ri)
+        histogram = ola_2.process_chunk(df, initial_ri)
+        final_rf = ola_2.get_final_binwidths(histogram, config.k, config.l if config.enable_l_diversity else 1)
+    except Exception as e:
+        raise SKALDError(code="GENERALIZATION_FAILED", message="OLA_2 failed", details=str(e))
+
+    try:
+        s_list = [int(info.get("s", 0)) if info.get("scale") else 0 for info in numerical_columns_info]
+        generalized = ola_2.generalize_chunk(df, final_rf, s_list)
+        for info in numerical_columns_info:
+            base = info["column"]
+            for suffix in ("_scaled_encoded", "_scaled", "_encoded"):
+                if base + suffix in generalized.columns:
+                    generalized.drop(columns=[base + suffix], inplace=True)
+    except Exception as e:
+        raise SKALDError(code="GENERALIZATION_FAILED", message="Generalization failed", details=str(e))
+
+    # Recombine: generalized rows first, skipped rows appended at the end
+    if df_skip.empty:
+        return generalized.to_dict(orient="records")
+    result = pd.concat([generalized, df_skip], ignore_index=True)
+    return result.to_dict(orient="records")
+
+
+def run_on_records_safe(records: list, config) -> dict:
+    """Like run_on_records but always returns a status dict — never raises."""
+    try:
+        result = run_on_records(records, config)
+        return {"status": "success", "records": result}
+    except SKALDError as e:
+        return {"status": "error", "error": e.to_dict()}
+    except Exception as e:
+        return {"status": "error", "error": wrap_internal_error(e).to_dict()}
+
+
+# ==================================================================
 # SAFE WRAPPER (UI ENTRY)
 # ==================================================================
 def run_pipeline_safe(config_path: str) -> dict:

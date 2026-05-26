@@ -77,3 +77,4 @@ bin/
 lib64
 *.cfg
 SKALD/temp/
+SKALD/target

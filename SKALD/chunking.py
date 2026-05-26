@@ -42,20 +42,38 @@ def split_csv_by_ram(data_dir="data"):
         logger.error("Failed clearing '%s': %s", chunks_dir, e)
         raise OSError(f"Failed clearing '{chunks_dir}': {e}")
 
-    # --- Find CSV file safely ---
+    # --- Find CSV or JSON file safely ---
     try:
-        csv_files = [f for f in os.listdir(data_dir) if f.lower().endswith(".csv")]
+        all_files = os.listdir(data_dir)
+        csv_files  = [f for f in all_files if f.lower().endswith(".csv")]
+        json_files = [f for f in all_files if f.lower().endswith(".json")]
     except Exception as e:
         raise OSError(f"Cannot list files in '{data_dir}': {e}")
 
-    if not csv_files:
-        raise FileNotFoundError(f"No CSV file found inside '{data_dir}'")
-    if len(csv_files) > 1:
+    if not csv_files and not json_files:
+        raise FileNotFoundError(f"No CSV or JSON file found inside '{data_dir}'")
+    if len(csv_files) + len(json_files) > 1:
+        found = csv_files + json_files
         raise ValueError(
-            f"More than one CSV found in '{data_dir}'. Expected exactly one. Found: {csv_files}"
+            f"More than one data file found in '{data_dir}'. Expected exactly one. Found: {found}"
         )
 
-    input_csv = os.path.join(data_dir, csv_files[0])
+    # Normalise: convert JSON → CSV in-memory so the rest of the function stays unchanged
+    if json_files:
+        import json as _json
+        json_path = os.path.join(data_dir, json_files[0])
+        try:
+            with open(json_path) as _f:
+                raw = _json.load(_f)
+        except Exception as e:
+            raise RuntimeError(f"Failed reading JSON '{json_path}': {e}")
+        if not isinstance(raw, list):
+            raise ValueError(f"JSON file '{json_files[0]}' must contain a list of objects")
+        converted_csv = os.path.join(data_dir, "_converted.csv")
+        pd.DataFrame(raw).to_csv(converted_csv, index=False)
+        input_csv = converted_csv
+    else:
+        input_csv = os.path.join(data_dir, csv_files[0])
     #print(f"Detected CSV: {input_csv}")
 
     # --- Detect RAM safely ---

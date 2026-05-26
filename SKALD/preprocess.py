@@ -96,19 +96,18 @@ def hash_columns(
         salt = generate_global_salt() if columns_with_salt else None
         if col not in dataframe.columns:
             raise KeyError(f"Column '{col}' not found for salted hashing")
-        dataframe[col] = dataframe[col].astype(str).apply(
-            lambda x: hashlib.sha256((salt + x).encode()).hexdigest()
-            if x.lower() != "nan" else x
+        dataframe[col] = dataframe[col].apply(
+            lambda x: x if _is_nan_like(x) or str(x).strip() == ""
+            else hashlib.sha256((salt + str(x)).encode()).hexdigest()
         )
         logger.info("Applied salted hashing to column: %s", col)
 
     for col in columns_without_salt:
         if col not in dataframe.columns:
             raise KeyError(f"Column '{col}' not found for hashing")
-
-        dataframe[col] = dataframe[col].astype(str).apply(
-            lambda x: hashlib.sha256(x.encode()).hexdigest()
-            if x.lower() != "nan" else x
+        dataframe[col] = dataframe[col].apply(
+            lambda x: x if _is_nan_like(x) or str(x).strip() == ""
+            else hashlib.sha256(str(x).encode()).hexdigest()
         )
         logger.info("Applied hashing to column: %s", col)
     return dataframe
