@@ -62,3 +62,7 @@ RELEASE_NOTES.md
 
 # Error code scratch files
 error_codes.txt
+
+.codex
+
+tests/

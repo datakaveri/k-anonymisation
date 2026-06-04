@@ -1,0 +1,147 @@
+{
+  "operations": [
+    "SKALD",
+    "k-anonymity",
+    "suppress",
+    "hash",
+    "mask",
+    "tokenization",
+    "encrypt",
+    "charcloak"
+  ],
+  "data_type": "SyntheticIndianProfiles",
+  "SyntheticIndianProfiles": {
+    "output_path": "generalized_synthetic_indian_profiles.csv",
+    "output_directory": "output",
+    "log_file": "log.txt",
+
+    "suppress": [
+      "Full Name"
+    ],
+
+    "hashing_with_salt": [
+      "Street Address"
+    ],
+
+    "masking": [
+      {
+        "column": "Aadhaar",
+        "masking_char": "*",
+        "apply_order": ["characters"],
+        "characters_to_mask": [1, 2, 3, 4]
+      },
+      {
+        "column": "Phone",
+        "masking_char": "#",
+        "apply_order": ["regex"],
+        "characters_to_mask": [2],
+        "regex_patterns": [
+          {
+            "type": "after",
+            "delimiter": "+91",
+            "regex": "(?<=\\+91)\\d{10}",
+            "length" : 4
+          }
+        ]
+      },
+      {
+        "column": "Email",
+        "masking_char": "*",
+        "characters_to_mask": [2],
+        "apply_order": ["characters", "regex"],
+        "regex_patterns": [
+          {
+            "type": "in_between",
+            "start": "*",
+            "end": "@",
+            "regex": "(?<=\\*).+?(?=@)",
+            "masking_char": "*"
+          },
+          {
+            "type": "after",
+            "delimiter": "@",
+            "length": 1,
+            "regex": "(?<=@).+",
+            "masking_char": "#"
+          },
+          {
+            "type": "before",
+            "delimiter": ".",
+            "length": 1,
+            "regex": "^.+(?=\\.)",
+            "masking_char": "#"
+          }
+        ]
+      }
+    ],
+
+    "tokenization": [
+      {
+        "column": "Customer ID",
+        "prefix": "TK-",
+        "digits": 8
+      }
+    ],
+
+    "charcloak": [
+      "PAN ID"
+    ],
+
+    "encrypt": [
+      {
+        "IFSC Code": {
+          "format_preserving": true
+        }
+      },
+      {
+        "UPI ID": {
+          "format_preserving": false
+        }
+      }
+    ],
+
+    "quasi_identifiers": {
+      "categorical": [
+        {
+          "column": "Blood Group"
+        }
+      ],
+      "numerical": [
+        {
+          "column": "PIN Code",
+          "encode": false,
+          "scale": false,
+          "type": "int"
+        },
+        {
+          "column": "Age",
+          "encode": false,
+          "scale": false,
+          "type": "int"
+        }
+      ]
+    },
+
+    "fixed_bins": {
+      "Age": [
+        {"from": 0,  "to": 17},
+        {"from": 18, "to": 35},
+        {"from": 36, "to": 60},
+        {"from": 61, "to": 120}
+      ]
+    },
+
+    "size": {
+      "PIN Code": 2,
+      "Age": 2
+    },
+
+    "k_anonymize": {
+      "k": 10
+    },
+
+    "enable_l_diversity": false,
+    "sensitive_parameter": "Disease",
+    "suppression_limit": 0.01
+  }
+}

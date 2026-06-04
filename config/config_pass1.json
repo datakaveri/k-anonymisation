@@ -1,16 +1,16 @@
 {
   "data_type": "test",
   "test": {
-    "pass": "pass2",
+    "pass": "pass1",
     "output_path": "generalized_test.csv",
     "output_directory": "output",
     "suppression_limit": 0.05,
 
-    "suppress": ["Customer ID", "Full Name", "Street Address"],
-    "hashing_with_salt": ["Aadhaar", "PAN ID", "Bank Account Number"],
+    "suppress": [],
+    "hashing_with_salt": [],
     "hashing_without_salt": [],
     "masking": [],
-    "encrypt": ["Email", "Phone", "IFSC Code", "UPI ID"],
+    "encrypt": [],
     "charcloak": [],
     "tokenization": [],
     "fpe": [],
@@ -42,8 +42,6 @@
       }
     },
 
-    "size": { "Age": 2, "PIN Code": 10 },
-
-    "k_anonymize": { "k": 50 }
+    "size": { "Age": 2, "PIN Code": 10 }
   }
 }

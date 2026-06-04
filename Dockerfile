@@ -16,6 +16,7 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
 # rust:alpine ships Alpine Linux — far fewer CVEs than Debian slim
 FROM rust:1.85-alpine AS builder
+LABEL org.opencontainers.image.source=https://github.com/datakaveri/k-anonymisation-SKALD
 
 # musl-dev provides headers; gcc on Alpine already targets musl natively —
 # no cross-compiler needed. Register the musl target with rustup.

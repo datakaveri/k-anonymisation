@@ -4,7 +4,7 @@ use super::anonymization::{
 use super::bootstrap::{find_first_json_config, parse_runtime_config, split_csv_by_ram};
 use super::pipeline::run_pipeline;
 use super::preprocess::preprocess_chunks;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -116,6 +116,7 @@ fn generalize_marks_only_qi_columns() {
         is_categorical: false,
         min_value: Some(20.0),
         max_value: Some(21.0),
+        interval_hierarchy: None,
     }];
 
     generalize_and_write_outputs(
@@ -183,15 +184,17 @@ fn ola1_scales_initial_ri_when_estimated_eq_too_high() {
             is_categorical: false,
             min_value: Some(0.0),
             max_value: Some(99.0),
+            interval_hierarchy: None,
         },
         QuasiIdentifierLite {
             column_name: "Zip".to_string(),
             is_categorical: false,
             min_value: Some(10000.0),
             max_value: Some(10099.0),
+            interval_hierarchy: None,
         },
     ];
-    let mut size = BTreeMap::new();
+    let mut size = HashMap::new();
     size.insert("Age".to_string(), 2);
     size.insert("Zip".to_string(), 2);
     let ri = find_ola1_initial_ri(&qis, 1, 400, &size).expect("ola1");
@@ -206,15 +209,16 @@ fn ola2_picks_rf_that_meets_suppression_limit() {
         is_categorical: false,
         min_value: Some(0.0),
         max_value: Some(3.0),
+        interval_hierarchy: None,
     }];
 
-    let mut hist = BTreeMap::new();
+    let mut hist = HashMap::new();
     hist.insert(vec![0], 1);
     hist.insert(vec![1], 1);
     hist.insert(vec![2], 1);
     hist.insert(vec![3], 1);
 
-    let mut size = BTreeMap::new();
+    let mut size = HashMap::new();
     size.insert("Age".to_string(), 2);
 
     let (rf, _dm, _eq) = find_ola2_best_rf(&qis, &hist, &[1], &size, 2, 0.0, 4).expect("ola2");

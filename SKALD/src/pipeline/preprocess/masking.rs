@@ -165,6 +165,17 @@ pub(super) struct RegexPatternConfig {
     pub(super) length: Option<usize>,
     /// Optional group-level masking: pairs of `(capture_group_index, "full"|"partial")`.
     pub(super) mask_groups: Vec<(usize, String)>,
+    /// Semantic type (`"before"`, `"after"`, `"in_between"`) — stored regardless
+    /// of whether a literal `regex` field is also present, so delimiter-length
+    /// masking fires even when the kind is `Literal`.
+    pub(super) pattern_type: Option<String>,
+    /// Delimiter string for `"before"` / `"after"` length masking — stored
+    /// alongside `kind` for the same reason.
+    pub(super) delimiter: Option<String>,
+    /// Start anchor for `"in_between"` patterns (used in derived fallback).
+    pub(super) start: Option<String>,
+    /// End anchor for `"in_between"` patterns (used in derived fallback).
+    pub(super) end: Option<String>,
 }
 
 /// Full masking configuration for one CSV column.
@@ -265,17 +276,34 @@ pub(super) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, P
                 }
             }
 
+            // Extract semantic info unconditionally — needed for length masking and
+            // derived fallback even when a literal "regex" field is also present.
+            let pattern_type_val = pobj.get("type").and_then(Value::as_str).map(|s| s.to_lowercase());
+            let delimiter_val    = pobj.get("delimiter").and_then(Value::as_str).map(|s| s.to_string());
+            let start_val        = pobj.get("start").and_then(Value::as_str).map(|s| s.to_string());
+            let end_val          = pobj.get("end").and_then(Value::as_str).map(|s| s.to_string());
+
             let kind = if let Some(r) = pobj.get("regex").and_then(Value::as_str) {
                 RegexPatternKind::Literal(r.to_string())
             } else {
-                let pattern_type = pobj.get("type").and_then(Value::as_str).unwrap_or("").to_lowercase();
-                let delimiter    = pobj.get("delimiter").and_then(Value::as_str).map(|s| s.to_string());
-                let start        = pobj.get("start").and_then(Value::as_str).map(|s| s.to_string());
-                let end          = pobj.get("end").and_then(Value::as_str).map(|s| s.to_string());
-                RegexPatternKind::Derived { pattern_type, delimiter, start, end }
+                RegexPatternKind::Derived {
+                    pattern_type: pattern_type_val.clone().unwrap_or_default(),
+                    delimiter: delimiter_val.clone(),
+                    start: start_val.clone(),
+                    end: end_val.clone(),
+                }
             };
 
-            regex_patterns.push(RegexPatternConfig { kind, masking_char: pat_masking_char, length, mask_groups });
+            regex_patterns.push(RegexPatternConfig {
+                kind,
+                masking_char: pat_masking_char,
+                length,
+                mask_groups,
+                pattern_type: pattern_type_val,
+                delimiter: delimiter_val,
+                start: start_val,
+                end: end_val,
+            });
         }
     }
 
@@ -313,23 +341,25 @@ pub(super) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, P
 /// * `start` — start anchor (used for `"in_between"`).
 /// * `end` — end anchor (used for `"in_between"`; `"$"` means end-of-string).
 pub(super) fn derive_regex(pattern_type: &str, delimiter: Option<&str>, start: Option<&str>, end: Option<&str>) -> String {
+    // All patterns use capturing group 1 for the text to mask — avoids lookbehind
+    // assertions that the Rust `regex` crate does not support.
     match pattern_type {
         "before" => {
             if let Some(d) = delimiter {
-                return format!("^.+?(?={})", regex::escape(d));
+                return format!("^(.+?){}", regex::escape(d));
             }
         }
         "after" => {
             if let Some(d) = delimiter {
-                return format!("(?<={}).+$", regex::escape(d));
+                return format!("{}(.+)$", regex::escape(d));
             }
         }
         "in_between" => {
             if let (Some(s), Some(e)) = (start, end) {
                 if e == "$" {
-                    return format!("(?<={}).+$", regex::escape(s));
+                    return format!("{}(.+)$", regex::escape(s));
                 }
-                return format!("(?<={}).+?(?={})", regex::escape(s), regex::escape(e));
+                return format!("{}(.+?){}", regex::escape(s), regex::escape(e));
             }
         }
         _ => {}
@@ -410,14 +440,10 @@ pub(super) fn apply_delimiter_length_mask(text: &str, pattern_type: &str, delimi
 pub(super) fn apply_regex_pattern(value: &str, pat: &RegexPatternConfig, _column: &str) -> String {
     let mask_char = pat.masking_char;
 
-    // 1. Delimiter-length masking (takes priority over regex when `length` is set)
+    // 1. Delimiter-length masking (fires regardless of kind, uses stored semantic fields)
     if let Some(length) = pat.length {
-        let (pattern_type, delimiter) = match &pat.kind {
-            RegexPatternKind::Derived { pattern_type, delimiter, .. } => {
-                (pattern_type.as_str(), delimiter.as_deref().unwrap_or(""))
-            }
-            _ => ("", ""),
-        };
+        let pattern_type = pat.pattern_type.as_deref().unwrap_or("");
+        let delimiter    = pat.delimiter.as_deref().unwrap_or("");
         if !delimiter.is_empty() && (pattern_type == "before" || pattern_type == "after") {
             let (result, changed) = apply_delimiter_length_mask(value, pattern_type, delimiter, length, mask_char);
             if changed {
@@ -426,7 +452,8 @@ pub(super) fn apply_regex_pattern(value: &str, pat: &RegexPatternConfig, _column
         }
     }
 
-    // 2. Build the regex string
+    // 2. Build regex string; track whether this is a derived (capturing-group) pattern
+    let mut is_derived = matches!(&pat.kind, RegexPatternKind::Derived { .. });
     let regex_str: String = match &pat.kind {
         RegexPatternKind::Literal(r) => r.clone(),
         RegexPatternKind::Derived { pattern_type, delimiter, start, end } => {
@@ -438,47 +465,38 @@ pub(super) fn apply_regex_pattern(value: &str, pat: &RegexPatternConfig, _column
         return value.to_string();
     }
 
-    // 3. Compile — fall back to derived if literal is invalid
+    // 3. Compile; when a literal regex fails (e.g. lookbehind), fall back to derived
     let compiled = match Regex::new(&regex_str) {
         Ok(r) => r,
         Err(_) => {
-            // Try derived pattern as fallback (mirrors Python warning + fallback)
-            if let RegexPatternKind::Literal(_) = &pat.kind {
-                // already a literal, nothing to fall back to
+            let pt      = pat.pattern_type.as_deref().unwrap_or("");
+            let derived = derive_regex(pt, pat.delimiter.as_deref(), pat.start.as_deref(), pat.end.as_deref());
+            if derived.is_empty() {
                 return value.to_string();
             }
-            return value.to_string();
+            match Regex::new(&derived) {
+                Ok(r) => { is_derived = true; r }
+                Err(_) => return value.to_string(),
+            }
         }
     };
 
-    // 4. Apply — group masking or full-match masking
+    // 4. Apply — explicit group masking, auto group-1 for derived patterns, or full-match
     if !pat.mask_groups.is_empty() {
         apply_regex_group_mask(value, &compiled, &pat.mask_groups, mask_char)
+    } else if is_derived {
+        // Derived patterns capture exactly what should be masked in group 1
+        let auto = [(1usize, "full".to_string())];
+        apply_regex_group_mask(value, &compiled, &auto, mask_char)
     } else {
         let mut result = String::with_capacity(value.len());
         let mut last = 0usize;
-        let mut replaced = 0usize;
         for m in compiled.find_iter(value) {
             result.push_str(&value[last..m.start()]);
             result.push_str(&mask_char.to_string().repeat(m.as_str().chars().count()));
             last = m.end();
-            replaced += 1;
         }
         result.push_str(&value[last..]);
-
-        // Data-adaptive fallback for in_between when no match found (mirrors Python)
-        if replaced == 0 {
-            if let RegexPatternKind::Derived { pattern_type, .. } = &pat.kind {
-                if pattern_type == "in_between" && value.contains(' ') {
-                    if let Ok(space_re) = Regex::new(r"(?<=\s).+$") {
-                        return space_re.replace_all(value, |m: &regex::Captures| {
-                            mask_char.to_string().repeat(m[0].chars().count())
-                        }).to_string();
-                    }
-                }
-            }
-        }
-
         result
     }
 }

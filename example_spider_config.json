@@ -1,0 +1,41 @@
+{
+  "epsilon": 1.0,
+  "n_samples": 5000,
+  "sensitive_columns": ["Disease"],
+
+  "operations": ["SKALD", "k-anonymity"],
+  "data_type": "SyntheticProfiles",
+  "SyntheticProfiles": {
+    "output_path": "generalized.csv",
+    "output_directory": "output",
+    "log_file": "log.txt",
+
+    "k_anonymize": {"k": 50},
+    "suppression_limit": 0.05,
+
+    "suppress": [
+      "Customer ID",
+      "Full Name",
+      "Date of Birth",
+      "Email",
+      "Phone",
+      "Aadhaar",
+      "PAN ID",
+      "Bank Account Number",
+      "IFSC Code",
+      "UPI ID",
+      "Street Address",
+      "PIN Code"
+    ],
+
+    "quasi_identifiers": {
+      "numerical": [
+        {"column": "Age", "type": "int"}
+      ],
+      "categorical": ["Gender", "Blood Group"]
+    },
+
+    "sensitive_parameter": "Disease",
+    "size": {"Age": 2}
+  }
+}

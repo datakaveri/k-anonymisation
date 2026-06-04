@@ -17,94 +17,28 @@ mod ola;
 mod generalization;
 
 pub use ola::{
+    build_interval_hierarchy,
     find_ola1_initial_ri,
     build_sparse_histogram,
     find_ola2_best_rf,
     find_ola2_best_rf_detailed,
     equivalence_class_stats,
+    compute_parameter_grid,
+    compute_k_optimal,
+    GridEntry,
+    IntervalHierarchy,
+    Ola2NodeScore,
+    Ola2SearchResult,
+    QuasiIdentifierLite,
+    SparseHist,
 };
 pub use generalization::generalize_and_write_outputs;
 
 use crate::pipeline::bootstrap::{split_csv_line_basic, validation, PipelineError, RuntimeConfig};
-use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-
-// ── Core data types ──────────────────────────────────────────────────────────
-
-/// Lightweight descriptor for a single quasi-identifier (QI) column.
-///
-/// Carries enough information for both OLA phases and the generalization step
-/// without retaining the full pipeline configuration.
-#[derive(Debug, Clone)]
-pub struct QuasiIdentifierLite {
-    /// The exact column name as it appears in the CSV header (may include
-    /// suffixes such as `_scaled` or `_encoded` for numerical columns).
-    pub column_name: String,
-    /// `true` for categorical QIs (e.g. "blood group", "gender", "profession"),
-    /// `false` for numerical QIs.
-    pub is_categorical: bool,
-    /// Global minimum value across all chunks — `None` for categorical QIs.
-    pub min_value: Option<f64>,
-    /// Global maximum value across all chunks — `None` for categorical QIs.
-    pub max_value: Option<f64>,
-}
-
-impl QuasiIdentifierLite {
-    /// Returns the inclusive integer range `[min, max]` as a float.
-    ///
-    /// Used to compute the number of buckets for numerical QIs.
-    /// Returns `1.0` for categorical QIs or when min/max are absent.
-    fn get_range(&self) -> f64 {
-        match (self.min_value, self.max_value) {
-            (Some(a), Some(b)) => (b - a + 1.0).max(1.0),
-            _ => 1.0,
-        }
-    }
-}
-
-/// Sparse histogram mapping generalized QI index-tuples to their record counts.
-///
-/// Each key is a `Vec<i64>` with one entry per QI:
-/// - **Numerical**: zero-based bucket index relative to `min_value` at `initial_ri` granularity.
-/// - **Categorical**: zero-based index into the sorted domain set.
-///
-/// Using a `BTreeMap` keeps iteration order deterministic across platforms.
-pub type SparseHist = BTreeMap<Vec<i64>, i64>;
-
-/// Score record for a single node evaluated during OLA-2 lattice search.
-///
-/// Serialized to JSON in the pipeline output so that analysts can inspect
-/// the top candidate nodes chosen by the algorithm.
-#[derive(Debug, Clone, Serialize)]
-pub struct Ola2NodeScore {
-    /// Generalization factors for each QI at this lattice node.
-    pub node: Vec<i64>,
-    /// DM* (Discernibility Metric) for this node — lower is better.
-    pub dm_star: i64,
-    /// Number of equivalence classes that satisfy k-anonymity.
-    pub num_equivalence_classes: i64,
-    /// Total records that would be suppressed at this node.
-    pub suppression_count: i64,
-}
-
-/// Full result of the OLA-2 binary lattice search.
-///
-/// Contains the winning generalization factors together with summary statistics
-/// and the top-5 candidate nodes so that callers can log or surface them.
-#[derive(Debug, Clone, Serialize)]
-pub struct Ola2SearchResult {
-    /// Generalization factors chosen as the best node.
-    pub best_rf: Vec<i64>,
-    /// DM* value of `best_rf`.
-    pub lowest_dm_star: i64,
-    /// Number of k-anonymous equivalence classes at `best_rf`.
-    pub num_equivalence_classes: i64,
-    /// Top-5 candidate nodes sorted by `(dm_star, suppression_count, -num_eq, node)`.
-    pub top_nodes: Vec<Ola2NodeScore>,
-}
 
 // ── Shared utility functions ─────────────────────────────────────────────────
 
@@ -223,11 +157,18 @@ pub fn build_quasi_identifiers(
 
     for qi in &cfg.numerical_qis {
         let (mn, mx) = dynamic_min_max.get(&qi.column).copied().unwrap_or((0.0, 0.0));
+        let interval_hierarchy = if let Some(iv) = cfg.qi_interval_constraints.get(&qi.column) {
+            let split = cfg.size_factors.get(&qi.column).copied().unwrap_or(2) as usize;
+            Some(build_interval_hierarchy(iv.clone(), split))
+        } else {
+            None
+        };
         out.push(QuasiIdentifierLite {
             column_name: qi.column.clone(),
             is_categorical: false,
             min_value: Some(mn),
             max_value: Some(mx),
+            interval_hierarchy,
         });
     }
 
@@ -237,6 +178,7 @@ pub fn build_quasi_identifiers(
             is_categorical: true,
             min_value: None,
             max_value: None,
+            interval_hierarchy: None,
         });
     }
 
