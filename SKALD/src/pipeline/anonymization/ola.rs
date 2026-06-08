@@ -179,6 +179,11 @@ impl QuasiIdentifierLite {
 
 pub type SparseHist = HashMap<Vec<i64>, i64>;
 
+/// Z-encoded histogram for the DIRECT flow.
+/// Entries are (z_value, count), sorted by z_value in ascending order.
+/// Every entry has count ≥ 1 and all z_values are strictly increasing.
+pub type ZHist = Vec<(i64, i64)>;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Ola2NodeScore {
     pub node: Vec<i64>,
@@ -187,12 +192,26 @@ pub struct Ola2NodeScore {
     pub suppression_count: i64,
 }
 
+/// One entry per node actually evaluated by the OLA-2 binary search.
+/// Nodes inferred via monotonicity propagation are NOT included — only nodes
+/// that triggered a real `merge_histogram` call.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeTrace {
+    pub node: Vec<i64>,
+    pub suppression_count: i64,
+    pub dm_star: i64,
+    pub num_equivalence_classes: i64,
+    pub passes: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Ola2SearchResult {
     pub best_rf: Vec<i64>,
     pub lowest_dm_star: i64,
     pub num_equivalence_classes: i64,
     pub top_nodes: Vec<Ola2NodeScore>,
+    /// Trace of every node directly evaluated (not inferred) during the search.
+    pub node_trace: Vec<NodeTrace>,
 }
 
 fn ceil_div_i64(a: i64, b: i64) -> i64 {
@@ -461,51 +480,68 @@ pub fn find_ola1_initial_ri(
     })
 }
 
-pub fn build_sparse_histogram(
+// ── Column-index resolution helper ───────────────────────────────────────────
+
+/// Reads the first chunk's CSV header and returns the column index for each QI,
+/// trying the QI's column name first and its base name (without encoding/scaling
+/// suffixes) as a fallback.
+fn resolve_col_indices(
+    first_chunk: &PathBuf,
+    qis: &[QuasiIdentifierLite],
+) -> Result<Vec<usize>, PipelineError> {
+    let f = fs::File::open(first_chunk)?;
+    let mut lines = BufReader::new(f).lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| validation("GENERALIZATION_FAILED", "chunk missing header", &first_chunk.display().to_string()))?
+        .map_err(|e| validation("GENERALIZATION_FAILED", "failed reading chunk header", &e.to_string()))?;
+    let headers = split_csv_line_basic(&header);
+    let mut out = Vec::with_capacity(qis.len());
+    for qi in qis {
+        let fallback = base_col_name(&qi.column_name);
+        let idx = headers
+            .iter()
+            .position(|h| h == &qi.column_name)
+            .or_else(|| headers.iter().position(|h| h == &fallback))
+            .ok_or_else(|| validation("DATA_COLUMN_MISSING", "Quasi-identifier column not found in CSV header", &qi.column_name))?;
+        out.push(idx);
+    }
+    Ok(out)
+}
+
+// ── Flow-selection pre-scan ───────────────────────────────────────────────────
+
+/// Single-pass scan over all chunks that produces the two inputs needed to
+/// decide the histogram-building strategy:
+///
+/// - **total record count** (all rows including those with invalid QI values;
+///   sufficient precision for the N·log₂N vs E decision rule).
+/// - **categorical domains** — for each QI position `i`, a sorted `Vec<String>`
+///   of every distinct value seen in that column.  Non-categorical positions
+///   contain an empty `Vec`.
+///
+/// Callers pass the returned domains directly to [`build_sparse_histogram`] or
+/// [`build_direct_histogram`] so those functions skip a redundant Pass-1 scan.
+pub fn scan_chunks_for_flow(
     chunk_paths: &[PathBuf],
     qis: &[QuasiIdentifierLite],
-    initial_ri: &[i64],
-) -> Result<(SparseHist, i64), PipelineError> {
-    if qis.len() != initial_ri.len() {
-        return Err(validation("GENERALIZATION_FAILED", "initial_ri length mismatch", "OLA-2"));
-    }
+) -> Result<(i64, Vec<Vec<String>>), PipelineError> {
+    let first = chunk_paths
+        .first()
+        .ok_or_else(|| validation("GENERALIZATION_FAILED", "No chunks provided", "scan_chunks_for_flow"))?;
+    let col_idx = resolve_col_indices(first, qis)?;
 
-    // Resolve column indices from the first chunk's header (schema is identical across all chunks)
-    let col_idx: Vec<usize> = {
-        let first = chunk_paths
-            .first()
-            .ok_or_else(|| validation("GENERALIZATION_FAILED", "No chunks provided", "histogram"))?;
-        let f = fs::File::open(first)?;
-        let mut lines = BufReader::new(f).lines();
-        let header = lines
-            .next()
-            .ok_or_else(|| validation("GENERALIZATION_FAILED", "chunk missing header", &first.display().to_string()))?
-            .map_err(|e| validation("GENERALIZATION_FAILED", "failed reading chunk header", &e.to_string()))?;
-        let headers = split_csv_line_basic(&header);
-        let mut out = Vec::with_capacity(qis.len());
-        for qi in qis {
-            let fallback = base_col_name(&qi.column_name);
-            let idx = headers
-                .iter()
-                .position(|h| h == &qi.column_name)
-                .or_else(|| headers.iter().position(|h| h == &fallback))
-                .ok_or_else(|| validation("DATA_COLUMN_MISSING", "Quasi-identifier column not found in CSV header", &qi.column_name))?;
-            out.push(idx);
-        }
-        out
-    };
-
-    // Pass 1: Build categorical domains from ALL chunks so no value is missed
     let mut cat_sets: Vec<BTreeSet<String>> = vec![BTreeSet::new(); qis.len()];
+    let mut total: i64 = 0;
+
     for chunk in chunk_paths {
         let f = fs::File::open(chunk)?;
         let mut lines = BufReader::new(f).lines();
         let _ = lines.next(); // skip header
         for line in lines {
-            let line = line.map_err(|e| validation("GENERALIZATION_FAILED", "failed reading chunk row", &e.to_string()))?;
-            if line.trim().is_empty() {
-                continue;
-            }
+            let line = line.map_err(|e| validation("GENERALIZATION_FAILED", "failed reading row", &e.to_string()))?;
+            if line.trim().is_empty() { continue; }
+            total += 1;
             let fields = split_csv_line_basic(&line);
             for i in 0..qis.len() {
                 if qis[i].is_categorical && col_idx[i] < fields.len() {
@@ -514,10 +550,66 @@ pub fn build_sparse_histogram(
             }
         }
     }
+
     let categorical_domains: Vec<Vec<String>> =
         cat_sets.into_iter().map(|s| s.into_iter().collect()).collect();
 
-    // Pass 2: Build histogram from all chunks using the complete domain sets
+    Ok((total, categorical_domains))
+}
+
+// ── Equivalence-space computation ─────────────────────────────────────────────
+
+/// Computes the total equivalence space E = Π R_Qi where:
+/// - Numerical: R_Qi = max − min + 1
+/// - Categorical: R_Qi = domain size
+/// - Interval: R_Qi = number of finest-level intervals
+///
+/// Uses `f64` throughout to avoid overflow for large spaces.
+/// Returns `f64::INFINITY` when the product overflows.
+pub fn compute_equivalence_space(
+    qis: &[QuasiIdentifierLite],
+    categorical_domains: &[Vec<String>],
+) -> f64 {
+    // categorical_domains is indexed by QI position (same length as qis);
+    // non-categorical positions hold an empty Vec.
+    let mut e: f64 = 1.0;
+    for (i, qi) in qis.iter().enumerate() {
+        let r = if qi.is_categorical {
+            let v = categorical_domains.get(i).map(|d| d.len()).unwrap_or(1);
+            (v as f64).max(1.0)
+        } else if let Some(h) = &qi.interval_hierarchy {
+            h.num_at(1) as f64
+        } else {
+            let mn = qi.min_value.unwrap_or(0.0);
+            let mx = qi.max_value.unwrap_or(0.0);
+            (mx - mn + 1.0).max(1.0)
+        };
+        e *= r;
+        if e.is_infinite() { break; }
+    }
+    e
+}
+
+// ── Histogram builders ────────────────────────────────────────────────────────
+
+pub fn build_sparse_histogram(
+    chunk_paths: &[PathBuf],
+    qis: &[QuasiIdentifierLite],
+    initial_ri: &[i64],
+    categorical_domains: &[Vec<String>],
+) -> Result<(SparseHist, i64), PipelineError> {
+    if qis.len() != initial_ri.len() {
+        return Err(validation("GENERALIZATION_FAILED", "initial_ri length mismatch", "OLA-2"));
+    }
+    if categorical_domains.len() != qis.len() {
+        return Err(validation("GENERALIZATION_FAILED", "categorical_domains length mismatch", "build_sparse_histogram"));
+    }
+
+    let first = chunk_paths
+        .first()
+        .ok_or_else(|| validation("GENERALIZATION_FAILED", "No chunks provided", "histogram"))?;
+    let col_idx = resolve_col_indices(first, qis)?;
+
     let mut hist: SparseHist = HashMap::new();
     let mut total_records: i64 = 0;
 
@@ -528,63 +620,455 @@ pub fn build_sparse_histogram(
 
         for line in lines {
             let line = line.map_err(|e| validation("GENERALIZATION_FAILED", "failed reading chunk row", &e.to_string()))?;
-            if line.trim().is_empty() {
-                continue;
-            }
+            if line.trim().is_empty() { continue; }
             let fields = split_csv_line_basic(&line);
             let mut idx_tuple = Vec::with_capacity(qis.len());
             let mut valid = true;
             for i in 0..qis.len() {
-                if col_idx[i] >= fields.len() {
-                    valid = false;
-                    break;
-                }
+                if col_idx[i] >= fields.len() { valid = false; break; }
                 let raw = fields[col_idx[i]].trim();
                 if let Some(ref h) = qis[i].interval_hierarchy {
-                    // Interval QI: map value to fine (level-1) interval index
                     let Ok(v) = raw.parse::<f64>() else { valid = false; break; };
-                    let v_int = v.round() as i64;
-                    match h.value_to_fine_index(v_int) {
+                    match h.value_to_fine_index(v.round() as i64) {
                         Some(idx) => idx_tuple.push(idx as i64),
-                        None => { valid = false; break; }
+                        None      => { valid = false; break; }
                     }
                 } else if qis[i].is_categorical {
-                    let Some(idx) = categorical_domains[i].iter().position(|v| v == raw).map(|v| v as i64) else {
+                    let Some(pos) = categorical_domains[i].iter().position(|v| v == raw) else {
                         valid = false;
                         break;
                     };
-                    idx_tuple.push(idx);
+                    idx_tuple.push(pos as i64);
                 } else {
-                    let Ok(v) = raw.parse::<f64>() else {
-                        valid = false;
-                        break;
-                    };
+                    let Ok(v) = raw.parse::<f64>() else { valid = false; break; };
                     let mn = qis[i].min_value.unwrap_or(0.0);
                     let step = initial_ri[i].max(1) as f64;
-                    let idx = ((v - mn) / step).floor().max(0.0) as i64;
-                    idx_tuple.push(idx);
+                    idx_tuple.push(((v - mn) / step).floor().max(0.0) as i64);
                 }
             }
-            if !valid {
-                continue;
-            }
+            if !valid { continue; }
             *hist.entry(idx_tuple).or_insert(0) += 1;
             total_records += 1;
         }
     }
 
     if hist.is_empty() || total_records <= 0 {
-        return Err(validation(
-            "GENERALIZATION_FAILED",
-            "No valid histogram records produced",
-            "check QI columns",
-        ));
+        return Err(validation("GENERALIZATION_FAILED", "No valid histogram records produced", "check QI columns"));
     }
-
     Ok((hist, total_records))
 }
 
-fn merge_histogram(hist: &SparseHist, qis: &[QuasiIdentifierLite], node: &[i64]) -> SparseHist {
+/// Builds a histogram at the finest possible granularity (`initial_ri = [1,…,1]`),
+/// bypassing OLA-1 entirely.  The resulting `SparseHist` is semantically identical
+/// to what [`build_sparse_histogram`] would produce with `initial_ri=[1,…,1]` and
+/// is directly compatible with OLA-2.
+///
+/// Use when `N·log₂N ≤ E` (the Direct flow is faster than OLA-1 in that regime).
+pub fn build_direct_histogram(
+    chunk_paths: &[PathBuf],
+    qis: &[QuasiIdentifierLite],
+    categorical_domains: &[Vec<String>],
+) -> Result<(SparseHist, i64), PipelineError> {
+    if categorical_domains.len() != qis.len() {
+        return Err(validation("GENERALIZATION_FAILED", "categorical_domains length mismatch", "build_direct_histogram"));
+    }
+
+    let first = chunk_paths
+        .first()
+        .ok_or_else(|| validation("GENERALIZATION_FAILED", "No chunks provided", "direct_histogram"))?;
+    let col_idx = resolve_col_indices(first, qis)?;
+
+    let mut hist: SparseHist = HashMap::new();
+    let mut total_records: i64 = 0;
+
+    for chunk in chunk_paths {
+        let f = fs::File::open(chunk)?;
+        let mut lines = BufReader::new(f).lines();
+        let _ = lines.next(); // skip header
+
+        for line in lines {
+            let line = line.map_err(|e| validation("GENERALIZATION_FAILED", "failed reading chunk row", &e.to_string()))?;
+            if line.trim().is_empty() { continue; }
+            let fields = split_csv_line_basic(&line);
+            let mut idx_tuple = Vec::with_capacity(qis.len());
+            let mut valid = true;
+            for i in 0..qis.len() {
+                if col_idx[i] >= fields.len() { valid = false; break; }
+                let raw = fields[col_idx[i]].trim();
+                if let Some(ref h) = qis[i].interval_hierarchy {
+                    let Ok(v) = raw.parse::<f64>() else { valid = false; break; };
+                    match h.value_to_fine_index(v.round() as i64) {
+                        Some(idx) => idx_tuple.push(idx as i64),
+                        None      => { valid = false; break; }
+                    }
+                } else if qis[i].is_categorical {
+                    let Some(pos) = categorical_domains[i].iter().position(|v| v == raw) else {
+                        valid = false;
+                        break;
+                    };
+                    idx_tuple.push(pos as i64);
+                } else {
+                    // initial_ri = 1: idx = floor(value - min)
+                    let Ok(v) = raw.parse::<f64>() else { valid = false; break; };
+                    let mn = qis[i].min_value.unwrap_or(0.0);
+                    idx_tuple.push((v - mn).floor().max(0.0) as i64);
+                }
+            }
+            if !valid { continue; }
+            *hist.entry(idx_tuple).or_insert(0) += 1;
+            total_records += 1;
+        }
+    }
+
+    if hist.is_empty() || total_records <= 0 {
+        return Err(validation("GENERALIZATION_FAILED", "No valid histogram records produced", "check QI columns"));
+    }
+    Ok((hist, total_records))
+}
+
+// ── Z-encoding DIRECT flow ────────────────────────────────────────────────────
+//
+// Z is a mixed-radix scalar that uniquely encodes a (u1, u2, ..., uc) tuple:
+//   Z = Σ(i=0..c-1)  u_i · W_i
+// where W_i = Π(k=i+1 to c-1) R_Qk  and  W_{c-1} = 1.
+//
+// For numerical QIs:  u_i = floor(v_i − min_Qi)  ∈ [0, R_Qi − 1]
+// For interval QIs:   u_i = fine_interval_index   ∈ [0, R_Qi − 1]
+// For categorical:    u_i = domain_position        ∈ [0, R_Qi − 1]   (0-indexed)
+//
+// The weights vector has the same length as qis.
+// Returns None if any weight overflows i64 (caller should fall back to ORIGINAL).
+
+/// Compute mixed-radix weights W_i = Π(k=i+1 to c-1) R_Qk.
+/// Returns `None` if any weight overflows `i64`.
+pub fn compute_z_weights(
+    qis: &[QuasiIdentifierLite],
+    categorical_domains: &[Vec<String>],
+) -> Option<Vec<i64>> {
+    let c = qis.len();
+    let mut ranges = Vec::with_capacity(c);
+    for (i, qi) in qis.iter().enumerate() {
+        let r = if qi.is_categorical {
+            categorical_domains.get(i).map(|d| d.len()).unwrap_or(1) as i64
+        } else if let Some(h) = &qi.interval_hierarchy {
+            h.num_at(1) as i64
+        } else {
+            let mn = qi.min_value.unwrap_or(0.0);
+            let mx = qi.max_value.unwrap_or(0.0);
+            (mx - mn + 1.0).max(1.0) as i64
+        };
+        ranges.push(r.max(1));
+    }
+    // W[c-1] = 1, W[i] = R[i+1] * W[i+1]
+    let mut weights = vec![1i64; c];
+    for i in (0..c.saturating_sub(1)).rev() {
+        weights[i] = weights[i + 1].checked_mul(ranges[i + 1])?;
+    }
+    Some(weights)
+}
+
+/// Encode a normalized u-vector to a single scalar Z.
+#[inline]
+fn encode_z(u: &[i64], weights: &[i64]) -> i64 {
+    u.iter().zip(weights.iter()).map(|(ui, wi)| ui * wi).sum()
+}
+
+/// Decode scalar Z back to a normalized u-vector using the precomputed weights.
+#[inline]
+fn decode_z(mut z: i64, weights: &[i64]) -> Vec<i64> {
+    let mut u = Vec::with_capacity(weights.len());
+    for &w in weights {
+        let ui = z / w;
+        z -= ui * w;
+        u.push(ui);
+    }
+    u
+}
+
+/// Sort a Vec<i64> of Z values and RLE-compress into a ZHist.
+fn collapse_z_values(mut zs: Vec<i64>) -> ZHist {
+    zs.sort_unstable();
+    let mut hist = ZHist::new();
+    for z in zs {
+        match hist.last_mut() {
+            Some(last) if last.0 == z => last.1 += 1,
+            _ => hist.push((z, 1)),
+        }
+    }
+    hist
+}
+
+/// Build a Z-encoded histogram at finest granularity.
+///
+/// Each record is converted to a single Z scalar via mixed-radix encoding.
+/// The result is a sorted, RLE-collapsed `ZHist` using at most 16 bytes/entry
+/// versus ~40+ bytes/entry for the equivalent `SparseHist`.
+///
+/// Use when `N·log₂N ≤ E` and weights fit in `i64` (see [`compute_z_weights`]).
+pub fn build_z_histogram(
+    chunk_paths: &[PathBuf],
+    qis: &[QuasiIdentifierLite],
+    categorical_domains: &[Vec<String>],
+    weights: &[i64],
+) -> Result<(ZHist, i64), PipelineError> {
+    if categorical_domains.len() != qis.len() || weights.len() != qis.len() {
+        return Err(validation("GENERALIZATION_FAILED", "length mismatch", "build_z_histogram"));
+    }
+    let first = chunk_paths
+        .first()
+        .ok_or_else(|| validation("GENERALIZATION_FAILED", "No chunks provided", "build_z_histogram"))?;
+    let col_idx = resolve_col_indices(first, qis)?;
+
+    let mut zs: Vec<i64> = Vec::new();
+    let mut total_records: i64 = 0;
+
+    for chunk in chunk_paths {
+        let f = fs::File::open(chunk)?;
+        let mut lines = BufReader::new(f).lines();
+        let _ = lines.next(); // skip header
+
+        for line in lines {
+            let line = line.map_err(|e| validation("GENERALIZATION_FAILED", "failed reading row", &e.to_string()))?;
+            if line.trim().is_empty() { continue; }
+            let fields = split_csv_line_basic(&line);
+
+            let mut u = Vec::with_capacity(qis.len());
+            let mut valid = true;
+            for i in 0..qis.len() {
+                if col_idx[i] >= fields.len() { valid = false; break; }
+                let raw = fields[col_idx[i]].trim();
+                let ui = if let Some(ref h) = qis[i].interval_hierarchy {
+                    let Ok(v) = raw.parse::<f64>() else { valid = false; break; };
+                    match h.value_to_fine_index(v.round() as i64) {
+                        Some(idx) => idx as i64,
+                        None => { valid = false; break; }
+                    }
+                } else if qis[i].is_categorical {
+                    // 0-indexed domain position, consistent with SparseHist
+                    let Some(pos) = categorical_domains[i].iter().position(|v| v == raw) else {
+                        valid = false; break;
+                    };
+                    pos as i64
+                } else {
+                    let Ok(v) = raw.parse::<f64>() else { valid = false; break; };
+                    let mn = qis[i].min_value.unwrap_or(0.0);
+                    (v - mn).floor().max(0.0) as i64
+                };
+                u.push(ui);
+            }
+            if !valid { continue; }
+            zs.push(encode_z(&u, weights));
+            total_records += 1;
+        }
+    }
+
+    if zs.is_empty() || total_records <= 0 {
+        return Err(validation("GENERALIZATION_FAILED", "No valid Z-histogram records produced", "check QI columns"));
+    }
+    Ok((collapse_z_values(zs), total_records))
+}
+
+/// Convert a `ZHist` to a `SparseHist` by decoding each Z back to its u-vector.
+/// Used to pass Z-flow results to functions that expect `SparseHist` (analytics, diagnostics).
+pub fn z_hist_to_sparse(hist: &ZHist, weights: &[i64]) -> SparseHist {
+    hist.iter().map(|&(z, count)| (decode_z(z, weights), count)).collect()
+}
+
+/// Merge a `ZHist` to the generalization level described by `node`.
+///
+/// Analogous to [`merge_histogram`] but stays in Z space throughout, avoiding
+/// the per-entry `Vec` allocation cost of `SparseHist`.
+pub fn merge_z_histogram(
+    hist: &ZHist,
+    qis: &[QuasiIdentifierLite],
+    weights: &[i64],
+    node: &[i64],
+) -> ZHist {
+    let mut mapped: Vec<(i64, i64)> = hist.iter().map(|&(z, count)| {
+        let u = decode_z(z, weights);
+        let u_prime: Vec<i64> = u.iter().enumerate().map(|(i, &ui)| {
+            match qis.get(i).and_then(|qi| qi.interval_hierarchy.as_ref()) {
+                Some(h) => {
+                    let level = (node[i] as usize).clamp(1, h.num_levels);
+                    h.ancestor_at.get(ui as usize).and_then(|a| a.get(level)).copied().unwrap_or(0) as i64
+                }
+                None => ui / node[i].max(1),
+            }
+        }).collect();
+        (encode_z(&u_prime, weights), count)
+    }).collect();
+
+    mapped.sort_unstable_by_key(|&(z, _)| z);
+
+    let mut out = ZHist::new();
+    for (z, count) in mapped {
+        match out.last_mut() {
+            Some(last) if last.0 == z => last.1 += count,
+            _ => out.push((z, count)),
+        }
+    }
+    out
+}
+
+fn suppression_count_z(hist: &ZHist, k: i64) -> i64 {
+    hist.iter().filter(|&&(_, c)| c > 0 && c < k).map(|&(_, c)| c).sum()
+}
+
+fn compute_dm_star_z(hist: &ZHist, k: i64) -> (i64, i64) {
+    let mut dm = 0_i64;
+    let mut eq = 0_i64;
+    for &(_, v) in hist {
+        if v >= k {
+            dm = dm.saturating_add(v.saturating_mul(v));
+            eq += 1;
+        }
+    }
+    (dm, eq)
+}
+
+fn compute_top_ola2_z_nodes(
+    base_hist: &ZHist,
+    qis: &[QuasiIdentifierLite],
+    weights: &[i64],
+    pass_nodes: &[Vec<i64>],
+    k: i64,
+) -> Vec<Ola2NodeScore> {
+    let mut out = Vec::new();
+    for node in pass_nodes {
+        let merged = merge_z_histogram(base_hist, qis, weights, node);
+        let (dm, eq) = compute_dm_star_z(&merged, k);
+        let suppression_count = suppression_count_z(&merged, k);
+        out.push(Ola2NodeScore {
+            node: node.clone(),
+            dm_star: dm,
+            num_equivalence_classes: eq,
+            suppression_count,
+        });
+    }
+    out.sort_by(|a, b| {
+        (a.dm_star, a.suppression_count, -a.num_equivalence_classes, a.node.clone()).cmp(&(
+            b.dm_star,
+            b.suppression_count,
+            -b.num_equivalence_classes,
+            b.node.clone(),
+        ))
+    });
+    out.into_iter().take(5).collect()
+}
+
+/// OLA-2 lattice search operating entirely on a `ZHist`.
+///
+/// Identical search strategy to [`find_ola2_best_rf_detailed`] but uses
+/// [`merge_z_histogram`] at every node evaluation, keeping all intermediate
+/// histograms in the compact sorted-array format.
+pub fn find_ola2_best_rf_z_detailed(
+    qis: &[QuasiIdentifierLite],
+    base_hist: &ZHist,
+    weights: &[i64],
+    initial_ri: &[i64],
+    size_factors: &HashMap<String, i64>,
+    k: i64,
+    suppression_limit: f64,
+    total_records: i64,
+) -> Result<Ola2SearchResult, PipelineError> {
+    if k <= 0 {
+        return Err(validation("GENERALIZATION_FAILED", "k must be > 0", "OLA-2 Z"));
+    }
+    if !(0.0..=1.0).contains(&suppression_limit) {
+        return Err(validation("GENERALIZATION_FAILED", "suppression_limit must be in [0,1]", "OLA-2 Z"));
+    }
+    if total_records <= 0 {
+        return Err(validation("GENERALIZATION_FAILED", "total_records must be > 0", "OLA-2 Z"));
+    }
+    if initial_ri.len() != qis.len() {
+        return Err(validation("GENERALIZATION_FAILED", "initial_ri length mismatch", "OLA-2 Z"));
+    }
+    let allowed = suppression_limit * total_records as f64;
+    let tree = build_tree_levels(qis, initial_ri, size_factors, false)?;
+    let mut node_status: HashMap<Vec<i64>, Option<bool>> = HashMap::new();
+    let mut node_to_level: HashMap<Vec<i64>, usize> = HashMap::new();
+    for (level_idx, level) in tree.iter().enumerate() {
+        for node in level {
+            node_status.entry(node.clone()).or_insert(None);
+            node_to_level.insert(node.clone(), level_idx);
+        }
+    }
+
+    let mut pass_nodes: Vec<Vec<i64>> = Vec::new();
+    let mut node_trace: Vec<NodeTrace> = Vec::new();
+
+    while node_status.values().any(Option::is_none) {
+        let unmarked_levels: Vec<usize> = tree
+            .iter()
+            .enumerate()
+            .filter_map(|(i, level)| {
+                if level.iter().any(|n| node_status.get(n).copied().flatten().is_none()) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if unmarked_levels.is_empty() { break; }
+        let mid_level = unmarked_levels[unmarked_levels.len() / 2];
+        let mut sorted_nodes: Vec<Vec<i64>> = tree[mid_level]
+            .iter()
+            .filter(|n| node_status.get(*n).copied().flatten().is_none())
+            .cloned()
+            .collect();
+        sorted_nodes.sort_by(|a, b| b.cmp(a));
+        if sorted_nodes.is_empty() { continue; }
+        let node = sorted_nodes[sorted_nodes.len() / 2].clone();
+        if node_status.get(&node).copied().flatten().is_some() { continue; }
+        let node_level = node_to_level.get(&node).copied().unwrap_or(mid_level);
+
+        let merged = merge_z_histogram(base_hist, qis, weights, &node);
+        let suppression_count = suppression_count_z(&merged, k);
+        let (dm, eq) = compute_dm_star_z(&merged, k);
+        let passes = suppression_count == 0 || (suppression_count as f64) <= allowed;
+
+        node_trace.push(NodeTrace {
+            node: node.clone(),
+            suppression_count,
+            dm_star: dm,
+            num_equivalence_classes: eq,
+            passes,
+        });
+
+        if passes {
+            node_status.insert(node.clone(), Some(true));
+            pass_nodes.push(node.clone());
+            mark_subtree_pass(&tree, &mut node_status, &node, node_level);
+        } else {
+            node_status.insert(node.clone(), Some(false));
+            mark_parents_fail(&tree, &mut node_status, &node, node_level);
+        }
+    }
+
+    if pass_nodes.is_empty() {
+        return Err(validation(
+            "GENERALIZATION_FAILED",
+            "No node satisfies k-anonymity constraints (OLA-2 Z)",
+            "Increase suppression_limit, reduce k, or switch to ORIGINAL flow",
+        ));
+    }
+
+    let scored = compute_top_ola2_z_nodes(base_hist, qis, weights, &pass_nodes, k);
+    let best = scored
+        .first()
+        .ok_or_else(|| validation("GENERALIZATION_FAILED", "No valid OLA-2 Z node scores", "OLA-2 Z"))?;
+    Ok(Ola2SearchResult {
+        best_rf: best.node.clone(),
+        lowest_dm_star: best.dm_star,
+        num_equivalence_classes: best.num_equivalence_classes,
+        top_nodes: scored,
+        node_trace,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn merge_histogram(hist: &SparseHist, qis: &[QuasiIdentifierLite], node: &[i64]) -> SparseHist {
     let mut merged: SparseHist = HashMap::new();
     for (idx, count) in hist {
         let mut m = Vec::with_capacity(idx.len());
@@ -753,6 +1237,8 @@ pub fn find_ola2_best_rf_detailed(
     }
 
     let mut pass_nodes: Vec<Vec<i64>> = Vec::new();
+    let mut node_trace: Vec<NodeTrace> = Vec::new();
+
     while node_status.values().any(Option::is_none) {
         let unmarked_levels: Vec<usize> = tree
             .iter()
@@ -785,8 +1271,18 @@ pub fn find_ola2_best_rf_detailed(
         let node_level = node_to_level.get(&node).copied().unwrap_or(mid_level);
         let merged = merge_histogram(base_hist, qis, &node);
         let suppression_count = suppression_count_sparse(&merged, k);
-        let passes_k = suppression_count == 0;
-        if passes_k || (suppression_count as f64) <= allowed {
+        let (dm, eq) = compute_dm_star_sparse(&merged, k);
+        let passes = suppression_count == 0 || (suppression_count as f64) <= allowed;
+
+        node_trace.push(NodeTrace {
+            node: node.clone(),
+            suppression_count,
+            dm_star: dm,
+            num_equivalence_classes: eq,
+            passes,
+        });
+
+        if passes {
             node_status.insert(node.clone(), Some(true));
             pass_nodes.push(node.clone());
             mark_subtree_pass(&tree, &mut node_status, &node, node_level);
@@ -813,6 +1309,7 @@ pub fn find_ola2_best_rf_detailed(
         lowest_dm_star: best.dm_star,
         num_equivalence_classes: best.num_equivalence_classes,
         top_nodes: scored,
+        node_trace,
     })
 }
 

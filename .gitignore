@@ -48,6 +48,10 @@ data/secret.key
 data/*.py
 data/pipeline-config-*.json
 
+# SKALD local dev data and test configs (not for repo)
+SKALD/data/
+SKALD/config/
+
 # Benchmarking
 benchmark/
 

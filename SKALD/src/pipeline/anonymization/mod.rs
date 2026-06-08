@@ -20,6 +20,15 @@ pub use ola::{
     build_interval_hierarchy,
     find_ola1_initial_ri,
     build_sparse_histogram,
+    build_direct_histogram,
+    build_z_histogram,
+    compute_z_weights,
+    merge_z_histogram,
+    z_hist_to_sparse,
+    find_ola2_best_rf_z_detailed,
+    scan_chunks_for_flow,
+    compute_equivalence_space,
+    merge_histogram,
     find_ola2_best_rf,
     find_ola2_best_rf_detailed,
     equivalence_class_stats,
@@ -27,10 +36,12 @@ pub use ola::{
     compute_k_optimal,
     GridEntry,
     IntervalHierarchy,
+    NodeTrace,
     Ola2NodeScore,
     Ola2SearchResult,
     QuasiIdentifierLite,
     SparseHist,
+    ZHist,
 };
 pub use generalization::generalize_and_write_outputs;
 

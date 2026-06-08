@@ -69,6 +69,21 @@ pub struct RuntimeConfig {
     /// QIs listed here are excluded from the OLA-2 lattice search (bins are fixed)
     /// but still contribute to equivalence class keys in the histogram.
     pub fixed_bins: HashMap<String, Vec<(i64, i64)>>,
+    /// Histogram-construction strategy.
+    /// `Auto` applies the N·log₂N vs E decision rule at runtime.
+    pub flow_mode: FlowMode,
+}
+
+/// Controls which histogram-building algorithm SKALD uses.
+///
+/// - `Auto`: use N·log₂N ≤ E to pick DIRECT (fast) or ORIGINAL (OLA-1 based).
+/// - `Original`: always run OLA-1 + sparse histogram (previous behaviour).
+/// - `Direct`: always skip OLA-1 and build the finest-granularity histogram directly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlowMode {
+    Auto,
+    Original,
+    Direct,
 }
 
 #[derive(Debug, Clone)]
@@ -513,6 +528,12 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
     let has_k_anonymize = section.get("k_anonymize").is_some();
     let has_qis = !numerical_qis.is_empty() || !categorical_qis.is_empty();
 
+    let flow_mode = match section.get("flow_mode").and_then(Value::as_str) {
+        Some(s) if s.eq_ignore_ascii_case("original") => FlowMode::Original,
+        Some(s) if s.eq_ignore_ascii_case("direct")   => FlowMode::Direct,
+        _                                               => FlowMode::Auto,
+    };
+
     Ok(RuntimeConfig {
         enable_k_anonymity: has_k_anonymize && has_qis,
         pass,
@@ -534,6 +555,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         source_json_config: config_path.to_path_buf(),
         qi_interval_constraints,
         fixed_bins,
+        flow_mode,
     })
 }
 
