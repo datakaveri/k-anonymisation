@@ -288,14 +288,20 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     log_histogram_diagnostic(&mut log, "hist_diag", diag_label, &base_sparse, 10);
 
     // ── Parameter grid (all passes) ──────────────────────────────────────────
-    log.info("parameter_grid", "Computing k × suppression_limit parameter grid");
-    let parameter_grid = compute_parameter_grid(&qis, &base_sparse, &initial_ri, &cfg.size_factors, total_records);
-    log.info("parameter_grid", &format!(
-        "{} grid cells ({} feasible)",
-        parameter_grid.len(),
-        parameter_grid.iter().filter(|e| e.feasible).count()
-    ));
-    write_parameter_grid_table(&parameter_grid, &output_dir_path);
+    let parameter_grid = if cfg.compute_param_grid {
+        log.info("parameter_grid", "Computing k × suppression_limit parameter grid");
+        let grid = compute_parameter_grid(&qis, &base_sparse, &initial_ri, &cfg.size_factors, total_records);
+        log.info("parameter_grid", &format!(
+            "{} grid cells ({} feasible)",
+            grid.len(),
+            grid.iter().filter(|e| e.feasible).count()
+        ));
+        write_parameter_grid_table(&grid, &output_dir_path);
+        grid
+    } else {
+        log.info("parameter_grid", "Skipped (compute_parameter_grid=false)");
+        vec![]
+    };
 
     // ── Pass 1: compute k_optimal and return ─────────────────────────────────
     if pass == "pass1" {
