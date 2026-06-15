@@ -1,0 +1,35 @@
+{
+  "data_type": "adult",
+  "adult": {
+
+    "pass": "no_bounds",
+
+    "flow_mode": "DIRECT",
+
+    "output_path": "generalized_adult.csv",
+    "output_directory": "output",
+
+    "suppression_limit": 0.05,
+
+    "suppress": ["class"],
+
+    "k_anonymize": { "k": 10 },
+
+    "quasi_identifiers": {
+      "numerical": [
+        { "column": "age",            "encode": false, "type": "int" },
+        { "column": "education-num",  "encode": false, "type": "int" }
+      ],
+      "categorical": [
+        { "column": "gender" }
+      ]
+    },
+
+    "size": {
+      "age":            2,
+      "education-num":  2,
+      "hours-per-week": 5
+    }
+
+  }
+}

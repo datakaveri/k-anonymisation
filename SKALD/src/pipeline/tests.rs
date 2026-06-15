@@ -1,7 +1,7 @@
 use super::anonymization::{
     find_ola1_initial_ri, find_ola2_best_rf, generalize_and_write_outputs, QuasiIdentifierLite,
 };
-use super::bootstrap::{find_first_json_config, parse_runtime_config, split_csv_by_ram};
+use super::bootstrap::{csv_quote_field, csv_row_to_line, find_first_json_config, parse_runtime_config, split_csv_line_basic, split_csv_by_ram};
 use super::pipeline::run_pipeline;
 use super::preprocess::preprocess_chunks;
 use std::collections::HashMap;
@@ -223,6 +223,74 @@ fn ola2_picks_rf_that_meets_suppression_limit() {
 
     let (rf, _dm, _eq) = find_ola2_best_rf(&qis, &hist, &[1], &size, 2, 0.0, 4).expect("ola2");
     assert_eq!(rf, vec![2]);
+}
+
+// ── CSV quoting round-trip ───────────────────────────────────────────────────
+
+#[test]
+fn csv_quote_field_no_quotes_needed() {
+    assert_eq!(csv_quote_field("Hypertension"), "Hypertension");
+    assert_eq!(csv_quote_field(""), "");
+    assert_eq!(csv_quote_field("42"), "42");
+}
+
+#[test]
+fn csv_quote_field_wraps_commas() {
+    assert_eq!(csv_quote_field("House 42, MG Road, Mumbai"), "\"House 42, MG Road, Mumbai\"");
+}
+
+#[test]
+fn csv_quote_field_escapes_embedded_quotes() {
+    assert_eq!(csv_quote_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+}
+
+#[test]
+fn csv_row_to_line_roundtrip_with_commas_in_field() {
+    // Simulate Street Address (with commas) followed by Disease — the exact
+    // scenario that caused Disease to show address fragments in the output.
+    let row = vec![
+        "C001".to_string(),
+        "House 42, MG Road, Mumbai".to_string(),
+        "Hypertension".to_string(),
+    ];
+    let line = csv_row_to_line(&row);
+    let parsed = split_csv_line_basic(&line);
+    assert_eq!(parsed, row, "round-trip must recover original fields");
+}
+
+#[test]
+fn preprocess_preserves_fields_with_commas() {
+    // End-to-end: preprocess a chunk that has a field with a comma in it.
+    // The output chunk must survive a round-trip through split_csv_line_basic.
+    let root = mk_temp_dir("skald_preprocess_csv_comma");
+    let chunk = root.join("chunk_1.csv");
+    fs::write(
+        &chunk,
+        "ID,Address,Disease\n1,\"House 42, MG Road\",Diabetes\n2,\"Flat 7, Park Ave\",Hypertension\n",
+    )
+    .expect("write chunk");
+
+    let cfg_path = root.join("cfg.json");
+    fs::write(
+        &cfg_path,
+        r#"{"data_type":"T","T":{"output_path":"x.csv","output_directory":"output","quasi_identifiers":{"numerical":[{"column":"ID","encode":false,"scale":false,"s":0,"type":"int"}],"categorical":[]}}}"#,
+    )
+    .expect("write cfg");
+
+    let cfg = parse_runtime_config(&cfg_path).expect("parse");
+    preprocess_chunks(std::slice::from_ref(&chunk), &cfg).expect("preprocess");
+
+    let after = fs::read_to_string(&chunk).expect("read chunk");
+    let mut lines = after.lines();
+    let _header = lines.next().unwrap();
+    for line in lines {
+        if line.trim().is_empty() { continue; }
+        let fields = split_csv_line_basic(line);
+        // Must parse back to exactly 3 fields — not split on the comma inside Address
+        assert_eq!(fields.len(), 3, "field count mismatch — unquoted comma in output: {line}");
+    }
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

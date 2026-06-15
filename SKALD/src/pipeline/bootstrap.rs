@@ -294,6 +294,28 @@ pub fn split_csv_line_basic(line: &str) -> Vec<String> {
     fields
 }
 
+/// Encodes a single CSV field value per RFC 4180: wraps in double-quotes when
+/// the value contains a comma, double-quote, or newline, and escapes any
+/// embedded double-quotes by doubling them.
+///
+/// This is the counterpart to [`split_csv_line_basic`] — together they form a
+/// lossless round-trip for arbitrary field values including street addresses
+/// that contain commas.
+pub fn csv_quote_field(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// Serialises a row of field values into a single CSV line using
+/// [`csv_quote_field`] to ensure values with commas or quotes are safely
+/// escaped.  Does NOT append a newline.
+pub fn csv_row_to_line(fields: &[String]) -> String {
+    fields.iter().map(|f| csv_quote_field(f)).collect::<Vec<_>>().join(",")
+}
+
 pub fn ensure_output_dir(path: &Path) -> Result<(), PipelineError> {
     fs::create_dir_all(path)?;
     Ok(())
