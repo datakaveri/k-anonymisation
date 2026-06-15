@@ -72,6 +72,9 @@ pub struct RuntimeConfig {
     /// Histogram-construction strategy.
     /// `Auto` applies the N·log₂N vs E decision rule at runtime.
     pub flow_mode: FlowMode,
+    /// When true (default), compute the k × suppression_limit parameter grid.
+    /// Set to false in benchmarks to skip the 12 extra OLA-2 searches.
+    pub compute_param_grid: bool,
 }
 
 /// Controls which histogram-building algorithm SKALD uses.
@@ -556,6 +559,10 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         qi_interval_constraints,
         fixed_bins,
         flow_mode,
+        compute_param_grid: section
+            .get("compute_parameter_grid")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
     })
 }
 
