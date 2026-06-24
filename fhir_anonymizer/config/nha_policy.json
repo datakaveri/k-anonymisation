@@ -1,0 +1,56 @@
+{
+  "_comment": "NHA FHIR anonymization policy — adjust operations per data-sharing agreement.",
+  "tokenize_resource_ids": true,
+  "rules": [
+    {"path": "Patient.name",                "operation": "suppress"},
+    {"path": "Patient.telecom",             "operation": "suppress"},
+    {"path": "Patient.address",             "operation": "suppress"},
+    {"path": "Patient.photo",               "operation": "suppress"},
+    {"path": "Patient.contact",             "operation": "suppress"},
+    {"path": "Patient.identifier.value",    "operation": "tokenize",
+     "params": {"prefix": "pid-"}},
+    {"path": "Patient.birthDate",           "operation": "date_generalize",
+     "params": {"granularity": "year"}},
+
+    {"path": "Practitioner.name",           "operation": "suppress"},
+    {"path": "Practitioner.telecom",        "operation": "suppress"},
+    {"path": "Practitioner.address",        "operation": "suppress"},
+    {"path": "Practitioner.identifier.value", "operation": "tokenize",
+     "params": {"prefix": "prac-"}},
+    {"path": "Practitioner.birthDate",      "operation": "suppress"},
+
+    {"path": "Organization.name",           "operation": "mask"},
+    {"path": "Organization.address",        "operation": "suppress"},
+    {"path": "Organization.telecom",        "operation": "suppress"},
+    {"path": "Organization.identifier.value", "operation": "tokenize"},
+
+    {"path": "Encounter.period",            "operation": "date_generalize",
+     "params": {"granularity": "year_month"}},
+
+    {"path": "Coverage.identifier.value",   "operation": "tokenize",
+     "params": {"prefix": "cov-"}},
+    {"path": "Coverage.subscriberId",       "operation": "tokenize"},
+    {"path": "Coverage.beneficiary",        "operation": "suppress"},
+
+    {"path": "Claim.identifier.value",      "operation": "tokenize"},
+    {"path": "Claim.created",               "operation": "date_generalize",
+     "params": {"granularity": "year_month"}},
+
+    {"path": "ClaimResponse.identifier.value", "operation": "tokenize"},
+    {"path": "ClaimResponse.created",       "operation": "date_generalize",
+     "params": {"granularity": "year_month"}},
+
+    {"path": "Appointment.start",           "operation": "date_generalize",
+     "params": {"granularity": "year_month"}},
+    {"path": "Appointment.end",             "operation": "date_generalize",
+     "params": {"granularity": "year_month"}},
+
+    {"path": "Observation.effectiveDateTime", "operation": "date_generalize",
+     "params": {"granularity": "year_month"}},
+
+    {"path": "Condition.recordedDate",      "operation": "date_generalize",
+     "params": {"granularity": "year_month"}},
+
+    {"path": "Medication.identifier.value", "operation": "suppress"}
+  ]
+}
