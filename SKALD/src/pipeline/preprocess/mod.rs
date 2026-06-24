@@ -22,7 +22,7 @@
 mod crypto;
 mod masking;
 
-use crate::pipeline::bootstrap::{split_csv_line_basic, validation, PipelineError, RuntimeConfig};
+use crate::pipeline::bootstrap::{csv_row_to_line, split_csv_line_basic, validation, PipelineError, RuntimeConfig};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -333,10 +333,10 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
 
         let tmp_path = chunk_path.with_extension("csv.tmp");
         let mut w = BufWriter::new(fs::File::create(&tmp_path)?);
-        w.write_all(headers.join(",").as_bytes())?;
+        w.write_all(csv_row_to_line(&headers).as_bytes())?;
         w.write_all(b"\n")?;
         for row in rows {
-            w.write_all(row.join(",").as_bytes())?;
+            w.write_all(csv_row_to_line(&row).as_bytes())?;
             w.write_all(b"\n")?;
         }
         w.flush()?;

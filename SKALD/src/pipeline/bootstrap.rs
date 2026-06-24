@@ -311,6 +311,21 @@ pub fn split_csv_line_basic(line: &str) -> Vec<String> {
     fields
 }
 
+/// Quotes a single CSV field per RFC 4180 — wraps in `"..."` and doubles any
+/// embedded quotes only when the field contains a comma, quote, or newline.
+pub fn csv_quote_field(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// Serializes a row of fields to a CSV line, quoting fields as needed.
+pub fn csv_row_to_line(fields: &[String]) -> String {
+    fields.iter().map(|f| csv_quote_field(f)).collect::<Vec<_>>().join(",")
+}
+
 pub fn ensure_output_dir(path: &Path) -> Result<(), PipelineError> {
     fs::create_dir_all(path)?;
     Ok(())

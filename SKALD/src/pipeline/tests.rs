@@ -552,3 +552,64 @@ fn flow_mode_defaults_to_auto() {
     assert_eq!(cfg.flow_mode, FlowMode::Auto);
     let _ = fs::remove_dir_all(d);
 }
+
+// ── CSV quoting round-trip ────────────────────────────────────────────────────
+
+#[test]
+fn csv_quote_field_no_quotes_needed() {
+    assert_eq!(csv_quote_field("Hypertension"), "Hypertension");
+    assert_eq!(csv_quote_field(""), "");
+    assert_eq!(csv_quote_field("42"), "42");
+}
+
+#[test]
+fn csv_quote_field_wraps_commas() {
+    assert_eq!(csv_quote_field("House 42, MG Road, Mumbai"), "\"House 42, MG Road, Mumbai\"");
+}
+
+#[test]
+fn csv_quote_field_escapes_embedded_quotes() {
+    assert_eq!(csv_quote_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+}
+
+#[test]
+fn csv_row_to_line_roundtrip_with_commas_in_field() {
+    let row = vec![
+        "C001".to_string(),
+        "House 42, MG Road, Mumbai".to_string(),
+        "Hypertension".to_string(),
+    ];
+    let line = csv_row_to_line(&row);
+    let parsed = split_csv_line_basic(&line);
+    assert_eq!(parsed, row, "round-trip must recover original fields");
+}
+
+#[test]
+fn preprocess_preserves_fields_with_commas() {
+    let d = mk_temp_dir("skald_preprocess_csv_comma");
+    let chunks_dir = d.join("chunks");
+    fs::create_dir_all(&chunks_dir).unwrap();
+    let chunk = chunks_dir.join("chunk_1.csv");
+    fs::write(
+        &chunk,
+        "ID,Address,Disease\n1,\"House 42, MG Road\",Diabetes\n2,\"Flat 7, Park Ave\",Hypertension\n",
+    ).expect("write chunk");
+
+    let cfg_path = d.join("cfg.json");
+    fs::write(
+        &cfg_path,
+        r#"{"data_type":"T","T":{"quasi_identifiers":{"numerical":[]}}}"#,
+    ).expect("write cfg");
+    let cfg = parse_runtime_config(&cfg_path).expect("parse cfg");
+
+    preprocess_chunks(&[chunk.clone()], &cfg).expect("preprocess");
+
+    let out = fs::read_to_string(&chunk).expect("read output");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "header + 2 data rows");
+    let row1 = split_csv_line_basic(lines[1]);
+    assert_eq!(row1[1], "House 42, MG Road", "address field must round-trip through preprocess");
+    let row2 = split_csv_line_basic(lines[2]);
+    assert_eq!(row2[1], "Flat 7, Park Ave", "address field must round-trip through preprocess");
+    let _ = fs::remove_dir_all(d);
+}
