@@ -30,8 +30,6 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crypto::{
-    fpe_digits_encrypt,
-    fpe_pan_encrypt,
     format_preserving_encrypt_general,
     generate_random_key_hex,
     generate_random_salt_hex,
@@ -46,11 +44,9 @@ use crypto::{
 use masking::{
     apply_masking_value,
     parse_encrypt_config,
-    parse_fpe_config,
     parse_masking_config,
     parse_tokenization_config,
     EncryptConfigLite,
-    FpeConfigLite,
     MaskingConfigLite,
     TokenizationConfigLite,
 };
@@ -58,10 +54,9 @@ use masking::{
 /// Applies all configured pre-processing transformations to each input chunk
 /// and writes the result back in-place (atomic rename via a `.csv.tmp` file).
 ///
-/// A token vault (`token_vault.json`), FPE key store (`fpe_keys.json`),
-/// symmetric key store (`symmetric_keys.json`), and FPE-encrypt key store
-/// (`fpe_encrypt_keys.json`) are maintained in `output_directory` so that
-/// mappings are consistent across pipeline re-runs.
+/// A token vault (`token_vault.json`), symmetric key store (`symmetric_keys.json`),
+/// and FPE-encrypt key store (`fpe_encrypt_keys.json`) are maintained in
+/// `output_directory` so that mappings are consistent across pipeline re-runs.
 ///
 /// # Arguments
 /// * `chunks` — paths to the CSV chunk files to transform (modified in-place).
@@ -85,7 +80,6 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
         .iter()
         .map(parse_tokenization_config)
         .collect::<Result<Vec<_>, _>>()?;
-    let fpe_cfgs: Vec<FpeConfigLite> = cfg.fpe.iter().map(parse_fpe_config).collect::<Result<Vec<_>, _>>()?;
     let encrypt_cfgs: Vec<EncryptConfigLite> = cfg.encrypt.iter().map(parse_encrypt_config).collect::<Result<Vec<_>, _>>()?;
 
     let out_dir_buf = if Path::new(&cfg.output_directory).is_absolute() {
@@ -143,9 +137,6 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
     // Per-column random salts for salted hashing — generated fresh each run (matches Python behavior).
     // Not persisted to disk; consistent within a run across all chunks for the same column.
     let mut hash_salts: BTreeMap<String, String> = BTreeMap::new();
-
-    let fpe_keys_path = out_dir.join("fpe_keys.json");
-    let mut fpe_keys = read_json_map_string(&fpe_keys_path)?;
 
     let symmetric_keys_path = out_dir.join("symmetric_keys.json");
     let mut symmetric_keys = read_json_map_string(&symmetric_keys_path)?;
@@ -301,32 +292,6 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
             }
         }
 
-        for fcfg in &fpe_cfgs {
-            let idx = headers
-                .iter()
-                .position(|h| h == &fcfg.column)
-                .ok_or_else(|| validation("PREPROCESS_COLUMN_MISSING", "Column not found in CSV header for FPE encryption", &fcfg.column))?;
-            let key = fpe_keys
-                .entry(fcfg.column.clone())
-                .or_insert_with(generate_random_key_hex)
-                .clone();
-
-            for row in &mut rows {
-                if idx >= row.len() {
-                    continue;
-                }
-                let v = row[idx].clone();
-                if should_skip_value(&v) {
-                    continue;
-                }
-                row[idx] = if fcfg.format == "pan" {
-                    fpe_pan_encrypt(&v, &key)
-                } else {
-                    fpe_digits_encrypt(&v, &key)
-                };
-            }
-        }
-
         for ecfg in &encrypt_cfgs {
             let idx = headers
                 .iter()
@@ -389,10 +354,6 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
         }
         write_json_pretty(&token_vault_path, &vault_json)?;
     }
-    write_json_pretty(
-        &fpe_keys_path,
-        &Value::Object(fpe_keys.into_iter().map(|(k, v)| (k, Value::String(v))).collect()),
-    )?;
     write_json_pretty(
         &symmetric_keys_path,
         &Value::Object(symmetric_keys.into_iter().map(|(k, v)| (k, Value::String(v))).collect()),

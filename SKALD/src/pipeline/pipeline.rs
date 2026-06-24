@@ -39,10 +39,10 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     // ── Preprocess-only path (no k-anonymity configured) ─────────────────────
     if !cfg.enable_k_anonymity {
         log.info("preprocessing", &format!(
-            "k-anonymity disabled — preprocess-only: suppress={}, hash_salt={}, hash={}, mask={}, encrypt={}, charcloak={}, tokenize={}, fpe={}",
+            "k-anonymity disabled — preprocess-only: suppress={}, hash_salt={}, hash={}, mask={}, encrypt={}, charcloak={}, tokenize={}",
             cfg.suppress.len(), cfg.hashing_with_salt.len(), cfg.hashing_without_salt.len(),
             cfg.masking.len(), cfg.encrypt.len(), cfg.charcloak.len(),
-            cfg.tokenization.len(), cfg.fpe.len(),
+            cfg.tokenization.len(),
         ));
         preprocess_chunks(&chunk_paths, &cfg)?;
         log.info("preprocessing", "Preprocessing complete");
@@ -69,10 +69,10 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     // ── Preprocessing (pass2 and no_bounds only) ─────────────────────────────
     if pass != "pass1" {
         log.info("preprocessing", &format!(
-            "Running preprocessing: suppress={}, hash_salt={}, hash={}, mask={}, encrypt={}, charcloak={}, tokenize={}, fpe={}",
+            "Running preprocessing: suppress={}, hash_salt={}, hash={}, mask={}, encrypt={}, charcloak={}, tokenize={}",
             cfg.suppress.len(), cfg.hashing_with_salt.len(), cfg.hashing_without_salt.len(),
             cfg.masking.len(), cfg.encrypt.len(), cfg.charcloak.len(),
-            cfg.tokenization.len(), cfg.fpe.len(),
+            cfg.tokenization.len(),
         ));
         preprocess_chunks(&chunk_paths, &cfg)?;
         log.info("preprocessing", "Preprocessing complete");

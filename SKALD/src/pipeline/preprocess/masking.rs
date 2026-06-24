@@ -55,43 +55,6 @@ pub(super) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationCon
     Ok(TokenizationConfigLite { column, prefix, digits: digits as usize })
 }
 
-// ── FPE (format-preserving encryption) ───────────────────────────────────────
-
-/// Lightweight FPE configuration parsed from a pipeline config entry.
-///
-/// FPE encrypts a value while preserving its structural format (e.g. PAN, digits).
-#[derive(Debug)]
-pub(super) struct FpeConfigLite {
-    /// Target CSV column name.
-    pub(super) column: String,
-    /// Format type: `"pan"` (Indian PAN) or `"digits"` (digit-only strings).
-    pub(super) format: String,
-}
-
-/// Parses a single FPE config entry from the pipeline JSON.
-///
-/// # Arguments
-/// * `entry` — a JSON object with keys `"column"` (required) and `"format"`.
-///
-/// # Errors
-/// Returns [`PipelineError`] with code `PREPROCESS_CONFIG_INVALID` if the
-/// entry is malformed or `"format"` is not `"pan"` or `"digits"`.
-pub(super) fn parse_fpe_config(entry: &Value) -> Result<FpeConfigLite, PipelineError> {
-    let obj = entry
-        .as_object()
-        .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "Each FPE entry must be an object", "fpe"))?;
-    let column = obj
-        .get("column")
-        .and_then(Value::as_str)
-        .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "FPE config missing 'column'", "fpe"))?
-        .to_string();
-    let format = obj.get("format").and_then(Value::as_str).unwrap_or("pan").to_string();
-    if format != "pan" && format != "digits" {
-        return Err(validation("PREPROCESS_CONFIG_INVALID", "FPE format must be 'pan' or 'digits'", &column));
-    }
-    Ok(FpeConfigLite { column, format })
-}
-
 // ── Symmetric / format-preserving encryption config ──────────────────────────
 
 /// Lightweight encryption configuration parsed from a pipeline config entry.

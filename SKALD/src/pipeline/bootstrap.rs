@@ -58,7 +58,6 @@ pub struct RuntimeConfig {
     pub encrypt: Vec<Value>,
     pub charcloak: Vec<String>,
     pub tokenization: Vec<Value>,
-    pub fpe: Vec<Value>,
     pub numerical_qis: Vec<NumericalQiConfig>,
     pub categorical_qis: Vec<String>,
     pub size_factors: HashMap<String, i64>,
@@ -428,12 +427,6 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         .cloned()
         .unwrap_or_default();
 
-    let fpe = section
-        .get("fpe")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
     let suppression_limit = section
         .get("suppression_limit")
         .and_then(Value::as_f64)
@@ -551,7 +544,6 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         encrypt,
         charcloak,
         tokenization,
-        fpe,
         numerical_qis,
         categorical_qis,
         size_factors,

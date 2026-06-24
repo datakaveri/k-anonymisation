@@ -215,7 +215,7 @@ pub(super) fn format_preserving_encrypt_general(value: &str, master_key: &str, c
 }
 
 /// Encrypts `value` using a deterministic XOR keystream derived from successive
-/// HMAC-SHA256 blocks, then hex-encodes the result with an `"ENC$"` prefix.
+/// HMAC-SHA256 blocks, then hex-encodes the result.
 ///
 /// The keystream never repeats regardless of value length because each 16-byte
 /// block uses a unique counter as part of its HMAC context.
@@ -235,60 +235,11 @@ pub(super) fn pseudo_encrypt(value: &str, key: &str, column: &str) -> String {
         keystream.extend_from_slice(&derive_key(key, &ctx));
         block_idx += 1;
     }
-    let mut out = String::from("ENC$");
+    let mut out = String::with_capacity(plaintext.len() * 2);
     for (p, k) in plaintext.iter().zip(keystream.iter()) {
         out.push_str(&format!("{:02x}", p ^ k));
     }
     out
-}
-
-/// Format-preserving encryption for 10-character Indian PAN numbers
-/// (`[A-Z]{5}[0-9]{4}[A-Z]`).
-///
-/// Encrypts the three structural parts (prefix letters, digits, suffix letter)
-/// independently using separate derived keys so the PAN structure is preserved.
-/// If `value` does not match the expected PAN format it is returned unchanged.
-///
-/// # Arguments
-/// * `value` — the PAN string (must be exactly 10 chars in the correct format).
-/// * `master_key` — the column-level master key.
-pub(super) fn fpe_pan_encrypt(value: &str, master_key: &str) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() != 10
-        || !chars[..5].iter().all(|c| c.is_ascii_uppercase())
-        || !chars[5..9].iter().all(|c| c.is_ascii_digit())
-        || !chars[9].is_ascii_uppercase()
-    {
-        return value.to_string();
-    }
-    let letters_key = derive_key(master_key, "pan_letters");
-    let digits_key = derive_key(master_key, "pan_digits");
-    let suffix_key = derive_key(master_key, "pan_suffix");
-    let part1: String = chars[..5].iter().collect();
-    let part2: String = chars[5..9].iter().collect();
-    let part3: String = chars[9..10].iter().collect();
-
-    let e1 = fpe_encrypt(&letters_key, &part1, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
-    let e2 = fpe_encrypt(&digits_key, &part2, "0123456789");
-    let e3 = fpe_encrypt(&suffix_key, &part3, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
-    format!("{e1}{e2}{e3}")
-}
-
-/// Format-preserving encryption for digit-only strings (e.g. phone numbers,
-/// Aadhaar numbers).
-///
-/// Returns `value` unchanged if it is empty or contains any non-digit character.
-/// The derived key is unique per (column-level key, digit-string length).
-///
-/// # Arguments
-/// * `value` — the digit string to encrypt.
-/// * `master_key` — the column-level master key.
-pub(super) fn fpe_digits_encrypt(value: &str, master_key: &str) -> String {
-    if value.is_empty() || !value.chars().all(|c| c.is_ascii_digit()) {
-        return value.to_string();
-    }
-    let key = derive_key(master_key, &format!("digits_len_{}", value.len()));
-    fpe_encrypt(&key, value, "0123456789")
 }
 
 // ── Class-preserving randomization ───────────────────────────────────────────
