@@ -4,7 +4,7 @@ use super::anonymization::{
     find_ola2_best_rf_z_detailed, generalize_and_write_outputs, merge_z_histogram,
     scan_chunks_for_flow, z_hist_to_sparse, QuasiIdentifierLite,
 };
-use super::bootstrap::{find_first_json_config, parse_runtime_config, split_csv_by_ram, FlowMode};
+use super::bootstrap::{csv_quote_field, csv_row_to_line, find_first_json_config, parse_runtime_config, split_csv_line_basic, split_csv_by_ram, FlowMode};
 use super::pipeline::run_pipeline;
 use super::preprocess::preprocess_chunks;
 use std::collections::HashMap;

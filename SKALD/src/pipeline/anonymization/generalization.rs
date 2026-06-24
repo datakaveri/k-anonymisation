@@ -12,7 +12,7 @@
 //! After all per-chunk output files are written they are merged into a single
 //! final CSV and the intermediates are deleted.
 
-use crate::pipeline::bootstrap::{split_csv_line_basic, validation, PipelineError};
+use crate::pipeline::bootstrap::{csv_row_to_line, split_csv_line_basic, validation, PipelineError};
 use super::{QuasiIdentifierLite, base_col_name};
 use std::collections::BTreeMap;
 use std::fs;
@@ -219,7 +219,7 @@ pub fn generalize_and_write_outputs(
             let _ = lines.next(); // skip header
 
             let mut w = BufWriter::new(fs::File::create(&tmp_path)?);
-            w.write_all(headers.join(",").as_bytes())?;
+            w.write_all(csv_row_to_line(&headers).as_bytes())?;
             w.write_all(b"\n")?;
 
             for line in lines {
@@ -256,7 +256,7 @@ pub fn generalize_and_write_outputs(
                     *class_counts.entry(key).or_insert(0) += 1;
                 }
 
-                w.write_all(fields.join(",").as_bytes())?;
+                w.write_all(csv_row_to_line(&fields).as_bytes())?;
                 w.write_all(b"\n")?;
             }
             w.flush()?;
@@ -271,7 +271,7 @@ pub fn generalize_and_write_outputs(
             let _ = lines.next(); // skip header written by pass 1
 
             let mut w = BufWriter::new(fs::File::create(&out_path)?);
-            w.write_all(headers.join(",").as_bytes())?;
+            w.write_all(csv_row_to_line(&headers).as_bytes())?;
             w.write_all(b"\n")?;
 
             for line in lines {
@@ -295,7 +295,7 @@ pub fn generalize_and_write_outputs(
                     }
                 }
 
-                w.write_all(fields.join(",").as_bytes())?;
+                w.write_all(csv_row_to_line(&fields).as_bytes())?;
                 w.write_all(b"\n")?;
             }
             w.flush()?;
