@@ -129,6 +129,7 @@ fn generalize_marks_only_qi_columns() {
         2,
         &outdir,
         "final.csv",
+        &HashMap::new(),
     )
     .expect("generalize");
 

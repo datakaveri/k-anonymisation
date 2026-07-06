@@ -41,6 +41,10 @@ impl From<serde_json::Error> for PipelineError {
     }
 }
 
+/// Per-column categorical generalization hierarchy.
+/// `{ "column_name": { "leaf_value": ["level2", "level3", …], "*": ["fallback_level2", …] } }`
+pub type HierarchyMap = HashMap<String, HashMap<String, Vec<String>>>;
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub enable_k_anonymity: bool,
@@ -60,6 +64,7 @@ pub struct RuntimeConfig {
     pub tokenization: Vec<Value>,
     pub numerical_qis: Vec<NumericalQiConfig>,
     pub categorical_qis: Vec<String>,
+    pub categorical_hierarchies: HierarchyMap,
     pub size_factors: HashMap<String, i64>,
     pub source_json_config: PathBuf,
     /// Per-column non-uniform interval constraints: column → sorted list of (from, to) intervals
@@ -527,6 +532,25 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         }
     }
 
+    let mut categorical_hierarchies: HierarchyMap = HashMap::new();
+    if let Some(hier_obj) = section.get("categorical_hierarchies").and_then(Value::as_object) {
+        for (col, col_val) in hier_obj {
+            if let Some(col_obj) = col_val.as_object() {
+                let mut col_map: HashMap<String, Vec<String>> = HashMap::new();
+                for (leaf, levels_val) in col_obj {
+                    if let Some(levels_arr) = levels_val.as_array() {
+                        let levels: Vec<String> = levels_arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect();
+                        col_map.insert(leaf.clone(), levels);
+                    }
+                }
+                categorical_hierarchies.insert(col.trim().to_lowercase(), col_map);
+            }
+        }
+    }
+
     let mut size_factors = HashMap::new();
     if let Some(obj) = section.get("size").and_then(Value::as_object) {
         for (k, v) in obj {
@@ -561,6 +585,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         tokenization,
         numerical_qis,
         categorical_qis,
+        categorical_hierarchies,
         size_factors,
         source_json_config: config_path.to_path_buf(),
         qi_interval_constraints,

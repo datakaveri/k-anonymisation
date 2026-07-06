@@ -381,7 +381,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     log_histogram_diagnostic(&mut log, "hist_diag", &merged_label, &merged_sparse, 10);
 
     log.info("generalization", &format!("Generalizing and writing output to {}", output_dir_path.display()));
-    generalize_and_write_outputs(&chunk_paths, &qis, &final_rf, cfg.k, &output_dir_path, &cfg.output_path)?;
+    generalize_and_write_outputs(&chunk_paths, &qis, &final_rf, cfg.k, &output_dir_path, &cfg.output_path, &cfg.categorical_hierarchies)?;
     log.info("generalization", "Output written");
 
     ensure_output_dir(&output_dir_path)?;

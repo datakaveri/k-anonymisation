@@ -12,7 +12,7 @@
 //! After all per-chunk output files are written they are merged into a single
 //! final CSV and the intermediates are deleted.
 
-use crate::pipeline::bootstrap::{csv_row_to_line, split_csv_line_basic, validation, PipelineError};
+use crate::pipeline::bootstrap::{csv_row_to_line, split_csv_line_basic, validation, HierarchyMap, PipelineError};
 use super::{QuasiIdentifierLite, base_col_name};
 use std::collections::BTreeMap;
 use std::fs;
@@ -37,85 +37,29 @@ fn generalize_numeric_label(value: i64, min_val: i64, step: i64) -> String {
     format!("[{}-{}]", bucket_start, bucket_end)
 }
 
-/// Maps a categorical value to its generalized form at the given level.
+/// Maps a categorical value to its generalized form at the given level using the
+/// runtime hierarchy map loaded from config.
 ///
-/// Supported columns and their hierarchies:
-///
-/// | Column | Level 1 | Level 2 | Level 3 | Level 4 |
-/// |--------|---------|---------|---------|---------|
-/// | `blood group` | exact | ABO letter | `*` | — |
-/// | `gender` | exact | `*` | — | — |
-/// | `profession` | exact | sector | super-sector | `*` |
-///
-/// Any unknown column is returned unchanged.
-///
-/// # Arguments
-/// * `column_name` — the QI column name (case-insensitive).
-/// * `value` — the original cell value.
-/// * `level` — the generalization level (clamped to ≥ 1).
-fn generalize_categorical_value(column_name: &str, value: &str, level: i64) -> String {
-    let key = column_name.trim().to_lowercase();
-    let lvl = level.max(1);
-    match key.as_str() {
-        "blood group" => {
-            if lvl <= 1 {
-                value.to_string()
-            } else if lvl == 2 {
-                match value {
-                    "A+" | "A-" => "A".to_string(),
-                    "B+" | "B-" => "B".to_string(),
-                    "AB+" | "AB-" => "AB".to_string(),
-                    "O+" | "O-" => "O".to_string(),
-                    _ => "Other".to_string(),
-                }
-            } else {
-                "*".to_string()
-            }
-        }
-        "gender" => {
-            if lvl <= 1 {
-                value.to_string()
-            } else {
-                "*".to_string()
-            }
-        }
-        "profession" => {
-            if lvl <= 1 {
-                value.to_string()
-            } else if lvl == 2 {
-                match value {
-                    "Medical Specialists" | "Allied Health" | "Nursing" | "Healthcare Support" => "Healthcare".to_string(),
-                    "K-12 Education Teacher" | "Higher Education Teacher" | "Supplemental Education Teacher" | "University Professor" => "Education".to_string(),
-                    "Performing Arts" | "Visual & Media Arts" | "Design" | "Mixed Media Artist" => "Creative".to_string(),
-                    "Traditional Engineering" | "Software Engineering" | "Data & Analytics" | "AI & Machine Learning" => "Engineering".to_string(),
-                    _ => "Other".to_string(),
-                }
-            } else if lvl == 3 {
-                match value {
-                    "Medical Specialists"
-                    | "Allied Health"
-                    | "Nursing"
-                    | "Healthcare Support"
-                    | "K-12 Education Teacher"
-                    | "Higher Education Teacher"
-                    | "Supplemental Education Teacher"
-                    | "University Professor" => "Service Sector".to_string(),
-                    "Performing Arts"
-                    | "Visual & Media Arts"
-                    | "Design"
-                    | "Mixed Media Artist"
-                    | "Traditional Engineering"
-                    | "Software Engineering"
-                    | "Data & Analytics"
-                    | "AI & Machine Learning" => "Non-Service".to_string(),
-                    _ => "Other".to_string(),
-                }
-            } else {
-                "*".to_string()
-            }
-        }
-        _ => value.to_string(),
+/// `level <= 1` always returns the original value. For `level >= 2` the function
+/// looks up `column_name` (case-insensitive) in `hierarchies`, then looks up
+/// `value` within that column map (falling back to the `"*"` catch-all row if
+/// the exact value is absent). The generalized string is taken from index
+/// `level - 2` of the levels list, defaulting to `"*"` if the index is out of
+/// range. Columns absent from the hierarchy are returned unchanged at level 1
+/// and suppressed to `"*"` at higher levels.
+fn generalize_categorical_value(hierarchies: &HierarchyMap, column_name: &str, value: &str, level: i64) -> String {
+    if level <= 1 {
+        return value.to_string();
     }
+    let key = column_name.trim().to_lowercase();
+    if let Some(col_map) = hierarchies.get(&key) {
+        let row = col_map.get(value).or_else(|| col_map.get("*"));
+        if let Some(levels) = row {
+            let idx = (level - 2) as usize;
+            return levels.get(idx).cloned().unwrap_or_else(|| "*".to_string());
+        }
+    }
+    "*".to_string()
 }
 
 /// Generates the output filename for a single generalized chunk.
@@ -159,6 +103,7 @@ pub fn generalize_and_write_outputs(
     k: i64,
     output_dir: &Path,
     output_path: &str,
+    hierarchies: &HierarchyMap,
 ) -> Result<(), PipelineError> {
     if final_rf.len() != qis.len() {
         return Err(validation("GENERALIZATION_FAILED", "final_rf length mismatch", "generalization"));
@@ -239,7 +184,7 @@ pub fn generalize_and_write_outputs(
                     }
                     if qi.is_categorical {
                         let v = fields[*src_idx].clone();
-                        fields[*src_idx] = generalize_categorical_value(&qi.column_name, &v, *bw);
+                        fields[*src_idx] = generalize_categorical_value(hierarchies, &qi.column_name, &v, *bw);
                     } else {
                         if let Ok(v) = fields[*src_idx].trim().parse::<f64>() {
                             let qi_pos = qis.iter().position(|q| std::ptr::eq(q, qi)).unwrap_or(0);
