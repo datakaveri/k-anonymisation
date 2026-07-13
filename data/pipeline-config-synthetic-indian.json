@@ -23,6 +23,10 @@
       "Street Address"
     ],
 
+    "hashing_with_key": [
+      "Aadhaar"
+    ],
+
     "masking": [
       {
         "column": "Aadhaar",

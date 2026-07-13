@@ -58,6 +58,7 @@ pub struct RuntimeConfig {
     pub suppress: Vec<String>,
     pub hashing_with_salt: Vec<String>,
     pub hashing_without_salt: Vec<String>,
+    pub hashing_with_key: Vec<String>,
     pub masking: Vec<Value>,
     pub encrypt: Vec<Value>,
     pub charcloak: Vec<String>,
@@ -418,6 +419,17 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         })
         .unwrap_or_default();
 
+    let hashing_with_key = section
+        .get("hashing_with_key")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     let masking = section
         .get("masking")
         .and_then(Value::as_array)
@@ -579,6 +591,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         suppress,
         hashing_with_salt,
         hashing_without_salt,
+        hashing_with_key,
         masking,
         encrypt,
         charcloak,

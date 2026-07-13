@@ -68,6 +68,20 @@ pub(super) fn hash_hex(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Computes a nested keyed hash: `t = hash(key + hash(key + message))`.
+///
+/// The inner hash binds the key to the message; the outer hash re-binds the
+/// key to that result, so recovering `message` requires knowing `key` even
+/// if the inner SHA-256 were ever partially reversed.
+///
+/// # Arguments
+/// * `key` — the column-level key.
+/// * `message` — the plaintext string to hash.
+pub(super) fn nested_hash_hex(key: &str, message: &str) -> String {
+    let inner = hash_hex(&format!("{key}{message}"));
+    hash_hex(&format!("{key}{inner}"))
+}
+
 // ── Value guards ─────────────────────────────────────────────────────────────
 
 /// Returns `true` when `v` should be left unchanged (empty or `"nan"`).

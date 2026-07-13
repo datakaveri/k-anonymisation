@@ -10,6 +10,7 @@
 //! | Column suppression | `suppress` | Drop columns entirely from output |
 //! | Salted hashing | `hashing_with_salt` | SHA-256 with a per-run random salt |
 //! | Unsalted hashing | `hashing_without_salt` | Deterministic SHA-256 |
+//! | Keyed nested hashing | `hashing_with_key` | `t = hash(key + hash(key + message))` with a per-run random key |
 //! | Masking | `masking` | Position / regex / class-based character masking |
 //! | CharCloak | `charcloak` | Class-preserving random character replacement |
 //! | Tokenization | `tokenization` | Sequential opaque tokens with vault persistence |
@@ -34,6 +35,7 @@ use crypto::{
     generate_random_key_hex,
     generate_random_salt_hex,
     hash_hex,
+    nested_hash_hex,
     pseudo_encrypt,
     randomize_preserving_class,
     read_json_map_string,
@@ -144,6 +146,11 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
     let fpe_encrypt_keys_path = out_dir.join("fpe_encrypt_keys.json");
     let mut fpe_encrypt_keys = read_json_map_string(&fpe_encrypt_keys_path)?;
 
+    // Per-column CSPRNG keys for nested keyed hashing — persisted to disk so the
+    // same column maps to the same hash across runs (mirrors symmetric/FPE key storage).
+    let hash_keys_path = out_dir.join("hash_keys.json");
+    let mut hash_keys = read_json_map_string(&hash_keys_path)?;
+
     for chunk_path in chunks {
         let file = fs::File::open(chunk_path)?;
         let reader = BufReader::new(file);
@@ -224,6 +231,27 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
                     continue;
                 }
                 row[idx] = hash_hex(&v);
+            }
+        }
+
+        for col in &cfg.hashing_with_key {
+            let idx = headers
+                .iter()
+                .position(|h| h == col)
+                .ok_or_else(|| validation("PREPROCESS_COLUMN_MISSING", "Column not found in CSV header for keyed hashing", col))?;
+            let key = hash_keys
+                .entry(col.clone())
+                .or_insert_with(generate_random_key_hex)
+                .clone();
+            for row in &mut rows {
+                if idx >= row.len() {
+                    continue;
+                }
+                let v = row[idx].clone();
+                if should_skip_value(&v) {
+                    continue;
+                }
+                row[idx] = nested_hash_hex(&key, &v);
             }
         }
 
@@ -361,6 +389,10 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
     write_json_pretty(
         &fpe_encrypt_keys_path,
         &Value::Object(fpe_encrypt_keys.into_iter().map(|(k, v)| (k, Value::String(v))).collect()),
+    )?;
+    write_json_pretty(
+        &hash_keys_path,
+        &Value::Object(hash_keys.into_iter().map(|(k, v)| (k, Value::String(v))).collect()),
     )?;
 
     Ok(())
