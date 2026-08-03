@@ -79,6 +79,10 @@ pub struct RuntimeConfig {
     /// When true (default), compute the k × suppression_limit parameter grid.
     /// Set to false in benchmarks to skip the 12 extra OLA-2 searches.
     pub compute_param_grid: bool,
+    /// Optional, config-driven join keys for multi-sheet Excel inputs.
+    /// When empty, sheets are auto-joined on shared column names (see
+    /// `multitabular::resolve_input_csv`).
+    pub sheet_joins: Vec<crate::pipeline::multitabular::SheetJoinSpec>,
 }
 
 /// Controls which histogram-building algorithm SKALD uses.
@@ -188,11 +192,22 @@ pub fn suggested_fix_for(code: &str) -> &'static str {
         "DATA_DIR_MISSING" | "DATA_MISSING" =>
             "Create a data/ directory and place exactly one CSV file inside it.",
         "DATA_NO_CSV" =>
-            "No CSV file found in data/. \
-             Add exactly one CSV file with a header row.",
+            "No CSV, JSON, or Excel file found in data/. \
+             Add exactly one .csv, .json, or .xlsx/.xls file.",
+        "DATA_AMBIGUOUS_INPUT" =>
+            "More than one input data file found in data/. \
+             Keep exactly one .csv, .json, or .xlsx/.xls file.",
         "DATA_EMPTY" =>
-            "The CSV file exists but is empty. \
+            "The input file exists but is empty. \
              Ensure it has a header row and at least one data row.",
+        "DATA_JSON_INVALID" =>
+            "JSON input must be a top-level array of flat objects, one per record. \
+             Example: [{\"col1\": \"val\"}, {\"col1\": \"val2\"}].",
+        "DATA_XLSX_INVALID" =>
+            "The Excel workbook could not be read, or a sheet_joins step \
+             referenced an unknown sheet or a column missing from one of the sheets. \
+             Verify the workbook opens correctly and that sheet_joins names and \
+             'on' columns match the actual sheet headers.",
         "DATA_COLUMN_MISSING" =>
             "A quasi-identifier column was not found in the CSV header. \
              Column names are case-sensitive — verify they match exactly.",
@@ -245,7 +260,10 @@ pub fn http_status_for(code: &str) -> u16 {
         "DATA_DIR_MISSING"
         | "DATA_MISSING"
         | "DATA_NO_CSV"
+        | "DATA_AMBIGUOUS_INPUT"
         | "DATA_EMPTY"
+        | "DATA_JSON_INVALID"
+        | "DATA_XLSX_INVALID"
         | "DATA_COLUMN_MISSING"
         | "PREPROCESS_COLUMN_MISSING"
         | "PREPROCESSING_FAILED"
@@ -569,6 +587,8 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         _                                               => FlowMode::Auto,
     };
 
+    let sheet_joins = crate::pipeline::multitabular::parse_sheet_joins(section)?;
+
     Ok(RuntimeConfig {
         enable_k_anonymity: has_k_anonymize && has_qis,
         pass,
@@ -595,6 +615,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
             .get("compute_parameter_grid")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        sheet_joins,
     })
 }
 
@@ -665,11 +686,16 @@ fn compute_rows_per_chunk(avg_row_bytes: usize) -> usize {
     target.clamp(MIN_ROWS, MAX_ROWS)
 }
 
+/// Convenience wrapper for plain single-CSV input: finds the one non-empty
+/// `.csv` in `data_dir` and chunks it. `data_dir` is only ever read, never
+/// written — safe under a read-only mount (e.g. docker-compose's `:ro` data
+/// volume). JSON/Excel inputs go through `multitabular::resolve_input_csv`
+/// first, which writes a normalised CSV into `chunks_dir` instead, then call
+/// `split_csv_file_by_ram` directly on that path.
 pub fn split_csv_by_ram(
     data_dir: &Path,
     chunks_dir: &Path,
 ) -> Result<(Vec<PathBuf>, usize), PipelineError> {
-    fs::create_dir_all(chunks_dir)?;
     let csvs = list_non_empty_csvs(data_dir)?;
     if csvs.len() != 1 {
         return Err(validation(
@@ -678,7 +704,15 @@ pub fn split_csv_by_ram(
             &format!("found {} CSV files — remove extras or consolidate into one", csvs.len()),
         ));
     }
-    let input = &csvs[0];
+    split_csv_file_by_ram(&csvs[0], chunks_dir)
+}
+
+/// Splits a single known CSV file into RAM-sized chunks under `chunks_dir`.
+pub fn split_csv_file_by_ram(
+    input: &Path,
+    chunks_dir: &Path,
+) -> Result<(Vec<PathBuf>, usize), PipelineError> {
+    fs::create_dir_all(chunks_dir)?;
 
     // Sample before opening the streaming reader so we can seek back to the start.
     let avg_row_bytes = sample_avg_row_bytes(input, 200);

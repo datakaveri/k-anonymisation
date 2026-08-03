@@ -72,3 +72,10 @@ error_codes.txt
 tests/
 
 fhir_anonymizer/
+/dp/
+/pipeline/
+/synthetic/
+
+*.coverage
+
+

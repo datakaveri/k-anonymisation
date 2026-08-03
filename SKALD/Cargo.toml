@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 aes = "0.8"
+calamine = "0.36"
 cipher = "0.4"
 hex = "0.4"
 hmac = "0.12"

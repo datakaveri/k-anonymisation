@@ -8,8 +8,9 @@ use crate::pipeline::anonymization::{
 };
 use crate::pipeline::bootstrap::{
     available_ram_bytes, ensure_output_dir, find_first_json_config, parse_runtime_config,
-    split_csv_by_ram, FlowMode, Logger, PipelineError, StatusPayload,
+    split_csv_file_by_ram, FlowMode, Logger, PipelineError, StatusPayload,
 };
+use crate::pipeline::multitabular::resolve_input_csv;
 use crate::pipeline::preprocess::preprocess_chunks;
 use serde_json::json;
 use std::fs;
@@ -31,9 +32,16 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
         pass, cfg.k, cfg.suppression_limit
     ));
 
+    // ── Input normalisation (CSV / JSON / multi-sheet Excel → single CSV) ────
+    // data/ is mounted read-only in deployment, so JSON/Excel inputs are
+    // normalised into chunks/ (read-write scratch) instead; a plain .csv
+    // input is returned as-is, still pointing into data/.
+    log.info("input", "Resolving input data format (csv/json/xlsx)");
+    let input_csv = resolve_input_csv(&root.join("data"), &root.join("chunks"), &cfg.sheet_joins)?;
+
     // ── Chunking (all passes need the raw CSV split) ─────────────────────────
     log.info("chunking", "Splitting CSV into RAM-sized chunks");
-    let (chunk_paths, rows_per_chunk) = split_csv_by_ram(&root.join("data"), &root.join("chunks"))?;
+    let (chunk_paths, rows_per_chunk) = split_csv_file_by_ram(&input_csv, &root.join("chunks"))?;
     log.info("chunking", &format!("{} chunk(s), ~{} rows/chunk", chunk_paths.len(), rows_per_chunk));
 
     // ── Preprocess-only path (no k-anonymity configured) ─────────────────────
