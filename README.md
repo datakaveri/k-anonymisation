@@ -120,7 +120,8 @@ Place a single JSON file in `config/`. Full example:
     "compute_parameter_grid": true,
     "sheet_joins": [
       { "left": "patients", "right": "visits", "on": "patient_id", "how": "left" }
-    ]
+    ],
+    "restore_sheets": false
   }
 }
 ```
@@ -138,6 +139,7 @@ Place a single JSON file in `config/`. Full example:
 | `flow_mode` | `"auto"` \| `"original"` \| `"direct"` | Which OLA search strategy to use (see [Flow modes](#flow-modes--direct-vs-original) below). Default `"auto"`. |
 | `compute_parameter_grid` | bool | When true (default), also compute the k × suppression_limit parameter grid (extra OLA-2 searches). Set `false` in benchmarks to skip it. |
 | `sheet_joins` | array | Config-driven join steps for multi-sheet Excel input: `{ "left": "<sheet>", "right": "<sheet>", "on": "<col>" \| ["<col>", ...], "how": "left"\|"right"\|"inner"\|"outer"\|"cross" }`. If omitted, sheets with a shared column are auto-joined; sheets with no shared columns are concatenated by row position. Only used when the input file is `.xlsx`/`.xls`. |
+| `restore_sheets` | bool | When true, also write the anonymized result back as a multi-sheet `.xlsx` mirroring the original input sheets (see [Restoring per-sheet output](#restoring-per-sheet-output-restore_sheets)). Default `false`. Only takes effect when sheets were merged via explicit `sheet_joins` (or there was only one sheet). |
 
 **FPE note:** the legacy `"fpe"` config section (PAN/digits-specific format-preserving encryption) has been removed from the Rust pipeline. General format-preserving encryption is still available via `encrypt` + `"format_preserving": true`. The PAN/digits-specific algorithms remain documented in `SKALD/preprocess.py` (reference implementation) and are invertible via `scripts/reverse_fpe.py` for data already encrypted under the old scheme.
 
@@ -154,6 +156,7 @@ Place a single JSON file in `config/`. Full example:
 | `output/top_ola2_nodes.json` | Top-ranked generalization nodes from OLA-2 |
 | `output/token_vault.json` | Token↔value mapping (if tokenization used) |
 | `output/symmetric_keys.json` | Symmetric encryption keys (if `encrypt` used) |
+| `output/<output_path stem>.xlsx` | Anonymized multi-sheet workbook (if `restore_sheets: true` and applicable — see [Restoring per-sheet output](#restoring-per-sheet-output-restore_sheets)) |
 
 `fpe_keys.json` is only produced by the legacy `SKALD/preprocess.py` reference path (PAN/digits FPE), not the Rust pipeline — see the FPE note under [Config schema](#config-schema).
 
@@ -173,7 +176,8 @@ Place a single JSON file in `config/`. Full example:
     "flow":                    "DIRECT_Z",
     "n_approx":                50000,
     "equivalence_space":       48000,
-    "n_log2_n":                793157.4
+    "n_log2_n":                793157.4,
+    "restored_workbook_path":  null
   },
   "log_file": "output/pipeline.log"
 }
@@ -327,7 +331,8 @@ Join them on `patient_id` with a `sheet_joins` config, and generalize `Blood Gro
       { "left": "Patients", "right": "Visits", "on": "patient_id", "how": "left" }
     ],
 
-    "k_anonymize": { "k": 2 }
+    "k_anonymize": { "k": 2 },
+    "restore_sheets": true
   }
 }
 ```
@@ -339,6 +344,8 @@ docker compose up --build
 cat output/status.json   # outputs.sample_generalized_rows shows the joined + generalized rows
 ```
 
+With `restore_sheets: true`, `output/generalized.xlsx` comes back out with the same two sheets — `Patients` (patient_id, Age, Blood Group, PIN Code) and `Visits` (patient_id, diagnosis_code) — populated with the anonymized values instead of the flat merged CSV.
+
 Two ready-to-run, verified examples (including a 3-sheet star-schema case) live in
 [`examples/multitabular/`](examples/multitabular/README.md) — copy either straight into `data/`/`config/`.
 
@@ -348,6 +355,16 @@ Things worth double-checking if it doesn't work:
 - `on` must be a column present in **both** sheets — otherwise also `DATA_XLSX_INVALID`.
 - With more than two sheets, chain multiple `sheet_joins` steps against the same `left` sheet name to build a star schema (each step's `right` sheet joins onto the running `left` frame).
 - If `sheet_joins` is omitted entirely: sheets with identical column sets are stacked as more rows; otherwise SKALD auto-joins on whatever column names the sheets have in common, or concatenates by row position if they share none — explicit `sheet_joins` is more predictable and recommended once you have more than one sheet.
+
+### Restoring per-sheet output (`restore_sheets`)
+
+By default, anonymized output is always one flat CSV, even when the input was multi-sheet Excel — SKALD joins everything into one table before anonymizing, since QI columns can span sheets and equivalence classes have to be computed over the full joined row.
+
+Set `"restore_sheets": true` to also get an anonymized `.xlsx` workbook back, with one sheet per **original input sheet**, restored to its original column names/order (join key columns included in every sheet that needs them). It's written alongside the usual flat CSV, named from the same `output_path` stem (e.g. `output_path: "generalized.csv"` → `output/generalized.xlsx`), and its path is reported at `outputs.restored_workbook_path` in `status.json`.
+
+If a sheet's rows were fanned out by the join (e.g. a patient with several visits), the corresponding restored rows are de-duplicated per sheet — a "Patients" sheet won't repeat the same patient once per visit.
+
+**Scope:** only supported when sheets were merged via an explicit `sheet_joins` config (both example demos use this), or when the input had a single sheet (trivial passthrough). It is **not** supported for the auto-join or same-schema-vertical-concat fallback paths — with `restore_sheets: true` but no `sheet_joins`, SKALD logs why and skips writing the workbook (the flat CSV is unaffected either way; this is purely an additional, best-effort output).
 
 ---
 

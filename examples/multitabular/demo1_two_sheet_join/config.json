@@ -29,6 +29,7 @@
       { "left": "Patients", "right": "Visits", "on": "patient_id", "how": "left" }
     ],
 
-    "k_anonymize": { "k": 2 }
+    "k_anonymize": { "k": 2 },
+    "restore_sheets": true
   }
 }

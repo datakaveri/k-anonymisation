@@ -83,6 +83,10 @@ pub struct RuntimeConfig {
     /// When empty, sheets are auto-joined on shared column names (see
     /// `multitabular::resolve_input_csv`).
     pub sheet_joins: Vec<crate::pipeline::multitabular::SheetJoinSpec>,
+    /// When true, also write the anonymized result back as a multi-sheet
+    /// `.xlsx` workbook mirroring the original input sheets (only meaningful
+    /// when the input was multi-sheet Excel joined via `sheet_joins`).
+    pub restore_sheets: bool,
 }
 
 /// Controls which histogram-building algorithm SKALD uses.
@@ -588,6 +592,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
     };
 
     let sheet_joins = crate::pipeline::multitabular::parse_sheet_joins(section)?;
+    let restore_sheets = section.get("restore_sheets").and_then(Value::as_bool).unwrap_or(false);
 
     Ok(RuntimeConfig {
         enable_k_anonymity: has_k_anonymize && has_qis,
@@ -616,6 +621,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
             .and_then(Value::as_bool)
             .unwrap_or(true),
         sheet_joins,
+        restore_sheets,
     })
 }
 

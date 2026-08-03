@@ -10,11 +10,12 @@
 
 use crate::pipeline::bootstrap::{csv_row_to_line, io_err, validation, PipelineError};
 use calamine::{open_workbook_auto, Data, Range, Reader};
+use rust_xlsxwriter::Workbook;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A minimal in-memory table: ordered column names + row-major string cells.
 /// Empty string represents a missing/null value (mirrors pandas' NaN → "").
@@ -418,6 +419,187 @@ pub fn apply_sheet_joins(
     Ok(frames.remove(&root).expect("root sheet always present in frames"))
 }
 
+// ── Restoring per-sheet output after anonymization ──────────────────────────
+//
+// To write anonymized results back out as one workbook per original sheet, we
+// need to know, for every column in the merged table, which original sheet
+// (and original column name) it came from. `TrackedSheet` shadows `merge_two`
+// /`apply_sheet_joins` with a parallel `origins` vector (same length and
+// index order as `sheet.columns`) that carries this provenance through the
+// same join steps. Restoring is only supported for the explicit `sheet_joins`
+// path — auto-join and same-schema vertical concat don't track it (see
+// `merge_excel_sheets`).
+
+/// Which original sheet + column a single merged-table column came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnOrigin {
+    pub sheet: String,
+    pub original_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedSheet {
+    sheet: Sheet,
+    /// Parallel to `sheet.columns` — origins[i] describes sheet.columns[i].
+    origins: Vec<ColumnOrigin>,
+}
+
+fn seed_tracked(name: &str, sheet: Sheet) -> TrackedSheet {
+    let origins = sheet
+        .columns
+        .iter()
+        .map(|c| ColumnOrigin { sheet: name.to_string(), original_name: c.clone() })
+        .collect();
+    TrackedSheet { sheet, origins }
+}
+
+/// Same join as `merge_two`, but also produces the provenance vector for the
+/// result. Relies on `merge_two`'s column ordering being exactly
+/// `left.columns` (unchanged) followed by `right`'s non-key columns in order
+/// (or, for `how == "cross"`, all of `right.columns`) — see `merge_two`.
+fn merge_two_tracked(left: &TrackedSheet, right: &TrackedSheet, on: &[String], how: &str) -> TrackedSheet {
+    let merged = merge_two(&left.sheet, &right.sheet, on, how);
+
+    let mut origins = left.origins.clone();
+    if how == "cross" {
+        origins.extend(right.origins.iter().cloned());
+    } else {
+        let right_on_idx: HashSet<usize> = on.iter().filter_map(|c| column_index(&right.sheet, c)).collect();
+        origins.extend(
+            right
+                .origins
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !right_on_idx.contains(i))
+                .map(|(_, o)| o.clone()),
+        );
+    }
+
+    TrackedSheet { sheet: merged, origins }
+}
+
+/// Provenance-tracking twin of `apply_sheet_joins` — identical join logic and
+/// error handling, but threads `TrackedSheet` instead of `Sheet` so the caller
+/// can build a `SheetRestorePlan` from the result.
+fn apply_sheet_joins_tracked(
+    sheets: &[(String, Sheet)],
+    joins: &[SheetJoinSpec],
+    source_name: &str,
+) -> Result<TrackedSheet, PipelineError> {
+    let mut frames: HashMap<String, TrackedSheet> = sheets
+        .iter()
+        .cloned()
+        .map(|(name, sheet)| {
+            let tracked = seed_tracked(&name, sheet);
+            (name, tracked)
+        })
+        .collect();
+    let available: Vec<&str> = sheets.iter().map(|(n, _)| n.as_str()).collect();
+    let mut root: Option<String> = None;
+
+    for (idx, step) in joins.iter().enumerate() {
+        let step_no = idx + 1;
+        let left = frames.get(&step.left).cloned().ok_or_else(|| {
+            validation(
+                "DATA_XLSX_INVALID",
+                "sheet_joins references an unknown sheet",
+                &format!(
+                    "step {step_no}: left sheet '{}' not found in workbook '{source_name}'. Available: {available:?}",
+                    step.left
+                ),
+            )
+        })?;
+        let right = frames.get(&step.right).cloned().ok_or_else(|| {
+            validation(
+                "DATA_XLSX_INVALID",
+                "sheet_joins references an unknown sheet",
+                &format!(
+                    "step {step_no}: right sheet '{}' not found in workbook '{source_name}'. Available: {available:?}",
+                    step.right
+                ),
+            )
+        })?;
+
+        let missing_left: Vec<&str> = step.on.iter().filter(|c| !left.sheet.columns.contains(c)).map(String::as_str).collect();
+        let missing_right: Vec<&str> = step.on.iter().filter(|c| !right.sheet.columns.contains(c)).map(String::as_str).collect();
+        if !missing_left.is_empty() || !missing_right.is_empty() {
+            return Err(validation(
+                "DATA_XLSX_INVALID",
+                "sheet_joins join column(s) missing from sheet",
+                &format!(
+                    "step {step_no}: '{}' missing {missing_left:?}, '{}' missing {missing_right:?}",
+                    step.left, step.right
+                ),
+            ));
+        }
+
+        let merged = merge_two_tracked(&left, &right, &step.on, &step.how);
+        frames.insert(step.left.clone(), merged);
+        if root.is_none() {
+            root = Some(step.left.clone());
+        }
+    }
+
+    let root = root.ok_or_else(|| {
+        validation("CONFIG_INVALID_VALUE", "sheet_joins must contain at least one step", source_name)
+    })?;
+    Ok(frames.remove(&root).expect("root sheet always present in frames"))
+}
+
+/// One original sheet's reconstruction recipe: ordered
+/// `(merged_table_column_name, original_column_name)` pairs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SheetColumnPlan {
+    pub sheet_name: String,
+    pub columns: Vec<(String, String)>,
+}
+
+/// Recipe for splitting the final anonymized table back into one sheet per
+/// original input sheet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SheetRestorePlan {
+    pub sheets: Vec<SheetColumnPlan>,
+}
+
+/// Builds a `SheetRestorePlan` from the original (pre-join) sheets and the
+/// final merged table's provenance. Iterates each original sheet's own column
+/// order (not the merged table's) so restored sheets look like the input.
+///
+/// A join-key column's provenance is dropped by `merge_two_tracked` for the
+/// `right` side (it's a duplicate of `left`'s copy), but it always survives
+/// unrenamed in the merged table under its original name — so any original
+/// column whose name matches a merged-table column name exactly, even without
+/// a direct origin entry, is treated as a passthrough shared key.
+fn build_restore_plan(
+    original_sheets: &[(String, Sheet)],
+    final_columns: &[String],
+    final_origins: &[ColumnOrigin],
+) -> SheetRestorePlan {
+    let mut origin_lookup: HashMap<(String, String), String> = HashMap::new();
+    for (i, o) in final_origins.iter().enumerate() {
+        origin_lookup.insert((o.sheet.clone(), o.original_name.clone()), final_columns[i].clone());
+    }
+    let final_name_set: HashSet<&str> = final_columns.iter().map(String::as_str).collect();
+
+    let mut sheets = Vec::new();
+    for (sheet_name, sheet) in original_sheets {
+        let mut columns = Vec::new();
+        for col in &sheet.columns {
+            let final_name = origin_lookup
+                .get(&(sheet_name.clone(), col.clone()))
+                .cloned()
+                .or_else(|| final_name_set.contains(col.as_str()).then(|| col.clone()));
+            if let Some(final_name) = final_name {
+                columns.push((final_name, col.clone()));
+            }
+        }
+        if !columns.is_empty() {
+            sheets.push(SheetColumnPlan { sheet_name: sheet_name.clone(), columns });
+        }
+    }
+    SheetRestorePlan { sheets }
+}
+
 /// Fallback merge when no `sheet_joins` config is provided: merges sheets
 /// sequentially on auto-detected shared columns, falling back to a horizontal
 /// concat by row position when two adjacent sheets share no columns at all.
@@ -485,27 +667,47 @@ fn vertical_concat(sheets: &[(String, Sheet)]) -> Sheet {
 /// Python's `split_csv_by_ram` Excel-handling block:
 /// single sheet → use as-is; `sheet_joins` present → config-driven join;
 /// else same-schema → vertical concat; else → auto-detected joins.
+///
+/// Also returns a `SheetRestorePlan` when one can be established — currently
+/// only for the single-sheet and explicit-`sheet_joins` cases. Auto-detected
+/// joins and same-schema vertical concat return `None`: the former isn't
+/// tracked (would need the same provenance threading as `sheet_joins`, not
+/// yet done since neither has been requested), and the latter has no
+/// meaningful per-column restore (every sheet already shares one schema).
 pub fn merge_excel_sheets(
     sheets: Vec<(String, Sheet)>,
     sheet_joins: &[SheetJoinSpec],
     source_name: &str,
-) -> Result<Sheet, PipelineError> {
+) -> Result<(Sheet, Option<SheetRestorePlan>), PipelineError> {
     if sheets.len() == 1 {
-        return Ok(sheets.into_iter().next().expect("len == 1").1);
+        let (name, sheet) = sheets.into_iter().next().expect("len == 1");
+        let plan = SheetRestorePlan {
+            sheets: vec![SheetColumnPlan {
+                sheet_name: name,
+                columns: sheet.columns.iter().map(|c| (c.clone(), c.clone())).collect(),
+            }],
+        };
+        return Ok((sheet, Some(plan)));
     }
     if !sheet_joins.is_empty() {
-        return apply_sheet_joins(&sheets, sheet_joins, source_name);
+        let tracked = apply_sheet_joins_tracked(&sheets, sheet_joins, source_name)?;
+        let plan = build_restore_plan(&sheets, &tracked.sheet.columns, &tracked.origins);
+        return Ok((tracked.sheet, Some(plan)));
     }
     if same_schema(&sheets) {
-        return Ok(vertical_concat(&sheets));
+        return Ok((vertical_concat(&sheets), None));
     }
-    Ok(auto_join_sheets(&sheets))
+    Ok((auto_join_sheets(&sheets), None))
 }
 
 // ── Top-level input resolution ───────────────────────────────────────────────
 
 /// Detects the single input data file in `data_dir` (.csv / .json / .xlsx / .xls)
-/// and returns the path to a single CSV ready for chunking.
+/// and returns the path to a single CSV ready for chunking, plus a
+/// `SheetRestorePlan` when the input was multi-sheet Excel and a plan could be
+/// established (see `merge_excel_sheets`) — `None` for CSV/JSON input, single-
+/// sheet Excel with nothing to restore beyond itself, or a merge strategy that
+/// doesn't track provenance.
 ///
 /// `data_dir` is treated as read-only (it's mounted `:ro` in docker-compose) and
 /// is never written to. A plain `.csv` input is returned as-is, pointing back
@@ -516,7 +718,7 @@ pub fn resolve_input_csv(
     data_dir: &Path,
     chunks_dir: &Path,
     sheet_joins: &[SheetJoinSpec],
-) -> Result<std::path::PathBuf, PipelineError> {
+) -> Result<(PathBuf, Option<SheetRestorePlan>), PipelineError> {
     if !data_dir.is_dir() {
         return Err(validation("DATA_DIR_MISSING", "Data directory not found", &data_dir.display().to_string()));
     }
@@ -564,20 +766,20 @@ pub fn resolve_input_csv(
         let converted_path = chunks_dir.join("_converted.csv");
         let sheet = read_json_sheet(&jsons[0])?;
         write_sheet_csv(&sheet, &converted_path)?;
-        return Ok(converted_path);
+        return Ok((converted_path, None));
     }
     if !excels.is_empty() {
         fs::create_dir_all(chunks_dir)?;
         let converted_path = chunks_dir.join("_converted.csv");
         let sheets = read_xlsx_sheets(&excels[0])?;
         let source_name = excels[0].file_name().and_then(|n| n.to_str()).unwrap_or("input").to_string();
-        let merged = merge_excel_sheets(sheets, sheet_joins, &source_name)?;
+        let (merged, plan) = merge_excel_sheets(sheets, sheet_joins, &source_name)?;
         write_sheet_csv(&merged, &converted_path)?;
-        return Ok(converted_path);
+        return Ok((converted_path, plan));
     }
 
     // Sole .csv input: return it as-is, still under (read-only) data_dir.
-    Ok(csvs.remove(0))
+    Ok((csvs.remove(0), None))
 }
 
 fn write_sheet_csv(sheet: &Sheet, path: &Path) -> Result<(), PipelineError> {
@@ -592,6 +794,107 @@ fn write_sheet_csv(sheet: &Sheet, path: &Path) -> Result<(), PipelineError> {
         write_row(&mut writer, row).map_err(|e| io_err("write converted CSV row", &path.display().to_string(), e))?;
     }
     writer.flush().map_err(|e| io_err("flush converted CSV", &path.display().to_string(), e))?;
+    Ok(())
+}
+
+// ── Writing anonymized output back as per-sheet workbook ────────────────────
+
+/// Parses one RFC-4180 CSV line, inverting `csv_row_to_line`/`csv_quote_field`
+/// (handles quoted fields containing embedded commas or quotes). Operates
+/// line-by-line, so a quoted field spanning multiple lines would not round-trip
+/// — not a concern here since SKALD's own writer only ever quotes to escape
+/// commas/quotes, never raw newlines.
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == ',' {
+            fields.push(std::mem::take(&mut field));
+        } else {
+            field.push(c);
+        }
+    }
+    fields.push(field);
+    fields
+}
+
+/// Reads the final anonymized CSV and, per `plan`, splits it back into one
+/// worksheet per original input sheet — each restored to its original column
+/// names and order, with the shared join key(s) carried into every sheet that
+/// needs them. Rows are de-duplicated per sheet (by that sheet's own projected
+/// column values) since a join can fan a single original row for e.g. a
+/// one-sheet-to-many-rows relationship out across multiple merged rows.
+pub fn write_restored_workbook(
+    final_csv_path: &Path,
+    plan: &SheetRestorePlan,
+    xlsx_path: &Path,
+) -> Result<(), PipelineError> {
+    let content = fs::read_to_string(final_csv_path)
+        .map_err(|e| io_err("read final generalized CSV", &final_csv_path.display().to_string(), e))?;
+    let mut lines = content.lines();
+    let header = match lines.next() {
+        Some(h) => parse_csv_line(h),
+        None => {
+            return Err(validation(
+                "IO_READ_FAILED",
+                "Generalized output is empty — nothing to restore",
+                &final_csv_path.display().to_string(),
+            ))
+        }
+    };
+    let col_idx: HashMap<&str, usize> = header.iter().enumerate().map(|(i, h)| (h.as_str(), i)).collect();
+    let rows: Vec<Vec<String>> = lines.filter(|l| !l.is_empty()).map(parse_csv_line).collect();
+
+    let mut workbook = Workbook::new();
+    for sheet_plan in &plan.sheets {
+        let worksheet = workbook.add_worksheet();
+        worksheet.set_name(&sheet_plan.sheet_name).map_err(|e| {
+            validation("IO_WRITE_FAILED", "Invalid sheet name for xlsx output", &format!("'{}': {e}", sheet_plan.sheet_name))
+        })?;
+
+        for (c, (_, original_name)) in sheet_plan.columns.iter().enumerate() {
+            worksheet
+                .write_string(0, c as u16, original_name)
+                .map_err(|e| validation("IO_WRITE_FAILED", "Failed writing xlsx header", &e.to_string()))?;
+        }
+
+        let col_positions: Vec<Option<usize>> =
+            sheet_plan.columns.iter().map(|(final_name, _)| col_idx.get(final_name.as_str()).copied()).collect();
+
+        let mut seen: HashSet<Vec<String>> = HashSet::new();
+        let mut out_row = 1u32;
+        for row in &rows {
+            let projected: Vec<String> =
+                col_positions.iter().map(|pos| pos.and_then(|i| row.get(i)).cloned().unwrap_or_default()).collect();
+            if seen.insert(projected.clone()) {
+                for (c, value) in projected.iter().enumerate() {
+                    worksheet
+                        .write_string(out_row, c as u16, value)
+                        .map_err(|e| validation("IO_WRITE_FAILED", "Failed writing xlsx row", &e.to_string()))?;
+                }
+                out_row += 1;
+            }
+        }
+    }
+
+    workbook.save(xlsx_path).map_err(|e| {
+        validation("IO_WRITE_FAILED", "Failed to save restored xlsx workbook", &format!("{}: {e}", xlsx_path.display()))
+    })?;
     Ok(())
 }
 
@@ -766,6 +1069,163 @@ mod tests {
         fs::write(&path, r#"{"a": 1}"#).unwrap();
         let err = read_json_sheet(&path).unwrap_err();
         assert!(matches!(err, PipelineError::Validation { code: "DATA_JSON_INVALID", .. }));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Sheet restore plan ───────────────────────────────────────────────────
+
+    #[test]
+    fn restore_plan_two_sheet_join_recovers_original_columns() {
+        let patients = sheet(&["patient_id", "Age", "Blood Group"], &[&["1", "23", "A+"]]);
+        let visits = sheet(&["patient_id", "diagnosis_code"], &[&["1", "D1"]]);
+        let sheets = vec![("Patients".to_string(), patients), ("Visits".to_string(), visits)];
+        let joins =
+            vec![SheetJoinSpec { left: "Patients".into(), right: "Visits".into(), on: vec!["patient_id".into()], how: "left".into() }];
+
+        let (merged, plan) = merge_excel_sheets(sheets, &joins, "patients.xlsx").unwrap();
+        assert_eq!(merged.columns, vec!["patient_id", "Age", "Blood Group", "diagnosis_code"]);
+
+        let plan = plan.expect("sheet_joins path always yields a plan");
+        let patients_plan = plan.sheets.iter().find(|s| s.sheet_name == "Patients").unwrap();
+        assert_eq!(
+            patients_plan.columns,
+            vec![
+                ("patient_id".to_string(), "patient_id".to_string()),
+                ("Age".to_string(), "Age".to_string()),
+                ("Blood Group".to_string(), "Blood Group".to_string()),
+            ]
+        );
+        let visits_plan = plan.sheets.iter().find(|s| s.sheet_name == "Visits").unwrap();
+        assert_eq!(
+            visits_plan.columns,
+            vec![("patient_id".to_string(), "patient_id".to_string()), ("diagnosis_code".to_string(), "diagnosis_code".to_string())]
+        );
+    }
+
+    #[test]
+    fn restore_plan_star_schema_tracks_all_three_sheets() {
+        let master = sheet(&["school_id", "school_type"], &[&["1", "P"]]);
+        let amenities = sheet(&["school_id", "toilets"], &[&["1", "4"]]);
+        let snapshot = sheet(&["school_id", "enrolment"], &[&["1", "100"]]);
+        let sheets = vec![
+            ("School master".to_string(), master),
+            ("School amenities".to_string(), amenities),
+            ("School snapshot".to_string(), snapshot),
+        ];
+        let joins = vec![
+            SheetJoinSpec { left: "School master".into(), right: "School amenities".into(), on: vec!["school_id".into()], how: "left".into() },
+            SheetJoinSpec { left: "School master".into(), right: "School snapshot".into(), on: vec!["school_id".into()], how: "left".into() },
+        ];
+
+        let (merged, plan) = merge_excel_sheets(sheets, &joins, "schools.xlsx").unwrap();
+        assert_eq!(merged.columns, vec!["school_id", "school_type", "toilets", "enrolment"]);
+
+        let plan = plan.unwrap();
+        assert_eq!(plan.sheets.len(), 3);
+        let amenities_plan = plan.sheets.iter().find(|s| s.sheet_name == "School amenities").unwrap();
+        assert_eq!(
+            amenities_plan.columns,
+            vec![("school_id".to_string(), "school_id".to_string()), ("toilets".to_string(), "toilets".to_string())]
+        );
+        let snapshot_plan = plan.sheets.iter().find(|s| s.sheet_name == "School snapshot").unwrap();
+        assert_eq!(
+            snapshot_plan.columns,
+            vec![("school_id".to_string(), "school_id".to_string()), ("enrolment".to_string(), "enrolment".to_string())]
+        );
+    }
+
+    #[test]
+    fn restore_plan_tracks_renamed_colliding_columns() {
+        // Both sheets have a non-key "name" column — merge_two suffixes them _x/_y.
+        // The restore plan must map each sheet back to ITS OWN "name", not the other's.
+        let left = sheet(&["id", "name"], &[&["1", "left-name"]]);
+        let right = sheet(&["id", "name"], &[&["1", "right-name"]]);
+        let sheets = vec![("Left".to_string(), left), ("Right".to_string(), right)];
+        let joins = vec![SheetJoinSpec { left: "Left".into(), right: "Right".into(), on: vec!["id".into()], how: "left".into() }];
+
+        let (merged, plan) = merge_excel_sheets(sheets, &joins, "wb.xlsx").unwrap();
+        assert_eq!(merged.columns, vec!["id", "name_x", "name_y"]);
+
+        let plan = plan.unwrap();
+        let left_plan = plan.sheets.iter().find(|s| s.sheet_name == "Left").unwrap();
+        assert_eq!(left_plan.columns, vec![("id".to_string(), "id".to_string()), ("name_x".to_string(), "name".to_string())]);
+        let right_plan = plan.sheets.iter().find(|s| s.sheet_name == "Right").unwrap();
+        assert_eq!(right_plan.columns, vec![("id".to_string(), "id".to_string()), ("name_y".to_string(), "name".to_string())]);
+    }
+
+    #[test]
+    fn restore_plan_single_sheet_is_identity() {
+        let only = sheet(&["a", "b"], &[&["1", "2"]]);
+        let sheets = vec![("Only".to_string(), only)];
+        let (merged, plan) = merge_excel_sheets(sheets, &[], "wb.xlsx").unwrap();
+        assert_eq!(merged.columns, vec!["a", "b"]);
+        let plan = plan.unwrap();
+        assert_eq!(plan.sheets.len(), 1);
+        assert_eq!(plan.sheets[0].columns, vec![("a".to_string(), "a".to_string()), ("b".to_string(), "b".to_string())]);
+    }
+
+    #[test]
+    fn restore_plan_absent_for_auto_join_and_vertical_concat() {
+        let master = sheet(&["id", "a"], &[&["1", "x"]]);
+        let other = sheet(&["id", "b"], &[&["1", "y"]]);
+        let sheets = vec![("M".to_string(), master), ("O".to_string(), other)];
+        let (_, plan) = merge_excel_sheets(sheets, &[], "wb.xlsx").unwrap();
+        assert!(plan.is_none(), "auto-join fallback should not produce a restore plan");
+
+        let a = sheet(&["id", "val"], &[&["1", "x"]]);
+        let b = sheet(&["id", "val"], &[&["2", "y"]]);
+        let sheets = vec![("A".to_string(), a), ("B".to_string(), b)];
+        let (_, plan) = merge_excel_sheets(sheets, &[], "wb.xlsx").unwrap();
+        assert!(plan.is_none(), "same-schema vertical concat should not produce a restore plan");
+    }
+
+    #[test]
+    fn parse_csv_line_roundtrips_quoted_commas_and_quotes() {
+        let line = r#"1,"House 42, MG Road","She said ""hi""",plain"#;
+        assert_eq!(parse_csv_line(line), vec!["1", "House 42, MG Road", "She said \"hi\"", "plain"]);
+    }
+
+    #[test]
+    fn write_restored_workbook_splits_and_dedupes_rows() {
+        let dir = std::env::temp_dir().join(format!("skald_restore_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("generalized.csv");
+        // Patient 1 has two visits, so the joined+generalized table fans out to two
+        // rows sharing identical Patients-side values (patient_id, Age, Blood Group)
+        // but distinct Visits-side values (diagnosis_code).
+        fs::write(&csv_path, "patient_id,Age,Blood Group,diagnosis_code\n1,[20-30),A,D1\n1,[20-30),A,D2\n").unwrap();
+
+        let plan = SheetRestorePlan {
+            sheets: vec![
+                SheetColumnPlan {
+                    sheet_name: "Patients".to_string(),
+                    columns: vec![
+                        ("patient_id".to_string(), "patient_id".to_string()),
+                        ("Age".to_string(), "Age".to_string()),
+                        ("Blood Group".to_string(), "Blood Group".to_string()),
+                    ],
+                },
+                SheetColumnPlan {
+                    sheet_name: "Visits".to_string(),
+                    columns: vec![
+                        ("patient_id".to_string(), "patient_id".to_string()),
+                        ("diagnosis_code".to_string(), "diagnosis_code".to_string()),
+                    ],
+                },
+            ],
+        };
+        let xlsx_path = dir.join("restored.xlsx");
+        write_restored_workbook(&csv_path, &plan, &xlsx_path).unwrap();
+
+        let sheets = read_xlsx_sheets(&xlsx_path).unwrap();
+        let patients = &sheets.iter().find(|(n, _)| n == "Patients").unwrap().1;
+        assert_eq!(patients.columns, vec!["patient_id", "Age", "Blood Group"]);
+        assert_eq!(patients.rows, vec![vec!["1", "[20-30)", "A"]], "duplicate Patients-side row should collapse to one");
+
+        let visits = &sheets.iter().find(|(n, _)| n == "Visits").unwrap().1;
+        assert_eq!(visits.columns, vec!["patient_id", "diagnosis_code"]);
+        assert_eq!(visits.rows, vec![vec!["1", "D1"], vec!["1", "D2"]], "distinct Visits-side rows should both survive");
+
         fs::remove_dir_all(&dir).ok();
     }
 }

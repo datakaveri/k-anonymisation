@@ -28,6 +28,7 @@
       { "left": "School master", "right": "School snapshot",   "on": "school_id", "how": "left" }
     ],
 
-    "k_anonymize": { "k": 5 }
+    "k_anonymize": { "k": 5 },
+    "restore_sheets": true
   }
 }

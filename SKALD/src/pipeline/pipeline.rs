@@ -10,7 +10,7 @@ use crate::pipeline::bootstrap::{
     available_ram_bytes, ensure_output_dir, find_first_json_config, parse_runtime_config,
     split_csv_file_by_ram, FlowMode, Logger, PipelineError, StatusPayload,
 };
-use crate::pipeline::multitabular::resolve_input_csv;
+use crate::pipeline::multitabular::{resolve_input_csv, write_restored_workbook, SheetRestorePlan};
 use crate::pipeline::preprocess::preprocess_chunks;
 use serde_json::json;
 use std::fs;
@@ -37,7 +37,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     // normalised into chunks/ (read-write scratch) instead; a plain .csv
     // input is returned as-is, still pointing into data/.
     log.info("input", "Resolving input data format (csv/json/xlsx)");
-    let input_csv = resolve_input_csv(&root.join("data"), &root.join("chunks"), &cfg.sheet_joins)?;
+    let (input_csv, restore_plan) = resolve_input_csv(&root.join("data"), &root.join("chunks"), &cfg.sheet_joins)?;
 
     // ── Chunking (all passes need the raw CSV split) ─────────────────────────
     log.info("chunking", "Splitting CSV into RAM-sized chunks");
@@ -60,6 +60,9 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
         merge_chunks_to_output(&chunk_paths, &final_output_path)?;
         log.info("output", &format!("Preprocess-only output written to {}", final_output_path.display()));
 
+        let restored_workbook_path =
+            maybe_write_restored_workbook(&mut log, &cfg, &restore_plan, &output_dir_path, &final_output_path);
+
         return Ok(StatusPayload {
             status: "success".to_string(),
             phase: Some("done".to_string()),
@@ -68,6 +71,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
                 "chunk_count": chunk_paths.len(),
                 "final_output_path": final_output_path.display().to_string(),
                 "sample_generalized_rows": read_csv_sample(&final_output_path.display().to_string(), 10),
+                "restored_workbook_path": restored_workbook_path,
             })),
             error: None,
             log_file: "output/pipeline.log".to_string(),
@@ -412,6 +416,8 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
         output_dir_path.join(&cfg.output_path).display().to_string()
     };
     let sample_generalized_rows = read_csv_sample(&final_output_path, 10);
+    let restored_workbook_path =
+        maybe_write_restored_workbook(&mut log, &cfg, &restore_plan, &output_dir_path, Path::new(&final_output_path));
 
     Ok(StatusPayload {
         status: "success".to_string(),
@@ -439,10 +445,58 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
             "final_output_path": final_output_path,
             "sample_generalized_rows": sample_generalized_rows,
             "parameter_grid": parameter_grid,
+            "restored_workbook_path": restored_workbook_path,
         })),
         error: None,
         log_file: "output/pipeline.log".to_string(),
     })
+}
+
+/// If `cfg.restore_sheets` is set and a `SheetRestorePlan` was established for
+/// this input (multi-sheet Excel joined via explicit `sheet_joins`), writes
+/// the anonymized result back out as a multi-sheet `.xlsx` workbook mirroring
+/// the original input sheets. Purely additive and non-fatal: on any failure
+/// or inapplicable case (no plan, single-sheet plan) it logs why and returns
+/// `None` — the primary anonymized CSV output is unaffected either way.
+fn maybe_write_restored_workbook(
+    log: &mut crate::pipeline::bootstrap::Logger,
+    cfg: &crate::pipeline::bootstrap::RuntimeConfig,
+    restore_plan: &Option<SheetRestorePlan>,
+    output_dir_path: &Path,
+    final_output_path: &Path,
+) -> Option<String> {
+    if !cfg.restore_sheets {
+        return None;
+    }
+    let Some(plan) = restore_plan else {
+        log.info(
+            "restore_sheets",
+            "restore_sheets=true but no sheet restore plan is available for this input \
+             (not multi-sheet Excel joined via explicit sheet_joins) — skipping",
+        );
+        return None;
+    };
+    if plan.sheets.len() <= 1 {
+        log.info("restore_sheets", "restore_sheets=true but input had only one sheet — nothing to split, skipping");
+        return None;
+    }
+
+    let xlsx_name = Path::new(&cfg.output_path)
+        .file_stem()
+        .map(|s| format!("{}.xlsx", s.to_string_lossy()))
+        .unwrap_or_else(|| "restored.xlsx".to_string());
+    let xlsx_path = output_dir_path.join(xlsx_name);
+
+    match write_restored_workbook(final_output_path, plan, &xlsx_path) {
+        Ok(()) => {
+            log.info("restore_sheets", &format!("Restored {} sheet(s) to {}", plan.sheets.len(), xlsx_path.display()));
+            Some(xlsx_path.display().to_string())
+        }
+        Err(e) => {
+            log.info("restore_sheets", &format!("Failed to write restored workbook: {e}"));
+            None
+        }
+    }
 }
 
 /// Read the first `n` data rows from a CSV and return them as a JSON array
