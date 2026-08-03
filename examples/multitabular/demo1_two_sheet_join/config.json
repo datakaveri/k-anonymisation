@@ -1,0 +1,34 @@
+{
+  "data_type": "test",
+  "test": {
+    "output_path": "generalized_test.csv",
+    "output_directory": "output",
+    "suppression_limit": 0.2,
+
+    "quasi_identifiers": {
+      "categorical": [{ "column": "Blood Group" }],
+      "numerical": [
+        { "column": "Age",      "encode": false, "type": "int" },
+        { "column": "PIN Code", "encode": false, "type": "int" }
+      ]
+    },
+
+    "categorical_hierarchies": {
+      "blood group": {
+        "A+": ["A", "*"], "A-": ["A", "*"],
+        "B+": ["B", "*"], "B-": ["B", "*"],
+        "AB+": ["AB", "*"], "AB-": ["AB", "*"],
+        "O+": ["O", "*"], "O-": ["O", "*"],
+        "*": ["Other", "*"]
+      }
+    },
+
+    "size": { "Age": 5, "PIN Code": 100000 },
+
+    "sheet_joins": [
+      { "left": "Patients", "right": "Visits", "on": "patient_id", "how": "left" }
+    ],
+
+    "k_anonymize": { "k": 2 }
+  }
+}

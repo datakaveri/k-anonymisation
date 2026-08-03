@@ -339,6 +339,9 @@ docker compose up --build
 cat output/status.json   # outputs.sample_generalized_rows shows the joined + generalized rows
 ```
 
+Two ready-to-run, verified examples (including a 3-sheet star-schema case) live in
+[`examples/multitabular/`](examples/multitabular/README.md) — copy either straight into `data/`/`config/`.
+
 Things worth double-checking if it doesn't work:
 
 - `sheet_joins[].left`/`.right` must match the workbook's **sheet names exactly** (case-sensitive) — a typo produces `DATA_XLSX_INVALID` naming the sheets it *did* find.

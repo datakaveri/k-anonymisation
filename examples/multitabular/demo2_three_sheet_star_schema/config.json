@@ -1,0 +1,33 @@
+{
+  "data_type": "test",
+  "test": {
+    "output_path": "generalized_schools.csv",
+    "output_directory": "output",
+    "suppression_limit": 0.2,
+
+    "quasi_identifiers": {
+      "categorical": [{ "column": "school_type" }],
+      "numerical": [
+        { "column": "enrolment", "encode": false, "type": "int" }
+      ]
+    },
+
+    "categorical_hierarchies": {
+      "school_type": {
+        "Primary": ["School", "*"],
+        "Secondary": ["School", "*"],
+        "Higher Secondary": ["School", "*"],
+        "*": ["Other", "*"]
+      }
+    },
+
+    "size": { "enrolment": 100 },
+
+    "sheet_joins": [
+      { "left": "School master", "right": "School amenities", "on": "school_id", "how": "left" },
+      { "left": "School master", "right": "School snapshot",   "on": "school_id", "how": "left" }
+    ],
+
+    "k_anonymize": { "k": 5 }
+  }
+}
