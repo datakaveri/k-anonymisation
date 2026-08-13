@@ -7,8 +7,9 @@ use crate::pipeline::anonymization::{
     SparseHist, ZHist,
 };
 use crate::pipeline::bootstrap::{
-    available_ram_bytes, ensure_output_dir, find_first_json_config, parse_runtime_config,
-    split_csv_file_by_ram, FlowMode, Logger, PipelineError, StatusPayload,
+    available_ram_bytes, clear_output_dir, clear_scratch_dir, ensure_output_dir,
+    find_first_json_config, parse_runtime_config, split_csv_file_by_ram, stale_output_files,
+    FlowMode, Logger, PipelineError, StatusPayload,
 };
 use crate::pipeline::multitabular::{resolve_input_csv, write_restored_workbook, SheetRestorePlan};
 use crate::pipeline::preprocess::preprocess_chunks;
@@ -31,6 +32,44 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
         "pass={}, k={}, suppression_limit={:.3}",
         pass, cfg.k, cfg.suppression_limit
     ));
+
+    // ── Stale-artifact handling ──────────────────────────────────────────────
+    // chunks/ is pure scratch and `_converted.csv` holds un-anonymized source
+    // data, so leftovers are always removed. output/ holds deliverables, so
+    // stale files are only reported unless the config opts into cleaning —
+    // reported either way, since a leftover `generalized_<other>.csv` beside
+    // this run's output is easy to mistake for part of this run's results.
+    let removed = clear_scratch_dir(&root.join("chunks"))?;
+    if removed > 0 {
+        log.info("cleanup", &format!("Removed {removed} stale file(s) from chunks/"));
+    }
+
+    let mut will_write = vec![cfg.output_path.clone()];
+    if cfg.restore_sheets {
+        if let Some(stem) = Path::new(&cfg.output_path).file_stem() {
+            will_write.push(format!("{}.xlsx", stem.to_string_lossy()));
+        }
+    }
+    if cfg.clean_output {
+        let cleared = clear_output_dir(&output_dir_path, &will_write)?;
+        if !cleared.is_empty() {
+            log.info("cleanup", &format!(
+                "clean_output=true — removed {} stale file(s) from output/: {}",
+                cleared.len(),
+                cleared.join(", ")
+            ));
+        }
+    } else {
+        let stale = stale_output_files(&output_dir_path, &will_write);
+        if !stale.is_empty() {
+            log.info("cleanup", &format!(
+                "output/ holds {} file(s) from an earlier run that this run will not overwrite — \
+                 they are NOT part of these results: {}. Set \"clean_output\": true to remove them.",
+                stale.len(),
+                stale.join(", ")
+            ));
+        }
+    }
 
     // ── Input normalisation (CSV / JSON / multi-sheet Excel → single CSV) ────
     // data/ is mounted read-only in deployment, so JSON/Excel inputs are

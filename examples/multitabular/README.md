@@ -5,12 +5,18 @@ input feature. Each folder has one input file and one config — copy both into
 place and run:
 
 ```bash
-rm -f data/* config/*.json
+rm -f data/* config/*.json output/*
 cp examples/multitabular/demo1_two_sheet_join/patients.xlsx data/
 cp examples/multitabular/demo1_two_sheet_join/config.json config/config.json
 docker compose up --build
 cat output/status.json
 ```
+
+Clear `output/` too (or set `"clean_output": true` in the config): it is not
+wiped automatically, so results from a previous demo stay alongside the new
+ones — after running demo2 and then demo1 you would see both
+`generalized_schools.csv` and `generalized_test.csv`. Each run logs leftovers it
+found under the `cleanup` phase. `chunks/` is emptied automatically.
 
 ## demo1_two_sheet_join
 

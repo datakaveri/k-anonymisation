@@ -4,7 +4,7 @@ use super::anonymization::{
     find_ola2_best_rf_z_detailed, generalize_and_write_outputs, merge_z_histogram,
     scan_chunks_for_flow, z_hist_to_sparse, QuasiIdentifierLite,
 };
-use super::bootstrap::{csv_quote_field, csv_row_to_line, find_first_json_config, parse_runtime_config, split_csv_line_basic, split_csv_by_ram, FlowMode};
+use super::bootstrap::{clear_output_dir, clear_scratch_dir, csv_quote_field, csv_row_to_line, find_first_json_config, parse_runtime_config, split_csv_line_basic, split_csv_by_ram, stale_output_files, FlowMode};
 use super::pipeline::run_pipeline;
 use super::preprocess::preprocess_chunks;
 use std::collections::HashMap;
@@ -612,5 +612,88 @@ fn preprocess_preserves_fields_with_commas() {
     assert_eq!(row1[1], "House 42, MG Road", "address field must round-trip through preprocess");
     let row2 = split_csv_line_basic(lines[2]);
     assert_eq!(row2[1], "Flat 7, Park Ave", "address field must round-trip through preprocess");
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn clear_scratch_dir_removes_stale_chunks_and_converted_csv() {
+    let d = mk_temp_dir("skald_clear_scratch");
+    let chunks = d.join("chunks");
+    fs::create_dir_all(&chunks).expect("chunks dir");
+    fs::write(chunks.join("chunk_1.csv"), "a,b\n1,2\n").expect("write chunk");
+    fs::write(chunks.join("chunk_2.csv"), "a,b\n3,4\n").expect("write chunk");
+    // _converted.csv holds un-anonymized source data — must not survive a run
+    fs::write(chunks.join("_converted.csv"), "school_id,school_type\n1,Primary\n").expect("write converted");
+
+    let removed = clear_scratch_dir(&chunks).expect("clear scratch");
+
+    assert_eq!(removed, 3);
+    assert!(!chunks.join("_converted.csv").exists());
+    assert!(!chunks.join("chunk_1.csv").exists());
+    assert!(chunks.is_dir(), "directory itself is kept");
+
+    // Missing directory is not an error
+    assert_eq!(clear_scratch_dir(&d.join("nope")).expect("absent dir"), 0);
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn stale_output_files_reports_only_leftovers_from_earlier_runs() {
+    let d = mk_temp_dir("skald_stale_output");
+    let out = d.join("output");
+    fs::create_dir_all(&out).expect("output dir");
+    for name in [
+        "generalized_schools.csv",   // leftover from an earlier run
+        "generalized_schools.xlsx",  // leftover from an earlier run
+        "generalized_test.csv",      // this run writes it
+        "status.json",               // rewritten every run
+        "pipeline.log",              // the log being written right now
+        "symmetric_keys.json",       // key material
+    ] {
+        fs::write(out.join(name), "x").expect("write file");
+    }
+
+    let will_write = vec!["generalized_test.csv".to_string()];
+    let stale = stale_output_files(&out, &will_write);
+
+    assert_eq!(stale, vec!["generalized_schools.csv".to_string(), "generalized_schools.xlsx".to_string()]);
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn clear_output_dir_removes_leftovers_but_keeps_keys_and_log() {
+    let d = mk_temp_dir("skald_clear_output");
+    let out = d.join("output");
+    fs::create_dir_all(&out).expect("output dir");
+    for name in ["generalized_schools.csv", "pipeline.log", "symmetric_keys.json", "fpe_encrypt_keys.json"] {
+        fs::write(out.join(name), "x").expect("write file");
+    }
+
+    let removed = clear_output_dir(&out, &["generalized_test.csv".to_string()]).expect("clear output");
+
+    assert_eq!(removed, vec!["generalized_schools.csv".to_string()]);
+    assert!(!out.join("generalized_schools.csv").exists());
+    assert!(out.join("pipeline.log").exists(), "active log must survive");
+    assert!(out.join("symmetric_keys.json").exists(), "key material must survive");
+    assert!(out.join("fpe_encrypt_keys.json").exists(), "key material must survive");
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn clean_output_defaults_to_false_and_parses_from_config() {
+    let d = mk_temp_dir("skald_clean_output_cfg");
+    fs::create_dir_all(&d).expect("dir");
+
+    let default_path = d.join("default.json");
+    fs::write(&default_path, r#"{"data_type":"T","T":{"output_path":"x.csv"}}"#).expect("write cfg");
+    assert!(!parse_runtime_config(&default_path).expect("parse cfg").clean_output);
+
+    let enabled_path = d.join("enabled.json");
+    fs::write(&enabled_path, r#"{"data_type":"T","T":{"output_path":"x.csv","clean_output":true}}"#).expect("write cfg");
+    assert!(parse_runtime_config(&enabled_path).expect("parse cfg").clean_output);
+
     let _ = fs::remove_dir_all(d);
 }

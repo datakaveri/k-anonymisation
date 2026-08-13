@@ -140,6 +140,7 @@ Place a single JSON file in `config/`. Full example:
 | `compute_parameter_grid` | bool | When true (default), also compute the k × suppression_limit parameter grid (extra OLA-2 searches). Set `false` in benchmarks to skip it. |
 | `sheet_joins` | array | Config-driven join steps for multi-sheet Excel input: `{ "left": "<sheet>", "right": "<sheet>", "on": "<col>" \| ["<col>", ...], "how": "left"\|"right"\|"inner"\|"outer"\|"cross" }`. If omitted, sheets with a shared column are auto-joined; sheets with no shared columns are concatenated by row position. Only used when the input file is `.xlsx`/`.xls`. |
 | `restore_sheets` | bool | When true, also write the anonymized result back as a multi-sheet `.xlsx` mirroring the original input sheets (see [Restoring per-sheet output](#restoring-per-sheet-output-restore_sheets)). Default `false`. Only takes effect when sheets were merged via explicit `sheet_joins` (or there was only one sheet). |
+| `clean_output` | bool | When true, delete leftover files from a previous run out of `output/` before this run starts. Default `false` — leftovers are reported in the log but kept (see [Leftovers between runs](#leftovers-between-runs)). Key material (`*keys*.json`) and the active log are never removed. |
 
 **FPE note:** the legacy `"fpe"` config section (PAN/digits-specific format-preserving encryption) has been removed from the Rust pipeline. General format-preserving encryption is still available via `encrypt` + `"format_preserving": true`. The PAN/digits-specific algorithms remain documented in `SKALD/preprocess.py` (reference implementation) and are invertible via `scripts/reverse_fpe.py` for data already encrypted under the old scheme.
 
@@ -159,6 +160,31 @@ Place a single JSON file in `config/`. Full example:
 | `output/<output_path stem>.xlsx` | Anonymized multi-sheet workbook (if `restore_sheets: true` and applicable — see [Restoring per-sheet output](#restoring-per-sheet-output-restore_sheets)) |
 
 `fpe_keys.json` is only produced by the legacy `SKALD/preprocess.py` reference path (PAN/digits FPE), not the Rust pipeline — see the FPE note under [Config schema](#config-schema).
+
+### Leftovers between runs
+
+`output/` is never wiped automatically, so results from an earlier run stay put
+unless this run happens to write the same filename. Running the schools demo
+(`output_path: generalized_schools.csv`) and then a patient dataset
+(`output_path: generalized_test.csv`) leaves **both** in `output/` — the schools
+files are stale, not part of the second run.
+
+Each run logs any such leftovers under the `cleanup` phase:
+
+```
+[INFO ] [cleanup] output/ holds 2 file(s) from an earlier run that this run will not
+                  overwrite — they are NOT part of these results:
+                  generalized_schools.csv, generalized_schools.xlsx.
+                  Set "clean_output": true to remove them.
+```
+
+Set `"clean_output": true` in the config to have them removed automatically, or
+clear `output/` yourself between runs. Key material (`*keys*.json`) and the
+active log are never removed either way.
+
+`chunks/` is different: it is pure scratch (chunk splits, plus `_converted.csv`
+for JSON/Excel input, which holds **un-anonymized** source data), so it is
+emptied at the start of every run with no opt-in needed.
 
 ### `status.json` — success
 

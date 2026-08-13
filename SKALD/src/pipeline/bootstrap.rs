@@ -87,6 +87,10 @@ pub struct RuntimeConfig {
     /// `.xlsx` workbook mirroring the original input sheets (only meaningful
     /// when the input was multi-sheet Excel joined via `sheet_joins`).
     pub restore_sheets: bool,
+    /// When true, delete leftover files from a previous run out of `output/`
+    /// before this run starts (key material and the active log are kept).
+    /// Defaults to false — stale files are only reported, never removed.
+    pub clean_output: bool,
 }
 
 /// Controls which histogram-building algorithm SKALD uses.
@@ -593,6 +597,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
 
     let sheet_joins = crate::pipeline::multitabular::parse_sheet_joins(section)?;
     let restore_sheets = section.get("restore_sheets").and_then(Value::as_bool).unwrap_or(false);
+    let clean_output = section.get("clean_output").and_then(Value::as_bool).unwrap_or(false);
 
     Ok(RuntimeConfig {
         enable_k_anonymity: has_k_anonymize && has_qis,
@@ -622,7 +627,86 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
             .unwrap_or(true),
         sheet_joins,
         restore_sheets,
+        clean_output,
     })
+}
+
+/// Files in `output/` a run must never delete: the log it is currently writing,
+/// and any key material — removing keys would make output encrypted by an
+/// earlier run unrecoverable.
+fn is_protected_output(name: &str) -> bool {
+    name == "pipeline.log" || name.contains("keys")
+}
+
+/// Per-run artifacts every successful run rewrites, so their presence from an
+/// earlier run is never surprising and isn't worth reporting.
+const ALWAYS_REWRITTEN: [&str; 4] =
+    ["status.json", "parameter_grid.txt", "equivalence_class_stats.json", "top_ola2_nodes.json"];
+
+/// Empties the pipeline's scratch directory (`chunks/`).
+///
+/// `chunks/` holds only derived working files — the RAM-sized chunk splits and
+/// the normalised `_converted.csv` for JSON/Excel input. Leftovers from an
+/// earlier run are always stale, and `_converted.csv` in particular holds
+/// *un-anonymized* source data, so they are removed unconditionally at startup.
+/// A missing directory is not an error.
+///
+/// # Returns
+/// The number of files removed.
+pub fn clear_scratch_dir(chunks_dir: &Path) -> Result<usize, PipelineError> {
+    if !chunks_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in fs::read_dir(chunks_dir)? {
+        let path = entry?.path();
+        if path.is_file() {
+            fs::remove_file(&path)
+                .map_err(|e| io_err("remove stale scratch file", &path.display().to_string(), e))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Names the files already in `output/` that this run will neither overwrite
+/// nor delete — i.e. results of an *earlier* run that would otherwise be easy
+/// to mistake for this run's output (e.g. `generalized_schools.csv` lingering
+/// beside a fresh `generalized_test.csv`).
+///
+/// `will_write` lists the filenames this run is going to produce; those plus
+/// key material, the active log, and the always-rewritten per-run artifacts
+/// are excluded. Returns file names, sorted.
+pub fn stale_output_files(output_dir: &Path, will_write: &[String]) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(output_dir) else {
+        return Vec::new();
+    };
+    let mut stale: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| !is_protected_output(name))
+        .filter(|name| !ALWAYS_REWRITTEN.contains(&name.as_str()))
+        .filter(|name| !will_write.iter().any(|w| w == name))
+        .collect();
+    stale.sort();
+    stale
+}
+
+/// Deletes the files reported by [`stale_output_files`]. Used only when the
+/// config sets `clean_output: true` — key material and the active log are
+/// never touched.
+///
+/// # Returns
+/// The names of the files removed, sorted.
+pub fn clear_output_dir(output_dir: &Path, will_write: &[String]) -> Result<Vec<String>, PipelineError> {
+    let stale = stale_output_files(output_dir, will_write);
+    for name in &stale {
+        let path = output_dir.join(name);
+        fs::remove_file(&path)
+            .map_err(|e| io_err("remove stale output file", &path.display().to_string(), e))?;
+    }
+    Ok(stale)
 }
 
 pub fn list_non_empty_csvs(data_dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
