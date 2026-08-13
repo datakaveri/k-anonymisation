@@ -11,7 +11,9 @@ use crate::pipeline::bootstrap::{
     find_first_json_config, parse_runtime_config, split_csv_file_by_ram, stale_output_files,
     FlowMode, Logger, PipelineError, StatusPayload,
 };
-use crate::pipeline::multitabular::{resolve_input_csv, write_restored_workbook, SheetRestorePlan};
+use crate::pipeline::multitabular::{
+    resolve_input_csv, write_output_in_format, write_restored_workbook, InputFormat, SheetRestorePlan,
+};
 use crate::pipeline::preprocess::preprocess_chunks;
 use serde_json::json;
 use std::fs;
@@ -45,9 +47,16 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     }
 
     let mut will_write = vec![cfg.output_path.clone()];
-    if cfg.restore_sheets {
-        if let Some(stem) = Path::new(&cfg.output_path).file_stem() {
-            will_write.push(format!("{}.xlsx", stem.to_string_lossy()));
+    if let Some(stem) = Path::new(&cfg.output_path).file_stem() {
+        let stem = stem.to_string_lossy().to_string();
+        if cfg.restore_sheets {
+            will_write.push(format!("{stem}.xlsx"));
+        }
+        // The input format isn't known yet at this point, so reserve every name
+        // match_input could produce rather than mis-report one as stale.
+        if cfg.match_input_format {
+            will_write.push(format!("{stem}.xlsx"));
+            will_write.push(format!("{stem}.json"));
         }
     }
     if cfg.clean_output {
@@ -76,7 +85,8 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     // normalised into chunks/ (read-write scratch) instead; a plain .csv
     // input is returned as-is, still pointing into data/.
     log.info("input", "Resolving input data format (csv/json/xlsx)");
-    let (input_csv, restore_plan) = resolve_input_csv(&root.join("data"), &root.join("chunks"), &cfg.sheet_joins)?;
+    let (input_csv, restore_plan, input_format) =
+        resolve_input_csv(&root.join("data"), &root.join("chunks"), &cfg.sheet_joins)?;
 
     // ── Chunking (all passes need the raw CSV split) ─────────────────────────
     log.info("chunking", "Splitting CSV into RAM-sized chunks");
@@ -101,6 +111,8 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
 
         let restored_workbook_path =
             maybe_write_restored_workbook(&mut log, &cfg, &restore_plan, &output_dir_path, &final_output_path);
+        let format_matched_output_path =
+            maybe_write_format_matched_output(&mut log, &cfg, input_format, &final_output_path, restored_workbook_path.as_deref())?;
 
         return Ok(StatusPayload {
             status: "success".to_string(),
@@ -109,6 +121,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
                 "pass": "preprocess_only",
                 "chunk_count": chunk_paths.len(),
                 "final_output_path": final_output_path.display().to_string(),
+                "format_matched_output_path": format_matched_output_path,
                 "sample_generalized_rows": read_csv_sample(&final_output_path.display().to_string(), 10),
                 "restored_workbook_path": restored_workbook_path,
             })),
@@ -457,6 +470,8 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     let sample_generalized_rows = read_csv_sample(&final_output_path, 10);
     let restored_workbook_path =
         maybe_write_restored_workbook(&mut log, &cfg, &restore_plan, &output_dir_path, Path::new(&final_output_path));
+    let format_matched_output_path =
+        maybe_write_format_matched_output(&mut log, &cfg, input_format, Path::new(&final_output_path), restored_workbook_path.as_deref())?;
 
     Ok(StatusPayload {
         status: "success".to_string(),
@@ -485,10 +500,66 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
             "sample_generalized_rows": sample_generalized_rows,
             "parameter_grid": parameter_grid,
             "restored_workbook_path": restored_workbook_path,
+            "format_matched_output_path": format_matched_output_path,
         })),
         error: None,
         log_file: "output/pipeline.log".to_string(),
     })
+}
+
+/// If `cfg.match_input_format` is set, also writes the anonymized result in
+/// whatever format the input arrived as — `.xlsx` in, `.xlsx` out — alongside
+/// the flat CSV, which is always produced and stays the canonical output.
+///
+/// Unlike `restore_sheets` this is fatal on failure: the caller explicitly
+/// asked for that format, so quietly delivering only the CSV would hand a
+/// downstream uploader the wrong artifact. CSV input is a no-op (the CSV
+/// output already matches) and logs why.
+fn maybe_write_format_matched_output(
+    log: &mut crate::pipeline::bootstrap::Logger,
+    cfg: &crate::pipeline::bootstrap::RuntimeConfig,
+    input_format: InputFormat,
+    final_output_path: &Path,
+    restored_workbook_path: Option<&str>,
+) -> Result<Option<String>, PipelineError> {
+    if !cfg.match_input_format {
+        return Ok(None);
+    }
+    if input_format == InputFormat::Csv {
+        log.info(
+            "output_format",
+            "output_format=match_input but input was CSV — output already matches, nothing to convert",
+        );
+        return Ok(None);
+    }
+    // `restore_sheets` writes to the same `<output_path stem>.xlsx` this would,
+    // and a workbook is exactly what match_input asks for — so reuse it rather
+    // than overwriting the per-sheet layout with a flattened single sheet.
+    if input_format == InputFormat::Excel {
+        if let Some(existing) = restored_workbook_path {
+            log.info(
+                "output_format",
+                &format!("restore_sheets already wrote {existing} — format matched, keeping the per-sheet workbook"),
+            );
+            return Ok(Some(existing.to_string()));
+        }
+    }
+
+    let stem = Path::new(&cfg.output_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "generalized".to_string());
+
+    match write_output_in_format(final_output_path, input_format, &stem)? {
+        Some(path) => {
+            log.info(
+                "output_format",
+                &format!("Input was {:?} — wrote matching output to {}", input_format, path.display()),
+            );
+            Ok(Some(path.display().to_string()))
+        }
+        None => Ok(None),
+    }
 }
 
 /// If `cfg.restore_sheets` is set and a `SheetRestorePlan` was established for

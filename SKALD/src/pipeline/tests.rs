@@ -5,6 +5,7 @@ use super::anonymization::{
     scan_chunks_for_flow, z_hist_to_sparse, QuasiIdentifierLite,
 };
 use super::bootstrap::{clear_output_dir, clear_scratch_dir, csv_quote_field, csv_row_to_line, find_first_json_config, parse_runtime_config, split_csv_line_basic, split_csv_by_ram, stale_output_files, FlowMode};
+use super::multitabular::{resolve_input_csv, write_output_in_format, InputFormat};
 use super::pipeline::run_pipeline;
 use super::preprocess::preprocess_chunks;
 use std::collections::HashMap;
@@ -694,6 +695,86 @@ fn clean_output_defaults_to_false_and_parses_from_config() {
     let enabled_path = d.join("enabled.json");
     fs::write(&enabled_path, r#"{"data_type":"T","T":{"output_path":"x.csv","clean_output":true}}"#).expect("write cfg");
     assert!(parse_runtime_config(&enabled_path).expect("parse cfg").clean_output);
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn output_format_parses_and_defaults_to_csv() {
+    let d = mk_temp_dir("skald_output_format_cfg");
+
+    let default_path = d.join("default.json");
+    fs::write(&default_path, r#"{"data_type":"T","T":{"output_path":"x.csv"}}"#).expect("write cfg");
+    assert!(!parse_runtime_config(&default_path).expect("parse cfg").match_input_format);
+
+    let explicit_csv = d.join("csv.json");
+    fs::write(&explicit_csv, r#"{"data_type":"T","T":{"output_format":"csv"}}"#).expect("write cfg");
+    assert!(!parse_runtime_config(&explicit_csv).expect("parse cfg").match_input_format);
+
+    let match_input = d.join("match.json");
+    fs::write(&match_input, r#"{"data_type":"T","T":{"output_format":"match_input"}}"#).expect("write cfg");
+    assert!(parse_runtime_config(&match_input).expect("parse cfg").match_input_format);
+
+    // An unrecognised value is a config error, not a silent fallback to CSV
+    let bogus = d.join("bogus.json");
+    fs::write(&bogus, r#"{"data_type":"T","T":{"output_format":"parquet"}}"#).expect("write cfg");
+    assert!(parse_runtime_config(&bogus).is_err());
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn write_output_in_format_echoes_input_format() {
+    let d = mk_temp_dir("skald_format_echo");
+    let csv = d.join("generalized.csv");
+    fs::write(&csv, "Age,City\n[20-29],\"Pune, MH\"\n[30-39],Delhi\n").expect("write csv");
+
+    // CSV in → nothing to convert
+    assert_eq!(write_output_in_format(&csv, InputFormat::Csv, "generalized").expect("csv"), None);
+
+    // JSON in → array of objects, keys in the table's column order, values escaped
+    let json_path = write_output_in_format(&csv, InputFormat::Json, "generalized").expect("json").expect("path");
+    assert_eq!(json_path, d.join("generalized.json"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).expect("read json")).expect("parse json");
+    let records = parsed.as_array().expect("array");
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["Age"], "[20-29]");
+    assert_eq!(records[0]["City"], "Pune, MH", "comma inside a quoted field must survive");
+    let key_order: Vec<&str> = fs::read_to_string(&json_path)
+        .expect("read json")
+        .lines()
+        .nth(1)
+        .map(|l| if l.find("\"Age\"") < l.find("\"City\"") { vec!["Age", "City"] } else { vec!["City", "Age"] })
+        .expect("first record line");
+    assert_eq!(key_order, vec!["Age", "City"], "keys follow column order, not alphabetical");
+
+    // Excel in → a real xlsx (zip container)
+    let xlsx_path = write_output_in_format(&csv, InputFormat::Excel, "generalized").expect("xlsx").expect("path");
+    assert_eq!(xlsx_path, d.join("generalized.xlsx"));
+    let bytes = fs::read(&xlsx_path).expect("read xlsx");
+    assert_eq!(&bytes[..2], b"PK", "xlsx must be a zip container");
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn resolve_input_csv_reports_the_format_it_found() {
+    let d = mk_temp_dir("skald_input_format");
+    let data = d.join("data");
+    let chunks = d.join("chunks");
+    fs::create_dir_all(&data).expect("data dir");
+
+    fs::write(data.join("in.csv"), "a,b\n1,2\n").expect("write csv");
+    let (path, _plan, format) = resolve_input_csv(&data, &chunks, &[]).expect("resolve csv");
+    assert_eq!(format, InputFormat::Csv);
+    assert_eq!(path, data.join("in.csv"), "plain CSV is used in place, not copied");
+
+    fs::remove_file(data.join("in.csv")).expect("rm csv");
+    fs::write(data.join("in.json"), r#"[{"a":"1","b":"2"}]"#).expect("write json");
+    let (path, _plan, format) = resolve_input_csv(&data, &chunks, &[]).expect("resolve json");
+    assert_eq!(format, InputFormat::Json);
+    assert_eq!(path, chunks.join("_converted.csv"), "JSON is normalised into scratch");
 
     let _ = fs::remove_dir_all(d);
 }

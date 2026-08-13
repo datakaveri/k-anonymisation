@@ -109,9 +109,15 @@ pub fn parse_sheet_joins(section: &Value) -> Result<Vec<SheetJoinSpec>, Pipeline
 
 // ── JSON input ───────────────────────────────────────────────────────────────
 
-/// Reads a JSON array-of-objects file into a `Sheet`. Column order is the
-/// union of keys in first-seen order across records (mirrors
-/// `pandas.DataFrame(list_of_dicts)`); missing keys per-record fill as "".
+/// Reads a JSON array-of-objects file into a `Sheet`; missing keys per-record
+/// fill as "".
+///
+/// Note that columns come out **alphabetised**, not in the input file's key
+/// order: `serde_json::Value::Object` is a `BTreeMap` unless the crate's
+/// `preserve_order` feature is on, so the original ordering is already gone by
+/// the time this function sees the records. Only cosmetic — every column is
+/// still present, and each row stays aligned to the header — but it does mean
+/// JSON in / JSON out does not round-trip column order.
 pub fn read_json_sheet(path: &Path) -> Result<Sheet, PipelineError> {
     let raw = fs::read_to_string(path).map_err(|e| io_err("read JSON file", &path.display().to_string(), e))?;
     let value: Value = serde_json::from_str(&raw)?;
@@ -714,11 +720,14 @@ pub fn merge_excel_sheets(
 /// into `data_dir`. JSON or Excel input is normalised into
 /// `chunks_dir/_converted.csv` instead — `chunks_dir` is the pipeline's own
 /// read-write scratch space — and that path is returned.
+///
+/// Also reports which format the input actually was, so the run can echo that
+/// format back on output when `output_format: "match_input"` is configured.
 pub fn resolve_input_csv(
     data_dir: &Path,
     chunks_dir: &Path,
     sheet_joins: &[SheetJoinSpec],
-) -> Result<(PathBuf, Option<SheetRestorePlan>), PipelineError> {
+) -> Result<(PathBuf, Option<SheetRestorePlan>, InputFormat), PipelineError> {
     if !data_dir.is_dir() {
         return Err(validation("DATA_DIR_MISSING", "Data directory not found", &data_dir.display().to_string()));
     }
@@ -766,7 +775,7 @@ pub fn resolve_input_csv(
         let converted_path = chunks_dir.join("_converted.csv");
         let sheet = read_json_sheet(&jsons[0])?;
         write_sheet_csv(&sheet, &converted_path)?;
-        return Ok((converted_path, None));
+        return Ok((converted_path, None, InputFormat::Json));
     }
     if !excels.is_empty() {
         fs::create_dir_all(chunks_dir)?;
@@ -775,11 +784,151 @@ pub fn resolve_input_csv(
         let source_name = excels[0].file_name().and_then(|n| n.to_str()).unwrap_or("input").to_string();
         let (merged, plan) = merge_excel_sheets(sheets, sheet_joins, &source_name)?;
         write_sheet_csv(&merged, &converted_path)?;
-        return Ok((converted_path, plan));
+        return Ok((converted_path, plan, InputFormat::Excel));
     }
 
     // Sole .csv input: return it as-is, still under (read-only) data_dir.
-    Ok((csvs.remove(0), None))
+    Ok((csvs.remove(0), None, InputFormat::Csv))
+}
+
+// ── Echoing the input format back on output ─────────────────────────────────
+
+/// Which of the supported input formats a run was actually given. Drives
+/// `output_format: "match_input"`, where the anonymized result is written back
+/// in the same format it arrived in rather than always as a flat CSV.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputFormat {
+    Csv,
+    Json,
+    Excel,
+}
+
+impl InputFormat {
+    /// File extension this format is written back as.
+    pub fn extension(self) -> &'static str {
+        match self {
+            InputFormat::Csv => "csv",
+            InputFormat::Json => "json",
+            InputFormat::Excel => "xlsx",
+        }
+    }
+}
+
+/// Rewrites the final anonymized CSV into `format`, next to it in the same
+/// directory, and returns the new file's path.
+///
+/// Unlike [`write_restored_workbook`] this does not reconstruct the original
+/// sheet layout — the anonymized table is written as-is, as a single worksheet
+/// (Excel) or a flat array of objects (JSON). It only echoes the *container
+/// format* back, so a caller that handed in `.xlsx` gets `.xlsx` out.
+///
+/// Returns `Ok(None)` for [`InputFormat::Csv`], where the CSV already is the
+/// requested format and there is nothing to convert.
+pub fn write_output_in_format(
+    final_csv_path: &Path,
+    format: InputFormat,
+    output_path_stem: &str,
+) -> Result<Option<PathBuf>, PipelineError> {
+    if format == InputFormat::Csv {
+        return Ok(None);
+    }
+    let out_path = final_csv_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{output_path_stem}.{}", format.extension()));
+
+    let (columns, rows) = read_csv_table(final_csv_path)?;
+    match format {
+        InputFormat::Json => write_json_table(&columns, &rows, &out_path)?,
+        InputFormat::Excel => write_single_sheet_workbook(&columns, &rows, &out_path)?,
+        InputFormat::Csv => unreachable!("returned above"),
+    }
+    Ok(Some(out_path))
+}
+
+/// Reads a CSV written by this pipeline back into (header, rows).
+fn read_csv_table(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>), PipelineError> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| io_err("read final generalized CSV", &path.display().to_string(), e))?;
+    let mut lines = content.lines();
+    let columns = match lines.next() {
+        Some(h) => parse_csv_line(h),
+        None => {
+            return Err(validation(
+                "IO_READ_FAILED",
+                "Generalized output is empty — nothing to convert",
+                &path.display().to_string(),
+            ))
+        }
+    };
+    let rows = lines.filter(|l| !l.is_empty()).map(parse_csv_line).collect();
+    Ok((columns, rows))
+}
+
+/// Writes the table as a JSON array of objects, mirroring the shape
+/// `read_json_sheet` accepts on input so a run can round-trip.
+///
+/// Written key-by-key rather than through `serde_json::Map`, which is a
+/// `BTreeMap` and would alphabetise the fields — this keeps each record's keys
+/// in the table's own column order. Values are escaped by `serde_json`.
+fn write_json_table(columns: &[String], rows: &[Vec<String>], path: &Path) -> Result<(), PipelineError> {
+    let file = fs::File::create(path).map_err(|e| io_err("create JSON output", &path.display().to_string(), e))?;
+    let mut w = BufWriter::new(file);
+
+    let write_all = |w: &mut BufWriter<fs::File>, b: &[u8]| -> Result<(), PipelineError> {
+        w.write_all(b).map_err(|e| io_err("write JSON output", &path.display().to_string(), e))
+    };
+
+    write_all(&mut w, b"[\n")?;
+    for (r, row) in rows.iter().enumerate() {
+        if r > 0 {
+            write_all(&mut w, b",\n")?;
+        }
+        write_all(&mut w, b"  {")?;
+        for (c, column) in columns.iter().enumerate() {
+            if c > 0 {
+                write_all(&mut w, b", ")?;
+            }
+            let key = serde_json::to_string(column)?;
+            let value = serde_json::to_string(row.get(c).map(String::as_str).unwrap_or(""))?;
+            write_all(&mut w, format!("{key}: {value}").as_bytes())?;
+        }
+        write_all(&mut w, b"}")?;
+    }
+    write_all(&mut w, b"\n]\n")?;
+
+    w.flush().map_err(|e| io_err("flush JSON output", &path.display().to_string(), e))?;
+    Ok(())
+}
+
+/// Writes the table as a one-worksheet `.xlsx`. Sheet structure from a
+/// multi-sheet input is deliberately not reconstructed here — that is what
+/// `restore_sheets` is for.
+fn write_single_sheet_workbook(
+    columns: &[String],
+    rows: &[Vec<String>],
+    path: &Path,
+) -> Result<(), PipelineError> {
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+
+    for (c, name) in columns.iter().enumerate() {
+        worksheet
+            .write_string(0, c as u16, name)
+            .map_err(|e| validation("IO_WRITE_FAILED", "Failed writing xlsx header", &e.to_string()))?;
+    }
+    for (r, row) in rows.iter().enumerate() {
+        for (c, value) in row.iter().enumerate() {
+            worksheet
+                .write_string(r as u32 + 1, c as u16, value)
+                .map_err(|e| validation("IO_WRITE_FAILED", "Failed writing xlsx row", &e.to_string()))?;
+        }
+    }
+
+    workbook.save(path).map_err(|e| {
+        validation("IO_WRITE_FAILED", "Failed to save xlsx output", &format!("{}: {e}", path.display()))
+    })?;
+    Ok(())
 }
 
 fn write_sheet_csv(sheet: &Sheet, path: &Path) -> Result<(), PipelineError> {
