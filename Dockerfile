@@ -14,8 +14,12 @@
 # =============================================================================
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-# rust:alpine ships Alpine Linux — far fewer CVEs than Debian slim
-FROM rust:1.85-alpine AS builder
+# rust:alpine ships Alpine Linux — far fewer CVEs than Debian slim.
+# Toolchain floor is set by the multi-tabular dependencies, not by our own code:
+# calamine 0.36, rust_xlsxwriter 0.97 and zip 8.6 all declare rustc 1.88 as their
+# MSRV, so anything older fails the build outright. Pinned (not `rust:alpine`)
+# to keep the image byte-reproducible for attestation.
+FROM rust:1.92-alpine AS builder
 LABEL org.opencontainers.image.source=https://github.com/datakaveri/k-anonymisation-SKALD
 
 # musl-dev provides headers; gcc on Alpine already targets musl natively —
