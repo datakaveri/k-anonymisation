@@ -141,7 +141,6 @@ Place a single JSON file in `config/`. Full example:
 | `sheet_joins` | array | Config-driven join steps for multi-sheet Excel input: `{ "left": "<sheet>", "right": "<sheet>", "on": "<col>" \| ["<col>", ...], "how": "left"\|"right"\|"inner"\|"outer"\|"cross" }`. If omitted, sheets with a shared column are auto-joined; sheets with no shared columns are concatenated by row position. Only used when the input file is `.xlsx`/`.xls`. |
 | `restore_sheets` | bool | When true, also write the anonymized result back as a multi-sheet `.xlsx` mirroring the original input sheets (see [Restoring per-sheet output](#restoring-per-sheet-output-restore_sheets)). Default `false`. Only takes effect when sheets were merged via explicit `sheet_joins` (or there was only one sheet). |
 | `clean_output` | bool | When true, delete leftover files from a previous run out of `output/` before this run starts. Default `false` — leftovers are reported in the log but kept (see [Leftovers between runs](#leftovers-between-runs)). Key material (`*keys*.json`) and the active log are never removed. |
-| `output_format` | `"csv"` \| `"match_input"` | `"csv"` (default) always writes a flat CSV. `"match_input"` additionally writes the result in the format the input arrived as — `.xlsx` in, `.xlsx` out (see [Matching the input format](#matching-the-input-format-output_format)). |
 
 **FPE note:** the legacy `"fpe"` config section (PAN/digits-specific format-preserving encryption) has been removed from the Rust pipeline. General format-preserving encryption is still available via `encrypt` + `"format_preserving": true`. The PAN/digits-specific algorithms remain documented in `SKALD/preprocess.py` (reference implementation) and are invertible via `scripts/reverse_fpe.py` for data already encrypted under the old scheme.
 
@@ -159,17 +158,14 @@ Place a single JSON file in `config/`. Full example:
 | `output/token_vault.json` | Token↔value mapping (if tokenization used) |
 | `output/symmetric_keys.json` | Symmetric encryption keys (if `encrypt` used) |
 | `output/<output_path stem>.xlsx` | Anonymized multi-sheet workbook (if `restore_sheets: true` and applicable — see [Restoring per-sheet output](#restoring-per-sheet-output-restore_sheets)) |
-| `output/<output_path stem>.xlsx` / `.json` | Anonymized result in the input's own format (if `output_format: "match_input"` — see [Matching the input format](#matching-the-input-format-output_format)) |
+| `output/<output_path stem>.xlsx` / `.json` | Anonymized result in the input's own format (always written for JSON/Excel input — see [Matching the input format](#matching-the-input-format)) |
 
 `fpe_keys.json` is only produced by the legacy `SKALD/preprocess.py` reference path (PAN/digits FPE), not the Rust pipeline — see the FPE note under [Config schema](#config-schema).
 
-### Matching the input format (`output_format`)
+### Matching the input format
 
-By default every run writes a flat CSV, whatever the input was: an `.xlsx`
-workbook has its sheets joined into one table, and that table is written as CSV.
-
-Set `"output_format": "match_input"` to also get the result back in the format
-it came in as:
+Every run writes the anonymized result back in the format it received, with no
+configuration required:
 
 | Input | Extra file written |
 |---|---|
@@ -177,11 +173,11 @@ it came in as:
 | `.json` | `output/<output_path stem>.json` — array of objects |
 | `.xlsx` / `.xls` | `output/<output_path stem>.xlsx` — **one** worksheet holding the anonymized table |
 
-The flat CSV is always written regardless, and `status.json` keeps pointing at
-it as `final_output_path`; the converted file is reported alongside as
-`format_matched_output_path`. Unlike `restore_sheets`, a failure here fails the
-run rather than silently leaving only the CSV — if you asked for `.xlsx` you
-should not get a CSV without being told.
+The flat CSV is always written too, and `status.json` keeps pointing at it as
+`final_output_path`; the converted file is reported alongside as
+`format_matched_output_path` — that is the field a downstream uploader should
+read. Unlike `restore_sheets`, a failure here fails the run rather than silently
+leaving only the CSV: a run handed `.xlsx` should not quietly return a CSV.
 
 This deliberately does **not** rebuild the original sheet layout — a multi-sheet
 input comes back as a single sheet. Use [`restore_sheets`](#restoring-per-sheet-output-restore_sheets)

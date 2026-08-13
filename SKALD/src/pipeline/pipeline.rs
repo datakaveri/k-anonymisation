@@ -49,15 +49,11 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     let mut will_write = vec![cfg.output_path.clone()];
     if let Some(stem) = Path::new(&cfg.output_path).file_stem() {
         let stem = stem.to_string_lossy().to_string();
-        if cfg.restore_sheets {
-            will_write.push(format!("{stem}.xlsx"));
-        }
         // The input format isn't known yet at this point, so reserve every name
-        // match_input could produce rather than mis-report one as stale.
-        if cfg.match_input_format {
-            will_write.push(format!("{stem}.xlsx"));
-            will_write.push(format!("{stem}.json"));
-        }
+        // the format-matched output could take rather than mis-report one as
+        // stale. `<stem>.xlsx` doubles as the restore_sheets workbook.
+        will_write.push(format!("{stem}.xlsx"));
+        will_write.push(format!("{stem}.json"));
     }
     if cfg.clean_output {
         let cleared = clear_output_dir(&output_dir_path, &will_write)?;
@@ -112,7 +108,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
         let restored_workbook_path =
             maybe_write_restored_workbook(&mut log, &cfg, &restore_plan, &output_dir_path, &final_output_path);
         let format_matched_output_path =
-            maybe_write_format_matched_output(&mut log, &cfg, input_format, &final_output_path, restored_workbook_path.as_deref())?;
+            write_format_matched_output(&mut log, &cfg, input_format, &final_output_path, restored_workbook_path.as_deref())?;
 
         return Ok(StatusPayload {
             status: "success".to_string(),
@@ -471,7 +467,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     let restored_workbook_path =
         maybe_write_restored_workbook(&mut log, &cfg, &restore_plan, &output_dir_path, Path::new(&final_output_path));
     let format_matched_output_path =
-        maybe_write_format_matched_output(&mut log, &cfg, input_format, Path::new(&final_output_path), restored_workbook_path.as_deref())?;
+        write_format_matched_output(&mut log, &cfg, input_format, Path::new(&final_output_path), restored_workbook_path.as_deref())?;
 
     Ok(StatusPayload {
         status: "success".to_string(),
@@ -507,29 +503,26 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     })
 }
 
-/// If `cfg.match_input_format` is set, also writes the anonymized result in
-/// whatever format the input arrived as — `.xlsx` in, `.xlsx` out — alongside
-/// the flat CSV, which is always produced and stays the canonical output.
+/// Writes the anonymized result in whatever format the input arrived as —
+/// `.xlsx` in, `.xlsx` out — alongside the flat CSV, which is always produced
+/// and stays the canonical output in `status.json`.
 ///
-/// Unlike `restore_sheets` this is fatal on failure: the caller explicitly
-/// asked for that format, so quietly delivering only the CSV would hand a
-/// downstream uploader the wrong artifact. CSV input is a no-op (the CSV
-/// output already matches) and logs why.
-fn maybe_write_format_matched_output(
+/// This is unconditional: a caller that hands SKALD a workbook gets a workbook
+/// back without having to ask for it. CSV input is a no-op (the CSV output
+/// already matches) and logs why.
+///
+/// Unlike `restore_sheets` this is fatal on failure. A run given `.xlsx` is
+/// expected to produce `.xlsx`, so quietly delivering only the CSV would hand a
+/// downstream uploader the wrong artifact.
+fn write_format_matched_output(
     log: &mut crate::pipeline::bootstrap::Logger,
     cfg: &crate::pipeline::bootstrap::RuntimeConfig,
     input_format: InputFormat,
     final_output_path: &Path,
     restored_workbook_path: Option<&str>,
 ) -> Result<Option<String>, PipelineError> {
-    if !cfg.match_input_format {
-        return Ok(None);
-    }
     if input_format == InputFormat::Csv {
-        log.info(
-            "output_format",
-            "output_format=match_input but input was CSV — output already matches, nothing to convert",
-        );
+        log.info("output_format", "Input was CSV — output already matches, nothing to convert");
         return Ok(None);
     }
     // `restore_sheets` writes to the same `<output_path stem>.xlsx` this would,

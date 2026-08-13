@@ -91,10 +91,6 @@ pub struct RuntimeConfig {
     /// before this run starts (key material and the active log are kept).
     /// Defaults to false — stale files are only reported, never removed.
     pub clean_output: bool,
-    /// When true (`output_format: "match_input"`), also write the anonymized
-    /// result in whatever format the input arrived as — `.xlsx` in, `.xlsx`
-    /// out. Defaults to false, i.e. always a flat CSV.
-    pub match_input_format: bool,
 }
 
 /// Controls which histogram-building algorithm SKALD uses.
@@ -603,19 +599,6 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
     let restore_sheets = section.get("restore_sheets").and_then(Value::as_bool).unwrap_or(false);
     let clean_output = section.get("clean_output").and_then(Value::as_bool).unwrap_or(false);
 
-    let match_input_format = match section.get("output_format").and_then(Value::as_str) {
-        Some(s) if s.eq_ignore_ascii_case("match_input") => true,
-        Some(s) if s.eq_ignore_ascii_case("csv") => false,
-        Some(other) => {
-            return Err(validation(
-                "CONFIG_INVALID_VALUE",
-                "Invalid output_format",
-                &format!("'{other}' — must be \"csv\" (default) or \"match_input\""),
-            ))
-        }
-        None => false,
-    };
-
     Ok(RuntimeConfig {
         enable_k_anonymity: has_k_anonymize && has_qis,
         pass,
@@ -645,7 +628,6 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         sheet_joins,
         restore_sheets,
         clean_output,
-        match_input_format,
     })
 }
 

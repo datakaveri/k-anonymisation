@@ -700,27 +700,99 @@ fn clean_output_defaults_to_false_and_parses_from_config() {
 }
 
 #[test]
-fn output_format_parses_and_defaults_to_csv() {
-    let d = mk_temp_dir("skald_output_format_cfg");
+fn xlsx_input_yields_xlsx_output_with_no_config_opt_in() {
+    let root = mk_temp_dir("skald_xlsx_roundtrip");
+    fs::create_dir_all(root.join("config")).expect("config dir");
+    fs::create_dir_all(root.join("data")).expect("data dir");
 
-    let default_path = d.join("default.json");
-    fs::write(&default_path, r#"{"data_type":"T","T":{"output_path":"x.csv"}}"#).expect("write cfg");
-    assert!(!parse_runtime_config(&default_path).expect("parse cfg").match_input_format);
+    // A single-sheet workbook, so no sheet_joins / restore_sheets are involved —
+    // the .xlsx output must come purely from echoing the input format.
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    {
+        let ws = wb.add_worksheet();
+        for (c, h) in ["Age", "Name"].iter().enumerate() {
+            ws.write_string(0, c as u16, *h).expect("header");
+        }
+        for (r, (age, name)) in [("20", "Alice"), ("20", "Bob"), ("21", "Carol")].iter().enumerate() {
+            ws.write_string(r as u32 + 1, 0, *age).expect("age");
+            ws.write_string(r as u32 + 1, 1, *name).expect("name");
+        }
+    }
+    wb.save(root.join("data").join("in.xlsx")).expect("save xlsx");
 
-    let explicit_csv = d.join("csv.json");
-    fs::write(&explicit_csv, r#"{"data_type":"T","T":{"output_format":"csv"}}"#).expect("write cfg");
-    assert!(!parse_runtime_config(&explicit_csv).expect("parse cfg").match_input_format);
+    fs::write(
+        root.join("config").join("pipeline.json"),
+        r#"{
+          "data_type":"T",
+          "T":{
+            "output_path":"final.csv",
+            "output_directory":"output",
+            "suppression_limit":1.0,
+            "k_anonymize":{"k":2},
+            "quasi_identifiers":{
+              "numerical":[{"column":"Age","encode":false,"scale":false,"s":0,"type":"int"}],
+              "categorical":[]
+            },
+            "size":{"Age":2}
+          }
+        }"#,
+    )
+    .expect("write cfg");
 
-    let match_input = d.join("match.json");
-    fs::write(&match_input, r#"{"data_type":"T","T":{"output_format":"match_input"}}"#).expect("write cfg");
-    assert!(parse_runtime_config(&match_input).expect("parse cfg").match_input_format);
+    let status = run_pipeline(&root).expect("run pipeline");
+    assert_eq!(status.status, "success");
 
-    // An unrecognised value is a config error, not a silent fallback to CSV
-    let bogus = d.join("bogus.json");
-    fs::write(&bogus, r#"{"data_type":"T","T":{"output_format":"parquet"}}"#).expect("write cfg");
-    assert!(parse_runtime_config(&bogus).is_err());
+    let outputs = status.outputs.expect("outputs");
+    let matched = outputs
+        .get("format_matched_output_path")
+        .and_then(|v| v.as_str())
+        .expect("xlsx input must report a format-matched output without any config flag");
+    assert!(matched.ends_with(".xlsx"), "got {matched}");
+    assert!(PathBuf::from(matched).exists());
 
-    let _ = fs::remove_dir_all(d);
+    // The flat CSV is still written and remains the canonical output
+    let csv = outputs.get("final_output_path").and_then(|v| v.as_str()).expect("final output");
+    assert!(csv.ends_with(".csv"));
+    assert!(PathBuf::from(csv).exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn csv_input_reports_no_format_matched_output() {
+    let root = mk_temp_dir("skald_csv_no_convert");
+    fs::create_dir_all(root.join("config")).expect("config dir");
+    fs::create_dir_all(root.join("data")).expect("data dir");
+
+    fs::write(root.join("data").join("d.csv"), "Age,Name\n20,Alice\n20,Bob\n21,Carol\n")
+        .expect("write data");
+    fs::write(
+        root.join("config").join("pipeline.json"),
+        r#"{
+          "data_type":"T",
+          "T":{
+            "output_path":"final.csv",
+            "output_directory":"output",
+            "suppression_limit":1.0,
+            "k_anonymize":{"k":2},
+            "quasi_identifiers":{
+              "numerical":[{"column":"Age","encode":false,"scale":false,"s":0,"type":"int"}],
+              "categorical":[]
+            },
+            "size":{"Age":2}
+          }
+        }"#,
+    )
+    .expect("write cfg");
+
+    let status = run_pipeline(&root).expect("run pipeline");
+    let outputs = status.outputs.expect("outputs");
+    assert!(
+        outputs.get("format_matched_output_path").map(|v| v.is_null()).unwrap_or(true),
+        "CSV in / CSV out needs no conversion"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
