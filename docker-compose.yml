@@ -11,7 +11,7 @@ version: "3.8"
 
 services:
   skald:
-    image: ghcr.io/kailash-reddy/skald:v3.1
+    image: ghcr.io/datakaveri/skald:v3.2
     build:
       context: .
       dockerfile: Dockerfile
