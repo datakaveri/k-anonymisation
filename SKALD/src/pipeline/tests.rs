@@ -838,15 +838,106 @@ fn resolve_input_csv_reports_the_format_it_found() {
     fs::create_dir_all(&data).expect("data dir");
 
     fs::write(data.join("in.csv"), "a,b\n1,2\n").expect("write csv");
-    let (path, _plan, format) = resolve_input_csv(&data, &chunks, &[]).expect("resolve csv");
-    assert_eq!(format, InputFormat::Csv);
-    assert_eq!(path, data.join("in.csv"), "plain CSV is used in place, not copied");
+    let r = resolve_input_csv(&data, &chunks, &[]).expect("resolve csv");
+    assert_eq!(r.format, InputFormat::Csv);
+    assert!(r.format_mismatch.is_none());
+    assert_eq!(r.csv_path, data.join("in.csv"), "plain CSV is used in place, not copied");
 
     fs::remove_file(data.join("in.csv")).expect("rm csv");
     fs::write(data.join("in.json"), r#"[{"a":"1","b":"2"}]"#).expect("write json");
-    let (path, _plan, format) = resolve_input_csv(&data, &chunks, &[]).expect("resolve json");
-    assert_eq!(format, InputFormat::Json);
-    assert_eq!(path, chunks.join("_converted.csv"), "JSON is normalised into scratch");
+    let r = resolve_input_csv(&data, &chunks, &[]).expect("resolve json");
+    assert_eq!(r.format, InputFormat::Json);
+    assert_eq!(r.csv_path, chunks.join("_converted.csv"), "JSON is normalised into scratch");
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn json_misnamed_as_csv_is_read_as_json_not_parsed_as_text() {
+    // The TEE decrypt step appends .csv to every dataset, so
+    // `records.json.enc` lands as `records.json.csv`. JSON is valid UTF-8, so
+    // it slips past the CSV reader's only guard and would be parsed as
+    // delimited text — garbage columns, no error, a plausible-looking result.
+    let d = mk_temp_dir("skald_sniff_json");
+    let data = d.join("data");
+    let chunks = d.join("chunks");
+    fs::create_dir_all(&data).expect("data dir");
+    fs::write(
+        data.join("records.json.csv"),
+        r#"[{"Age":"20","City":"Pune"},{"Age":"21","City":"Delhi"}]"#,
+    )
+    .expect("write json");
+
+    let r = resolve_input_csv(&data, &chunks, &[]).expect("resolve");
+
+    assert_eq!(r.format, InputFormat::Json, "content wins over the .csv extension");
+    let mismatch = r.format_mismatch.expect("the name/content disagreement must be reported");
+    assert!(mismatch.contains("records.json.csv") && mismatch.contains("json"), "got: {mismatch}");
+
+    // Parsed as records, not as one column of raw JSON text
+    let converted = fs::read_to_string(&r.csv_path).expect("read converted");
+    assert_eq!(converted.lines().next(), Some("Age,City"));
+    assert_eq!(converted.lines().count(), 3, "header + 2 records");
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn xlsx_misnamed_as_csv_reaches_the_excel_reader() {
+    let d = mk_temp_dir("skald_sniff_xlsx");
+    let data = d.join("data");
+    let chunks = d.join("chunks");
+    fs::create_dir_all(&data).expect("data dir");
+
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    {
+        let ws = wb.add_worksheet();
+        ws.write_string(0, 0, "Age").expect("header");
+        ws.write_string(1, 0, "20").expect("cell");
+    }
+    wb.save(data.join("dataset.xlsx.csv")).expect("save xlsx");
+
+    let r = resolve_input_csv(&data, &chunks, &[]).expect("resolve");
+
+    assert_eq!(r.format, InputFormat::Excel);
+    assert!(r.format_mismatch.is_some());
+    assert_eq!(fs::read_to_string(&r.csv_path).expect("read converted").lines().next(), Some("Age"));
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn sniff_leaves_genuine_csv_alone() {
+    let d = mk_temp_dir("skald_sniff_csv");
+    let data = d.join("data");
+    let chunks = d.join("chunks");
+    fs::create_dir_all(&data).expect("data dir");
+    // A leading bracket inside a quoted field must not be mistaken for JSON
+    fs::write(data.join("in.csv"), "\"[bracketed]\",b\n1,2\n").expect("write csv");
+
+    let r = resolve_input_csv(&data, &chunks, &[]).expect("resolve");
+
+    assert_eq!(r.format, InputFormat::Csv);
+    assert!(r.format_mismatch.is_none(), "no mismatch for a correctly named CSV");
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
+fn categorical_hierarchy_key_lookup_is_case_insensitive() {
+    // Config keys are lowercased at parse and column names lowercased at
+    // lookup, so a producer sending "BloodGroup" verbatim still resolves.
+    let d = mk_temp_dir("skald_hier_case");
+    let cfg_path = d.join("cfg.json");
+    fs::write(
+        &cfg_path,
+        r#"{"data_type":"T","T":{"categorical_hierarchies":{"BloodGroup":{"A+":["A","*"]}}}}"#,
+    )
+    .expect("write cfg");
+
+    let cfg = parse_runtime_config(&cfg_path).expect("parse cfg");
+    assert!(cfg.categorical_hierarchies.contains_key("bloodgroup"), "config key must normalise");
+    assert!(!cfg.categorical_hierarchies.contains_key("BloodGroup"));
 
     let _ = fs::remove_dir_all(d);
 }

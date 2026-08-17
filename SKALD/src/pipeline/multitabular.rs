@@ -722,12 +722,19 @@ pub fn merge_excel_sheets(
 /// read-write scratch space — and that path is returned.
 ///
 /// Also reports which format the input actually was, so the run can echo that
-/// format back on output when `output_format: "match_input"` is configured.
+/// format back on output.
+///
+/// The reader is chosen from the file's **contents**, not its name — see
+/// [`sniff_format`]. A `.json` file misnamed `.csv` is otherwise valid UTF-8, so
+/// it would sail past the CSV reader's only guard and be parsed as delimited
+/// text: garbage columns, no error, a plausible-looking result. Routing on
+/// content makes that impossible; a name/content disagreement is reported in
+/// [`ResolvedInput::format_mismatch`] for the caller to log.
 pub fn resolve_input_csv(
     data_dir: &Path,
     chunks_dir: &Path,
     sheet_joins: &[SheetJoinSpec],
-) -> Result<(PathBuf, Option<SheetRestorePlan>, InputFormat), PipelineError> {
+) -> Result<ResolvedInput, PipelineError> {
     if !data_dir.is_dir() {
         return Err(validation("DATA_DIR_MISSING", "Data directory not found", &data_dir.display().to_string()));
     }
@@ -770,25 +777,102 @@ pub fn resolve_input_csv(
         ));
     }
 
-    if !jsons.is_empty() {
-        fs::create_dir_all(chunks_dir)?;
-        let converted_path = chunks_dir.join("_converted.csv");
-        let sheet = read_json_sheet(&jsons[0])?;
-        write_sheet_csv(&sheet, &converted_path)?;
-        return Ok((converted_path, None, InputFormat::Json));
-    }
-    if !excels.is_empty() {
-        fs::create_dir_all(chunks_dir)?;
-        let converted_path = chunks_dir.join("_converted.csv");
-        let sheets = read_xlsx_sheets(&excels[0])?;
-        let source_name = excels[0].file_name().and_then(|n| n.to_str()).unwrap_or("input").to_string();
-        let (merged, plan) = merge_excel_sheets(sheets, sheet_joins, &source_name)?;
-        write_sheet_csv(&merged, &converted_path)?;
-        return Ok((converted_path, plan, InputFormat::Excel));
-    }
+    // Exactly one candidate at this point; its extension is only a hint.
+    let input_path = csvs.into_iter().chain(jsons).chain(excels).next().expect("total == 1 checked above");
+    let declared = format_from_extension(&input_path).unwrap_or(InputFormat::Csv);
+    let sniffed = sniff_format(&input_path)?;
+    let format = sniffed.unwrap_or(declared);
 
-    // Sole .csv input: return it as-is, still under (read-only) data_dir.
-    Ok((csvs.remove(0), None, InputFormat::Csv))
+    let format_mismatch = sniffed.filter(|&s| s != declared).map(|s| {
+        format!(
+            "'{}' is named like {} but its contents are {} — reading it as {}. \
+             The extension is a hint only; fix the producer so the name matches.",
+            input_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            declared.extension(),
+            s.extension(),
+            s.extension(),
+        )
+    });
+
+    let (csv_path, restore_plan) = match format {
+        InputFormat::Json => {
+            fs::create_dir_all(chunks_dir)?;
+            let converted_path = chunks_dir.join("_converted.csv");
+            let sheet = read_json_sheet(&input_path)?;
+            write_sheet_csv(&sheet, &converted_path)?;
+            (converted_path, None)
+        }
+        InputFormat::Excel => {
+            fs::create_dir_all(chunks_dir)?;
+            let converted_path = chunks_dir.join("_converted.csv");
+            let sheets = read_xlsx_sheets(&input_path)?;
+            let source_name = input_path.file_name().and_then(|n| n.to_str()).unwrap_or("input").to_string();
+            let (merged, plan) = merge_excel_sheets(sheets, sheet_joins, &source_name)?;
+            write_sheet_csv(&merged, &converted_path)?;
+            (converted_path, plan)
+        }
+        // Sole CSV input: used in place, still under (read-only) data_dir.
+        InputFormat::Csv => (input_path, None),
+    };
+
+    Ok(ResolvedInput { csv_path, restore_plan, format, format_mismatch })
+}
+
+/// What [`resolve_input_csv`] worked out about the run's input.
+#[derive(Debug)]
+pub struct ResolvedInput {
+    /// A single CSV ready for chunking — the input itself when it was already
+    /// CSV, otherwise the normalised `chunks_dir/_converted.csv`.
+    pub csv_path: PathBuf,
+    /// Per-sheet provenance, when the input was multi-sheet Excel merged via
+    /// explicit `sheet_joins`. `None` otherwise.
+    pub restore_plan: Option<SheetRestorePlan>,
+    /// The format actually detected, which the run echoes back on output.
+    pub format: InputFormat,
+    /// Set when the file's extension disagreed with its contents; the caller
+    /// logs it. Content wins, so this is a warning, not an error.
+    pub format_mismatch: Option<String>,
+}
+
+/// Maps a path's extension to a format. `None` for anything unrecognised.
+fn format_from_extension(path: &Path) -> Option<InputFormat> {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
+        "csv" => Some(InputFormat::Csv),
+        "json" => Some(InputFormat::Json),
+        "xlsx" | "xls" => Some(InputFormat::Excel),
+        _ => None,
+    }
+}
+
+/// Identifies a file's format from its leading bytes, ignoring its name.
+///
+/// Recognises the two formats that are unambiguous at the head of the stream:
+/// `.xlsx`/`.xls` (a zip container, `PK\x03\x04`) and JSON (first non-whitespace
+/// byte is `[` or `{`, which no CSV header row can start with unquoted).
+/// Returns `None` for anything else — including CSV, which has no signature and
+/// is what the caller falls back to.
+pub fn sniff_format(path: &Path) -> Result<Option<InputFormat>, PipelineError> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).map_err(|e| io_err("open input file", &path.display().to_string(), e))?;
+    let mut head = [0u8; 64];
+    let read = file
+        .read(&mut head)
+        .map_err(|e| io_err("read input file header", &path.display().to_string(), e))?;
+    let head = &head[..read];
+
+    if head.starts_with(b"PK\x03\x04") {
+        return Ok(Some(InputFormat::Excel));
+    }
+    // Legacy .xls (OLE2 compound file) — recognised so a misnamed one reaches
+    // calamine and fails with a real message rather than as broken CSV.
+    if head.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]) {
+        return Ok(Some(InputFormat::Excel));
+    }
+    match head.iter().find(|b| !b.is_ascii_whitespace()) {
+        Some(b'[') | Some(b'{') => Ok(Some(InputFormat::Json)),
+        _ => Ok(None),
+    }
 }
 
 // ── Echoing the input format back on output ─────────────────────────────────

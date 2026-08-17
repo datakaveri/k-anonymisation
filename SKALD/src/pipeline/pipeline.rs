@@ -81,8 +81,13 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     // normalised into chunks/ (read-write scratch) instead; a plain .csv
     // input is returned as-is, still pointing into data/.
     log.info("input", "Resolving input data format (csv/json/xlsx)");
+    let resolved = resolve_input_csv(&root.join("data"), &root.join("chunks"), &cfg.sheet_joins)?;
+    if let Some(mismatch) = &resolved.format_mismatch {
+        log.info("input", &format!("FORMAT MISMATCH: {mismatch}"));
+    }
+    log.info("input", &format!("Reading input as {:?}", resolved.format));
     let (input_csv, restore_plan, input_format) =
-        resolve_input_csv(&root.join("data"), &root.join("chunks"), &cfg.sheet_joins)?;
+        (resolved.csv_path, resolved.restore_plan, resolved.format);
 
     // ── Chunking (all passes need the raw CSV split) ─────────────────────────
     log.info("chunking", "Splitting CSV into RAM-sized chunks");

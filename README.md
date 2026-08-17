@@ -162,6 +162,27 @@ Place a single JSON file in `config/`. Full example:
 
 `fpe_keys.json` is only produced by the legacy `SKALD/preprocess.py` reference path (PAN/digits FPE), not the Rust pipeline — see the FPE note under [Config schema](#config-schema).
 
+### How the input format is detected
+
+From the file's **contents**, not its name. A `.xlsx` renamed `.csv` is still
+read as a workbook, and a `.json` renamed `.csv` is still read as JSON.
+
+This matters because the two failure modes are not equally visible. A misnamed
+workbook fails loudly — it is binary, so the CSV reader dies on the first
+non-UTF-8 byte. Misnamed JSON is valid UTF-8, so it would sail past that guard,
+be parsed as delimited text, and yield garbage columns with no error at all.
+
+Detection uses leading bytes: `PK\x03\x04` (or the OLE2 signature for legacy
+`.xls`) means Excel; a first non-whitespace byte of `[` or `{` means JSON;
+anything else is treated as CSV. When the name and contents disagree the
+contents win and the run logs it:
+
+```
+[input] FORMAT MISMATCH: 'records.json.csv' is named like csv but its contents
+        are json — reading it as json. The extension is a hint only; fix the
+        producer so the name matches.
+```
+
 ### Matching the input format
 
 Every run writes the anonymized result back in the format it received, with no
