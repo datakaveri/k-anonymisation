@@ -3,8 +3,7 @@ use crate::pipeline::anonymization::{
     compute_k_optimal, compute_numerical_min_max, compute_parameter_grid, compute_z_weights,
     equivalence_class_stats, find_ola1_initial_ri, find_ola2_best_rf_detailed,
     find_ola2_best_rf_z_detailed, generalize_and_write_outputs, merge_histogram,
-    merge_z_histogram, scan_chunks_for_flow, z_hist_to_sparse, GridEntry, QuasiIdentifierLite,
-    SparseHist, ZHist,
+    merge_z_histogram, scan_chunks_for_flow, z_hist_to_sparse, GridEntry, SparseHist, ZHist,
 };
 use crate::pipeline::bootstrap::{
     available_ram_bytes, clear_output_dir, clear_scratch_dir, ensure_output_dir,
@@ -12,7 +11,7 @@ use crate::pipeline::bootstrap::{
     FlowMode, Logger, PipelineError, StatusPayload,
 };
 use crate::pipeline::multitabular::{
-    resolve_input_csv, write_output_in_format, write_restored_workbook, InputFormat, SheetRestorePlan,
+    resolve_pipeline_input, write_output_in_format, write_restored_workbook, InputFormat, SheetRestorePlan,
 };
 use crate::pipeline::preprocess::preprocess_chunks;
 use serde_json::json;
@@ -80,8 +79,36 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     // data/ is mounted read-only in deployment, so JSON/Excel inputs are
     // normalised into chunks/ (read-write scratch) instead; a plain .csv
     // input is returned as-is, still pointing into data/.
+    let staged_input_path = if cfg.free_text_anonymization.enabled {
+        cfg.free_text_anonymization
+            .staged_input_path
+            .as_ref()
+            .map(|p| if p.is_absolute() { p.clone() } else { root.join(p) })
+    } else {
+        None
+    };
+    if cfg.free_text_anonymization.enabled {
+        log.info("input", &format!(
+            "free-text anonymization enabled for {} column(s)",
+            cfg.free_text_anonymization.columns.len()
+        ));
+        if let Some(path) = &staged_input_path {
+            log.info("input", &format!("Using staged input file from {}", path.display()));
+        } else {
+            log.warn(
+                "input",
+                "free_text_anonymization.enabled is set but staged_input_path is missing — falling back to raw data/",
+            );
+        }
+    }
+
     log.info("input", "Resolving input data format (csv/json/xlsx)");
-    let resolved = resolve_input_csv(&root.join("data"), &root.join("chunks"), &cfg.sheet_joins)?;
+    let resolved = resolve_pipeline_input(
+        staged_input_path.as_deref(),
+        &root.join("data"),
+        &root.join("chunks"),
+        &cfg.sheet_joins,
+    )?;
     if let Some(mismatch) = &resolved.format_mismatch {
         log.info("input", &format!("FORMAT MISMATCH: {mismatch}"));
     }
@@ -746,4 +773,3 @@ fn log_histogram_diagnostic(
     }
     log.info(tag, &format!("── end {label} ──"));
 }
-

@@ -46,6 +46,16 @@ impl From<serde_json::Error> for PipelineError {
 pub type HierarchyMap = HashMap<String, HashMap<String, Vec<String>>>;
 
 #[derive(Debug, Clone)]
+pub struct FreeTextAnonymizationConfig {
+    pub enabled: bool,
+    pub columns: Vec<String>,
+    /// Optional path to a sanitized input file produced by the free-text
+    /// anonymization stage. When present and enabled, the pipeline consumes
+    /// this staged file instead of scanning `data/` for the raw input.
+    pub staged_input_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub enable_k_anonymity: bool,
     /// "pass1" | "pass2" | "no_bounds"
@@ -87,6 +97,8 @@ pub struct RuntimeConfig {
     /// `.xlsx` workbook mirroring the original input sheets (only meaningful
     /// when the input was multi-sheet Excel joined via `sheet_joins`).
     pub restore_sheets: bool,
+    /// Optional free-text anonymization handoff.
+    pub free_text_anonymization: FreeTextAnonymizationConfig,
     /// When true, delete leftover files from a previous run out of `output/`
     /// before this run starts (key material and the active log are kept).
     /// Defaults to false — stale files are only reported, never removed.
@@ -222,7 +234,7 @@ pub fn suggested_fix_for(code: &str) -> &'static str {
         "PREPROCESS_COLUMN_MISSING" | "PREPROCESSING_FAILED" =>
             "A preprocessing target column was not found in the CSV header. \
              Check suppress, masking, hashing, tokenization, fpe, encrypt, \
-             and charcloak column names against the actual CSV header.",
+             charcloak, and free-text handoff column names against the actual CSV header.",
         "PREPROCESS_CONFIG_INVALID" =>
             "A preprocessing config entry is malformed. \
              Each entry must be an object with a 'column' field and valid parameters.",
@@ -597,6 +609,39 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
 
     let sheet_joins = crate::pipeline::multitabular::parse_sheet_joins(section)?;
     let restore_sheets = section.get("restore_sheets").and_then(Value::as_bool).unwrap_or(false);
+    let free_text_anonymization = {
+        let block = section
+            .get("free_text_anonymization")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let enabled = block.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let columns = block
+            .get("columns")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let staged_input_path = block
+            .get("staged_input_path")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from);
+
+        if enabled && columns.is_empty() {
+            return Err(validation(
+                "CONFIG_INVALID_VALUE",
+                "free_text_anonymization.enabled requires at least one column",
+                "Add one or more entries under free_text_anonymization.columns",
+            ));
+        }
+
+        FreeTextAnonymizationConfig { enabled, columns, staged_input_path }
+    };
     let clean_output = section.get("clean_output").and_then(Value::as_bool).unwrap_or(false);
 
     Ok(RuntimeConfig {
@@ -627,6 +672,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
             .unwrap_or(true),
         sheet_joins,
         restore_sheets,
+        free_text_anonymization,
         clean_output,
     })
 }

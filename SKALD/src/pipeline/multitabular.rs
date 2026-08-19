@@ -730,6 +730,69 @@ pub fn merge_excel_sheets(
 /// text: garbage columns, no error, a plausible-looking result. Routing on
 /// content makes that impossible; a name/content disagreement is reported in
 /// [`ResolvedInput::format_mismatch`] for the caller to log.
+pub fn resolve_pipeline_input(
+    staged_input_path: Option<&Path>,
+    data_dir: &Path,
+    chunks_dir: &Path,
+    sheet_joins: &[SheetJoinSpec],
+) -> Result<ResolvedInput, PipelineError> {
+    if let Some(path) = staged_input_path {
+        return resolve_input_path(path, chunks_dir, sheet_joins);
+    }
+    resolve_input_csv(data_dir, chunks_dir, sheet_joins)
+}
+
+fn resolve_input_path(
+    input_path: &Path,
+    chunks_dir: &Path,
+    sheet_joins: &[SheetJoinSpec],
+) -> Result<ResolvedInput, PipelineError> {
+    if !input_path.is_file() {
+        return Err(validation(
+            "DATA_MISSING",
+            "Configured input file not found",
+            &input_path.display().to_string(),
+        ));
+    }
+
+    let declared = format_from_extension(input_path).unwrap_or(InputFormat::Csv);
+    let sniffed = sniff_format(input_path)?;
+    let format = sniffed.unwrap_or(declared);
+
+    let format_mismatch = sniffed.filter(|&s| s != declared).map(|s| {
+        format!(
+            "'{}' is named like {} but its contents are {} — reading it as {}. \
+             The extension is a hint only; fix the producer so the name matches.",
+            input_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            declared.extension(),
+            s.extension(),
+            s.extension(),
+        )
+    });
+
+    let (csv_path, restore_plan) = match format {
+        InputFormat::Json => {
+            fs::create_dir_all(chunks_dir)?;
+            let converted_path = chunks_dir.join("_converted.csv");
+            let sheet = read_json_sheet(input_path)?;
+            write_sheet_csv(&sheet, &converted_path)?;
+            (converted_path, None)
+        }
+        InputFormat::Excel => {
+            fs::create_dir_all(chunks_dir)?;
+            let converted_path = chunks_dir.join("_converted.csv");
+            let sheets = read_xlsx_sheets(input_path)?;
+            let source_name = input_path.file_name().and_then(|n| n.to_str()).unwrap_or("input").to_string();
+            let (merged, plan) = merge_excel_sheets(sheets, sheet_joins, &source_name)?;
+            write_sheet_csv(&merged, &converted_path)?;
+            (converted_path, plan)
+        }
+        InputFormat::Csv => (input_path.to_path_buf(), None),
+    };
+
+    Ok(ResolvedInput { csv_path, restore_plan, format, format_mismatch })
+}
+
 pub fn resolve_input_csv(
     data_dir: &Path,
     chunks_dir: &Path,
@@ -779,43 +842,7 @@ pub fn resolve_input_csv(
 
     // Exactly one candidate at this point; its extension is only a hint.
     let input_path = csvs.into_iter().chain(jsons).chain(excels).next().expect("total == 1 checked above");
-    let declared = format_from_extension(&input_path).unwrap_or(InputFormat::Csv);
-    let sniffed = sniff_format(&input_path)?;
-    let format = sniffed.unwrap_or(declared);
-
-    let format_mismatch = sniffed.filter(|&s| s != declared).map(|s| {
-        format!(
-            "'{}' is named like {} but its contents are {} — reading it as {}. \
-             The extension is a hint only; fix the producer so the name matches.",
-            input_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-            declared.extension(),
-            s.extension(),
-            s.extension(),
-        )
-    });
-
-    let (csv_path, restore_plan) = match format {
-        InputFormat::Json => {
-            fs::create_dir_all(chunks_dir)?;
-            let converted_path = chunks_dir.join("_converted.csv");
-            let sheet = read_json_sheet(&input_path)?;
-            write_sheet_csv(&sheet, &converted_path)?;
-            (converted_path, None)
-        }
-        InputFormat::Excel => {
-            fs::create_dir_all(chunks_dir)?;
-            let converted_path = chunks_dir.join("_converted.csv");
-            let sheets = read_xlsx_sheets(&input_path)?;
-            let source_name = input_path.file_name().and_then(|n| n.to_str()).unwrap_or("input").to_string();
-            let (merged, plan) = merge_excel_sheets(sheets, sheet_joins, &source_name)?;
-            write_sheet_csv(&merged, &converted_path)?;
-            (converted_path, plan)
-        }
-        // Sole CSV input: used in place, still under (read-only) data_dir.
-        InputFormat::Csv => (input_path, None),
-    };
-
-    Ok(ResolvedInput { csv_path, restore_plan, format, format_mismatch })
+    resolve_input_path(&input_path, chunks_dir, sheet_joins)
 }
 
 /// What [`resolve_input_csv`] worked out about the run's input.

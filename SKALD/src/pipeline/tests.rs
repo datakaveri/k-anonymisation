@@ -60,6 +60,40 @@ fn parse_runtime_config_reads_basic_fields() {
 }
 
 #[test]
+fn parse_runtime_config_reads_free_text_handoff() {
+    let d = mk_temp_dir("skald_free_text_cfg");
+    let cfg_path = d.join("cfg.json");
+    fs::write(
+        &cfg_path,
+        r#"{
+          "data_type":"T",
+          "T":{
+            "output_path":"x.csv",
+            "free_text_anonymization":{
+              "enabled":true,
+              "columns":["Narrative"],
+              "staged_input_path":"work/sanitized.csv"
+            }
+          }
+        }"#,
+    )
+    .expect("write cfg");
+
+    let cfg = parse_runtime_config(&cfg_path).expect("parse cfg");
+    assert!(cfg.free_text_anonymization.enabled);
+    assert_eq!(cfg.free_text_anonymization.columns, vec!["Narrative".to_string()]);
+    assert_eq!(
+        cfg.free_text_anonymization
+            .staged_input_path
+            .as_ref()
+            .and_then(|p| p.to_str()),
+        Some("work/sanitized.csv")
+    );
+
+    let _ = fs::remove_dir_all(d);
+}
+
+#[test]
 fn split_csv_by_ram_creates_multiple_chunks() {
     let root = mk_temp_dir("skald_chunk_split");
     let data = root.join("data");
@@ -177,6 +211,53 @@ fn run_pipeline_smoke_success() {
         .and_then(|v| v.as_str())
         .expect("final output path");
     assert!(PathBuf::from(out_path).exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn run_pipeline_can_consume_staged_input_file() {
+    let root = mk_temp_dir("skald_staged_input");
+    fs::create_dir_all(root.join("config")).expect("config dir");
+    fs::create_dir_all(root.join("chunks")).expect("chunks dir");
+    fs::create_dir_all(root.join("work")).expect("work dir");
+
+    fs::write(
+        root.join("work").join("sanitized.csv"),
+        "Age,Narrative\n20,redacted one\n20,redacted two\n21,redacted three\n",
+    )
+    .expect("write staged input");
+
+    fs::write(
+        root.join("config").join("pipeline.json"),
+        r#"{
+          "data_type":"T",
+          "T":{
+            "output_path":"final.csv",
+            "output_directory":"output",
+            "suppression_limit":1.0,
+            "k_anonymize":{"k":2},
+            "free_text_anonymization":{
+              "enabled":true,
+              "columns":["Narrative"],
+              "staged_input_path":"work/sanitized.csv"
+            },
+            "quasi_identifiers":{
+              "numerical":[{"column":"Age","encode":false,"scale":false,"s":0,"type":"int"}],
+              "categorical":[]
+            },
+            "size":{"Age":2}
+          }
+        }"#,
+    )
+    .expect("write cfg");
+
+    let status = run_pipeline(&root).expect("run pipeline");
+    assert_eq!(status.status, "success");
+
+    let outputs = status.outputs.expect("outputs");
+    let csv = outputs.get("final_output_path").and_then(|v| v.as_str()).expect("final output");
+    assert!(PathBuf::from(csv).exists());
 
     let _ = fs::remove_dir_all(root);
 }

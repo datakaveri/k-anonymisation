@@ -9,8 +9,9 @@ Implements the OLA-1 / OLA-2 lattice algorithms for optimal generalization with 
 
 1. Reads one input file from `data/` — CSV, JSON (array of flat objects), or Excel (`.xlsx`/`.xls`, including multi-sheet workbooks joined into one table)
 2. Applies preprocessing (suppress, hash, mask, encrypt, tokenize)
-3. Computes k-anonymous generalizations using OLA-2 lattice search — either the original OLA-1→OLA-2 path or a memory-efficient DIRECT flow, chosen automatically
-4. Writes anonymized output and a structured status payload to `output/`
+3. Optionally consumes a pre-sanitized staged input file produced by a free-text anonymization step
+4. Computes k-anonymous generalizations using OLA-2 lattice search — either the original OLA-1→OLA-2 path or a memory-efficient DIRECT flow, chosen automatically
+5. Writes anonymized output and a structured status payload to `output/`
 
 Reverse-operation scripts (`scripts/reverse_*.py`) can recover original values from anonymized output for authorized holders of the generated key/vault files.
 
@@ -89,6 +90,11 @@ Place a single JSON file in `config/`. Full example:
     "tokenization": [
       { "column": "patient_id", "prefix": "TK-", "digits": 8 }
     ],
+    "free_text_anonymization": {
+      "enabled": false,
+      "columns": [],
+      "staged_input_path": "work/sanitized_input.csv"
+    },
 
     "quasi_identifiers": {
       "numerical": [
@@ -140,6 +146,9 @@ Place a single JSON file in `config/`. Full example:
 | `compute_parameter_grid` | bool | When true (default), also compute the k × suppression_limit parameter grid (extra OLA-2 searches). Set `false` in benchmarks to skip it. |
 | `sheet_joins` | array | Config-driven join steps for multi-sheet Excel input: `{ "left": "<sheet>", "right": "<sheet>", "on": "<col>" \| ["<col>", ...], "how": "left"\|"right"\|"inner"\|"outer"\|"cross" }`. If omitted, sheets with a shared column are auto-joined; sheets with no shared columns are concatenated by row position. Only used when the input file is `.xlsx`/`.xls`. |
 | `restore_sheets` | bool | When true, also write the anonymized result back as a multi-sheet `.xlsx` mirroring the original input sheets (see [Restoring per-sheet output](#restoring-per-sheet-output-restore_sheets)). Default `false`. Only takes effect when sheets were merged via explicit `sheet_joins` (or there was only one sheet). |
+| `free_text_anonymization.enabled` | bool | When true, the pipeline expects a staged sanitized input file to be provided by the TEE before SKALD runs. |
+| `free_text_anonymization.columns` | array | Free-text columns selected in the UI for the upstream anonymizer. SKALD only validates that the list is present when the feature is enabled. |
+| `free_text_anonymization.staged_input_path` | string | Path to the sanitized input file that the TEE/GDA stage writes. When enabled, SKALD reads this file instead of scanning `data/`. Relative paths are resolved from the repo root. |
 | `clean_output` | bool | When true, delete leftover files from a previous run out of `output/` before this run starts. Default `false` — leftovers are reported in the log but kept (see [Leftovers between runs](#leftovers-between-runs)). Key material (`*keys*.json`) and the active log are never removed. |
 
 **FPE note:** the legacy `"fpe"` config section (PAN/digits-specific format-preserving encryption) has been removed from the Rust pipeline. General format-preserving encryption is still available via `encrypt` + `"format_preserving": true`. The PAN/digits-specific algorithms remain documented in `SKALD/preprocess.py` (reference implementation) and are invertible via `scripts/reverse_fpe.py` for data already encrypted under the old scheme.
