@@ -61,6 +61,33 @@ cargo run --manifest-path SKALD/Cargo.toml --release --bin skald_pipeline
 cargo test --manifest-path SKALD/Cargo.toml --lib
 ```
 
+## Build a standalone RHEL 7 bundle
+
+The repository includes a Docker-based packaging command that extracts the
+statically linked x86_64 binary and copies the fixed configuration into a
+portable directory:
+
+```bash
+bash scripts/package_rhel7.sh
+```
+
+The bundle is written to `dist/skald-rhel7/`. Give the recipient the bundle,
+place exactly one input file in `data/`, and run:
+
+```bash
+./skald_pipeline
+```
+
+To package a different fixed configuration, pass the output directory and
+config path:
+
+```bash
+bash scripts/package_rhel7.sh dist/telangana-ration config/telangana_ration.json
+```
+
+The binary is statically linked against musl, so it does not depend on the
+recipient's RHEL 7 glibc version.
+
 ---
 
 ## Config schema

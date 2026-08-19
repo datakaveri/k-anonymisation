@@ -63,6 +63,7 @@ server_config.cfg
 # Generated docs and release artefacts
 docs/
 RELEASE_NOTES.md
+dist/
 
 # Error code scratch files
 error_codes.txt

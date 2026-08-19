@@ -1,0 +1,38 @@
+{
+  "operations": [
+    "suppress",
+    "hashing_with_salt"
+  ],
+  "data_type": "telangana_ration",
+  "telangana_ration": {
+    "insensitive_columns": [
+      "fsc_no",
+      "member_id",
+      "member_name",
+      "gender",
+      "mobile",
+      "fsc_type",
+      "caste",
+      "dob",
+      "age",
+      "hof",
+      "member_type",
+      "uid",
+      "address",
+      "district",
+      "mandal",
+      "fsc_shop_no"
+    ],
+    "suppress": [
+      "member_name",
+      "mobile",
+      "fsc_type",
+      "hof",
+      "uid",
+      "address"
+    ],
+    "hashing_with_salt": [
+      "fsc_no"
+    ]
+  }
+}
