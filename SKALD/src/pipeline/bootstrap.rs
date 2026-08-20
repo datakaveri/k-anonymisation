@@ -1,3 +1,4 @@
+use crate::pipeline::connectors::{parse_data_sink, parse_data_source, DataSink, DataSource};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -103,6 +104,12 @@ pub struct RuntimeConfig {
     /// before this run starts (key material and the active log are kept).
     /// Defaults to false — stale files are only reported, never removed.
     pub clean_output: bool,
+    /// Where this run reads its input from. Defaults to the filesystem, which
+    /// is what every config written before connectors existed resolves to.
+    pub input_source: DataSource,
+    /// Where this run pushes its anonymized output, *in addition* to the files
+    /// under `output/` — those are written either way.
+    pub output_sink: DataSink,
 }
 
 /// Controls which histogram-building algorithm SKALD uses.
@@ -260,6 +267,29 @@ pub fn suggested_fix_for(code: &str) -> &'static str {
         "IO_PERMISSION_DENIED" =>
             "Permission denied on a file or directory. \
              Run the pipeline with appropriate filesystem permissions.",
+        "CLI_INVALID_ARGUMENT" =>
+            "The command line could not be understood. \
+             Run `skald_pipeline --help` for the accepted flags.",
+        "DB_CONFIG_INVALID" =>
+            "Review the config's 'input' / 'output_sink' section: a postgres input needs \
+             a connection (dsn, or database plus host/user) and one of 'table' or 'query'; \
+             a postgres sink needs a 'table'.",
+        "ENV_VAR_MISSING" =>
+            "The config references an environment variable with ${VAR} that is not set. \
+             Export it before running, or write ${VAR:-default} to supply a fallback.",
+        "DB_CONNECT_FAILED" =>
+            "Could not reach the database. Check host, port, credentials and sslmode, \
+             and that this machine is allowed to connect (pg_hba.conf, firewall).",
+        "DB_READ_FAILED" =>
+            "The input query failed on the server. Verify the table or SELECT is valid \
+             and that the connecting user has SELECT on it.",
+        "DB_WRITE_FAILED" =>
+            "The anonymized rows could not be loaded. Verify the destination table's \
+             columns match the output, and that the user has INSERT (plus CREATE for \
+             mode 'create'/'replace') on the schema. Nothing was committed.",
+        "DB_NO_ROWS" =>
+            "The configured query returned no rows. Check the table name, any WHERE \
+             clause, and that the connecting user can see the rows.",
         "INTERNAL_ERROR" =>
             "An unexpected internal error occurred. \
              Check output/pipeline.log for a full trace and contact support.",
@@ -275,7 +305,10 @@ pub fn http_status_for(code: &str) -> u16 {
         | "CONFIG_PARSE_ERROR"
         | "CONFIG_MISSING_FIELD"
         | "CONFIG_INVALID"
-        | "CONFIG_INVALID_VALUE" => 400,
+        | "CONFIG_INVALID_VALUE"
+        | "CLI_INVALID_ARGUMENT"
+        | "DB_CONFIG_INVALID"
+        | "ENV_VAR_MISSING" => 400,
 
         "DATA_DIR_MISSING"
         | "DATA_MISSING"
@@ -291,9 +324,14 @@ pub fn http_status_for(code: &str) -> u16 {
         | "ANON_INFEASIBLE"
         | "ANON_NO_QIS"
         | "GENERALIZATION_FAILED"
-        | "ENCODING_FAILED" => 422,
+        | "ENCODING_FAILED"
+        | "DB_NO_ROWS" => 422,
 
         "IO_READ_FAILED" | "IO_WRITE_FAILED" | "IO_PERMISSION_DENIED" | "INTERNAL_ERROR" => 500,
+
+        // The database is a dependency this process talks to, not part of it —
+        // a caller retrying against a healthy server is the right response.
+        "DB_CONNECT_FAILED" | "DB_READ_FAILED" | "DB_WRITE_FAILED" => 502,
 
         _ => 500,
     }
@@ -374,7 +412,11 @@ pub fn ensure_output_dir(path: &Path) -> Result<(), PipelineError> {
     Ok(())
 }
 
-pub fn find_first_json_config(config_dir: &Path) -> Result<PathBuf, PipelineError> {
+/// Every `*.json` in `config_dir`, sorted by name.
+///
+/// A bundle can ship several configs — one per dataset — so which of them a
+/// bare run picks is worth being able to report, not just decide.
+pub fn list_json_configs(config_dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
     if !config_dir.is_dir() {
         return Err(validation(
             "CONFIG_NOT_FOUND",
@@ -388,7 +430,11 @@ pub fn find_first_json_config(config_dir: &Path) -> Result<PathBuf, PipelineErro
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
         .collect();
     files.sort();
-    files
+    Ok(files)
+}
+
+pub fn find_first_json_config(config_dir: &Path) -> Result<PathBuf, PipelineError> {
+    list_json_configs(config_dir)?
         .into_iter()
         .next()
         .ok_or_else(|| validation("CONFIG_NOT_FOUND", "No JSON config file found in config/", "config/ directory is empty"))
@@ -644,6 +690,16 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
     };
     let clean_output = section.get("clean_output").and_then(Value::as_bool).unwrap_or(false);
 
+    // A sink that names no connection of its own writes back to the database
+    // the input was read from — the common "anonymize this table into that one"
+    // case, which should not have to repeat the credentials.
+    let input_source = parse_data_source(section)?;
+    let inherited_connection = match &input_source {
+        DataSource::Postgres(read) => Some(read.connection.clone()),
+        DataSource::Files => None,
+    };
+    let output_sink = parse_data_sink(section, inherited_connection.as_ref())?;
+
     Ok(RuntimeConfig {
         enable_k_anonymity: has_k_anonymize && has_qis,
         pass,
@@ -674,6 +730,8 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         restore_sheets,
         free_text_anonymization,
         clean_output,
+        input_source,
+        output_sink,
     })
 }
 

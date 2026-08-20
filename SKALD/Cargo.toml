@@ -16,3 +16,16 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1 = "0.10"
 sha2 = "0.10"
+
+# ── PostgreSQL connector ─────────────────────────────────────────────────────
+# `postgres` is the synchronous client and is pure Rust — no libpq, so it links
+# into the static musl binary like everything else here. TLS is rustls rather
+# than native-tls for the same reason: OpenSSL would need dynamic linking and
+# would put a system library back into a bundle whose whole point is not having
+# one. `ring` is the crypto provider — it builds against musl with the same
+# toolchain the rest of the image already installs.
+postgres = "0.19"
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "1"

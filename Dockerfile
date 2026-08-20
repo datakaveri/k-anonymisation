@@ -11,6 +11,12 @@
 #   Mount config JSON  →  /app/config/
 #   Mount input CSV    →  /app/data/
 #   Read results from  →  /app/output/
+#
+# Flags pass through the entrypoint, so a container can be pointed at a
+# specific config or input without rebuilding:
+#   docker run … skald --config config/telangana.json --data data/export.csv
+# The SKALD_CONFIG / SKALD_DATA / SKALD_OUTPUT environment variables do the
+# same. A postgres input or output sink is configured in the config JSON.
 # =============================================================================
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
@@ -23,8 +29,10 @@ FROM rust:1.92-alpine AS builder
 LABEL org.opencontainers.image.source=https://github.com/datakaveri/k-anonymisation-SKALD
 
 # musl-dev provides headers; gcc on Alpine already targets musl natively —
-# no cross-compiler needed. Register the musl target with rustup.
-RUN apk add --no-cache musl-dev \
+# no cross-compiler needed. `ring` (the TLS crypto provider behind the
+# PostgreSQL connector) compiles C, so gcc is named explicitly rather than
+# relied on as a base-image detail. Register the musl target with rustup.
+RUN apk add --no-cache musl-dev gcc \
     && rustup target add x86_64-unknown-linux-musl
 
 # Static linking: embed musl crt so the binary has zero runtime deps
@@ -61,7 +69,8 @@ COPY --from=builder \
     /build/target/x86_64-unknown-linux-musl/release/skald_pipeline \
     /skald_pipeline
 
-# Pipeline resolves config/, data/, output/ relative to CWD
+# Pipeline resolves config/, data/, output/ relative to CWD unless flags or
+# SKALD_* environment variables say otherwise
 WORKDIR /app
 
 VOLUME ["/app/config", "/app/data", "/app/output"]

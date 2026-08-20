@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "Template: read rows from PostgreSQL, anonymize, load the result back.",
+    "Credentials are never written here — password_env names the variable that",
+    "holds the secret, and ${VAR} expansion works in any string field.",
+    "Run with:  SKALD_PG_PASSWORD=... skald_pipeline --config examples/postgres_config.json",
+    "The files under output/ are written as well as the database load, always."
+  ],
+
+  "data_type": "health",
+  "health": {
+    "pass": "pass2",
+    "output_path": "generalized_health.csv",
+    "output_directory": "output",
+    "suppression_limit": 0.05,
+
+    "input": {
+      "type": "postgres",
+      "host": "${SKALD_PG_HOST:-db.internal}",
+      "port": 5432,
+      "database": "health",
+      "user": "skald_reader",
+      "password_env": "SKALD_PG_PASSWORD",
+      "sslmode": "verify-full",
+      "table": "public.patients"
+    },
+
+    "output_sink": {
+      "type": "postgres",
+      "table": "anonymized.patients",
+      "mode": "replace"
+    },
+
+    "suppress": ["Name"],
+    "hashing_with_salt": ["AadhaarNumber"],
+    "encrypt": ["Email", "PhoneNumber"],
+
+    "quasi_identifiers": {
+      "categorical": [{ "column": "Gender" }],
+      "numerical": [
+        { "column": "Age", "encode": false, "type": "int" },
+        { "column": "PINCode", "encode": false, "type": "int" }
+      ]
+    },
+
+    "size": { "Age": 2, "PINCode": 10 },
+    "k_anonymize": { "k": 20 }
+  }
+}

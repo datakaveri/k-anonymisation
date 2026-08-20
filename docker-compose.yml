@@ -18,6 +18,14 @@ services:
     container_name: skald_pipeline
     # Pipeline is a one-shot batch process — no auto-restart
     restart: "no"
+    # With no arguments the first config in ./config is used and ./data is
+    # scanned for the single input file. Name a specific config instead when
+    # ./config holds several:
+    #   command: ["--config", "config/telangana_ration.json"]
+    # environment:
+    #   # Credentials for a postgres input/output_sink stay out of the config
+    #   # file — the config names the variable, the deployment supplies it.
+    #   SKALD_PG_PASSWORD: "${SKALD_PG_PASSWORD:-}"
     volumes:
       # Config JSON read by pipeline  (host → container, read-only)
       - ./config:/app/config:ro

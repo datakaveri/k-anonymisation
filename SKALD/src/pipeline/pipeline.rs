@@ -7,27 +7,80 @@ use crate::pipeline::anonymization::{
 };
 use crate::pipeline::bootstrap::{
     available_ram_bytes, clear_output_dir, clear_scratch_dir, ensure_output_dir,
-    find_first_json_config, parse_runtime_config, split_csv_file_by_ram, stale_output_files,
-    FlowMode, Logger, PipelineError, StatusPayload,
+    list_json_configs, parse_runtime_config, split_csv_file_by_ram, stale_output_files,
+    FlowMode, Logger, PipelineError, RuntimeConfig, StatusPayload,
 };
+use crate::pipeline::cli::Paths;
+use crate::pipeline::connectors::{postgres as pg, DataSink, DataSource};
 use crate::pipeline::multitabular::{
     resolve_pipeline_input, write_output_in_format, write_restored_workbook, InputFormat, SheetRestorePlan,
 };
 use crate::pipeline::preprocess::preprocess_chunks;
 use serde_json::json;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+/// Runs the pipeline over the conventional layout under `root` — `config/`,
+/// `data/`, `chunks/` and `output/`. Equivalent to running the binary from
+/// `root` with no flags.
 pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
-    let output_dir_path = root.join("output");
+    run_pipeline_with(&Paths::from_root(root))
+}
+
+pub fn run_pipeline_with(paths: &Paths) -> Result<StatusPayload, PipelineError> {
+    let output_dir_path = paths.output_dir.clone();
+    let log_file = paths.log_file().display().to_string();
     let mut log = Logger::new(&output_dir_path);
 
     log.info("startup", "SKALD pipeline starting");
 
-    log.info("config", "Searching for JSON config in config/");
-    let config_path = find_first_json_config(&root.join("config"))?;
+    let config_path = match &paths.config_file {
+        Some(path) => {
+            log.info("config", &format!("Using config named on the command line: {}", path.display()));
+            if !path.is_file() {
+                return Err(crate::pipeline::bootstrap::validation(
+                    "CONFIG_NOT_FOUND",
+                    "The config file named on the command line does not exist",
+                    &path.display().to_string(),
+                ));
+            }
+            path.clone()
+        }
+        None => {
+            log.info("config", &format!("Searching for a JSON config in {}", paths.config_dir.display()));
+            let candidates = list_json_configs(&paths.config_dir)?;
+            // A bundle ships one config per dataset, so "the first one" is a
+            // choice the run made rather than the only option there was.
+            if candidates.len() > 1 {
+                let names: Vec<String> = candidates
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .collect();
+                log.warn("config", &format!(
+                    "{} configs are present ({}) — using the first by name. \
+                     Pass --config to choose a different one.",
+                    names.len(),
+                    names.join(", "),
+                ));
+            }
+            candidates.into_iter().next().ok_or_else(|| {
+                crate::pipeline::bootstrap::validation(
+                    "CONFIG_NOT_FOUND",
+                    "No JSON config file found",
+                    &format!("{} holds no *.json file", paths.config_dir.display()),
+                )
+            })?
+        }
+    };
     log.info("config", &format!("Loaded config: {}", config_path.display()));
-    let cfg = parse_runtime_config(&config_path)?;
+    let mut cfg = parse_runtime_config(&config_path)?;
+
+    // Key material (token vault, symmetric and FPE keys) follows the run's
+    // output directory. Resolving it here — where both the command line and the
+    // config are known — keeps preprocessing from having to guess at it from
+    // the chunk paths.
+    cfg.output_directory = paths.key_material_dir(&cfg.output_directory).display().to_string();
+    log.info("config", &format!("Key material directory: {}", cfg.output_directory));
     let pass = cfg.pass.clone();
     log.info("config", &format!(
         "pass={}, k={}, suppression_limit={:.3}",
@@ -40,7 +93,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     // stale files are only reported unless the config opts into cleaning —
     // reported either way, since a leftover `generalized_<other>.csv` beside
     // this run's output is easy to mistake for part of this run's results.
-    let removed = clear_scratch_dir(&root.join("chunks"))?;
+    let removed = clear_scratch_dir(&paths.chunks_dir)?;
     if removed > 0 {
         log.info("cleanup", &format!("Removed {removed} stale file(s) from chunks/"));
     }
@@ -79,34 +132,13 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
     // data/ is mounted read-only in deployment, so JSON/Excel inputs are
     // normalised into chunks/ (read-write scratch) instead; a plain .csv
     // input is returned as-is, still pointing into data/.
-    let staged_input_path = if cfg.free_text_anonymization.enabled {
-        cfg.free_text_anonymization
-            .staged_input_path
-            .as_ref()
-            .map(|p| if p.is_absolute() { p.clone() } else { root.join(p) })
-    } else {
-        None
-    };
-    if cfg.free_text_anonymization.enabled {
-        log.info("input", &format!(
-            "free-text anonymization enabled for {} column(s)",
-            cfg.free_text_anonymization.columns.len()
-        ));
-        if let Some(path) = &staged_input_path {
-            log.info("input", &format!("Using staged input file from {}", path.display()));
-        } else {
-            log.warn(
-                "input",
-                "free_text_anonymization.enabled is set but staged_input_path is missing — falling back to raw data/",
-            );
-        }
-    }
+    let staged_input_path = stage_input(&mut log, &cfg, paths)?;
 
     log.info("input", "Resolving input data format (csv/json/xlsx)");
     let resolved = resolve_pipeline_input(
         staged_input_path.as_deref(),
-        &root.join("data"),
-        &root.join("chunks"),
+        &paths.data_dir,
+        &paths.chunks_dir,
         &cfg.sheet_joins,
     )?;
     if let Some(mismatch) = &resolved.format_mismatch {
@@ -118,7 +150,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
 
     // ── Chunking (all passes need the raw CSV split) ─────────────────────────
     log.info("chunking", "Splitting CSV into RAM-sized chunks");
-    let (chunk_paths, rows_per_chunk) = split_csv_file_by_ram(&input_csv, &root.join("chunks"))?;
+    let (chunk_paths, rows_per_chunk) = split_csv_file_by_ram(&input_csv, &paths.chunks_dir)?;
     log.info("chunking", &format!("{} chunk(s), ~{} rows/chunk", chunk_paths.len(), rows_per_chunk));
 
     // ── Preprocess-only path (no k-anonymity configured) ─────────────────────
@@ -141,6 +173,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
             maybe_write_restored_workbook(&mut log, &cfg, &restore_plan, &output_dir_path, &final_output_path);
         let format_matched_output_path =
             write_format_matched_output(&mut log, &cfg, input_format, &final_output_path, restored_workbook_path.as_deref())?;
+        let database_sink = push_to_sink(&mut log, &cfg, &final_output_path)?;
 
         return Ok(StatusPayload {
             status: "success".to_string(),
@@ -152,9 +185,10 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
                 "format_matched_output_path": format_matched_output_path,
                 "sample_generalized_rows": read_csv_sample(&final_output_path.display().to_string(), 10),
                 "restored_workbook_path": restored_workbook_path,
+                "database_sink": database_sink,
             })),
             error: None,
-            log_file: "output/pipeline.log".to_string(),
+            log_file: log_file.clone(),
         });
     }
 
@@ -414,7 +448,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
                 "initial_ri": initial_ri,
             })),
             error: None,
-            log_file: "output/pipeline.log".to_string(),
+            log_file: log_file.clone(),
         });
     }
 
@@ -500,6 +534,7 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
         maybe_write_restored_workbook(&mut log, &cfg, &restore_plan, &output_dir_path, Path::new(&final_output_path));
     let format_matched_output_path =
         write_format_matched_output(&mut log, &cfg, input_format, Path::new(&final_output_path), restored_workbook_path.as_deref())?;
+    let database_sink = push_to_sink(&mut log, &cfg, Path::new(&final_output_path))?;
 
     Ok(StatusPayload {
         status: "success".to_string(),
@@ -529,10 +564,104 @@ pub fn run_pipeline(root: &Path) -> Result<StatusPayload, PipelineError> {
             "parameter_grid": parameter_grid,
             "restored_workbook_path": restored_workbook_path,
             "format_matched_output_path": format_matched_output_path,
+            "database_sink": database_sink,
         })),
         error: None,
-        log_file: "output/pipeline.log".to_string(),
+        log_file: log_file.clone(),
     })
+}
+
+/// Works out which single file this run should read, staging it first when it
+/// has to be fetched.
+///
+/// Most specific wins, and every override is logged, because "which rows did
+/// this run actually anonymize?" is the first question asked of any output:
+///
+/// 1. the free-text anonymization handoff — already sanitized, so nothing may
+///    displace it;
+/// 2. a file named with `--data`, which is a deliberate per-run instruction;
+/// 3. a `postgres` input section, staged to `chunks/_pg_input.csv`;
+/// 4. otherwise `None`, and the data directory is scanned as it always was.
+fn stage_input(
+    log: &mut Logger,
+    cfg: &RuntimeConfig,
+    paths: &Paths,
+) -> Result<Option<PathBuf>, PipelineError> {
+    let free_text_staged = if cfg.free_text_anonymization.enabled {
+        log.info("input", &format!(
+            "free-text anonymization enabled for {} column(s)",
+            cfg.free_text_anonymization.columns.len()
+        ));
+        let staged = cfg
+            .free_text_anonymization
+            .staged_input_path
+            .as_ref()
+            .map(|p| if p.is_absolute() { p.clone() } else { paths.root.join(p) });
+        if staged.is_none() {
+            log.warn(
+                "input",
+                "free_text_anonymization.enabled is set but staged_input_path is missing — falling back to the data directory",
+            );
+        }
+        staged
+    } else {
+        None
+    };
+
+    if let Some(path) = free_text_staged {
+        log.info("input", &format!("Using staged input file from {}", path.display()));
+        if paths.data_file.is_some() || matches!(cfg.input_source, DataSource::Postgres(_)) {
+            log.warn(
+                "input",
+                "The free-text handoff file takes precedence — it is the sanitized copy, \
+                 so the raw input it was derived from is deliberately not re-read",
+            );
+        }
+        return Ok(Some(path));
+    }
+
+    if let Some(path) = &paths.data_file {
+        log.info("input", &format!("Using input file named on the command line: {}", path.display()));
+        if matches!(cfg.input_source, DataSource::Postgres(_)) {
+            log.warn(
+                "input",
+                "--data names a file, so the config's postgres input is not read this run",
+            );
+        }
+        return Ok(Some(path.clone()));
+    }
+
+    match &cfg.input_source {
+        DataSource::Files => Ok(None),
+        DataSource::Postgres(read) => {
+            let staged = paths.chunks_dir.join("_pg_input.csv");
+            pg::read_to_csv(read, &staged, log)?;
+            Ok(Some(staged))
+        }
+    }
+}
+
+/// Loads the anonymized CSV into the configured database sink, if there is one.
+/// The files under `output/` are written and reported either way — the sink is
+/// an additional destination, never a replacement for them.
+fn push_to_sink(
+    log: &mut Logger,
+    cfg: &RuntimeConfig,
+    final_output_path: &Path,
+) -> Result<serde_json::Value, PipelineError> {
+    match &cfg.output_sink {
+        DataSink::None => Ok(serde_json::Value::Null),
+        DataSink::Postgres(write) => {
+            let summary = pg::write_from_csv(write, final_output_path, log)?;
+            Ok(json!({
+                "type": "postgres",
+                "table": summary.table,
+                "mode": summary.mode.as_str(),
+                "rows_loaded": summary.rows,
+                "column_count": summary.columns.len(),
+            }))
+        }
+    }
 }
 
 /// Writes the anonymized result in whatever format the input arrived as —

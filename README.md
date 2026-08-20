@@ -61,32 +61,199 @@ cargo run --manifest-path SKALD/Cargo.toml --release --bin skald_pipeline
 cargo test --manifest-path SKALD/Cargo.toml --lib
 ```
 
+## Command line
+
+Every path the pipeline uses can be named at run time, so one binary serves any
+number of datasets:
+
+```
+skald_pipeline [OPTIONS]
+
+  -c, --config <PATH>   Config JSON file, or a directory to search   [SKALD_CONFIG]
+  -d, --data <PATH>     Input directory, or a single input file      [SKALD_DATA]
+  -o, --output <DIR>    Results, logs and key material               [SKALD_OUTPUT]
+      --chunks <DIR>    Scratch directory for chunked CSV            [SKALD_CHUNKS]
+  -r, --root <DIR>      Base directory the defaults hang off         [SKALD_ROOT]
+  -h, --help            Print help
+  -V, --version         Print version
+```
+
+Resolution order for each path is **flag → environment variable → default under
+`--root`**, and `--root` itself defaults to the working directory. With no flags
+and no variables the layout is `./config`, `./data`, `./chunks`, `./output` —
+exactly as it was before these flags existed, so nothing that worked before
+needs changing.
+
+```bash
+# Pick one of several bundled configs
+./skald_pipeline --config config/telangana_ration.json
+
+# A config and an input from anywhere on the filesystem
+./skald_pipeline --config /etc/skald/live.json --data /mnt/export/patients.csv
+
+# Keep each run's results apart
+./skald_pipeline --config /etc/skald/live.json --output /var/skald/runs/2026-08-20
+
+# The same, from the environment — suits cron and systemd units
+SKALD_CONFIG=/etc/skald/live.json SKALD_DATA=/mnt/export/patients.csv skald_pipeline
+```
+
+`--config` accepts a directory as well as a file; a directory is searched for
+its first `*.json`, which is what happens by default. `--data` likewise accepts
+either a directory to scan or a single file to read.
+
+Key material (`symmetric_keys.json`, `fpe_encrypt_keys.json`, `token_vault.json`)
+follows `--output`, so relocating a run's results keeps the keys that reverse it
+in the same place.
+
+---
+
 ## Build a standalone RHEL 7 bundle
 
-The repository includes a Docker-based packaging command that extracts the
-statically linked x86_64 binary and copies the fixed configuration into a
-portable directory:
+A Docker-based packaging command extracts the statically linked x86_64 binary
+and the configs into a portable directory:
 
 ```bash
 bash scripts/package_rhel7.sh
 ```
 
-The bundle is written to `dist/skald-rhel7/`. Give the recipient the bundle,
-place exactly one input file in `data/`, and run:
+The bundle is written to `dist/skald-rhel7/`, holding the binary, a `run.sh`
+wrapper, a `README.txt`, and `config/`, `data/` and `output/` directories. Give
+the recipient the bundle, place exactly one input file in `data/`, and run:
 
 ```bash
-./skald_pipeline
+./run.sh                                     # first config in config/
+./run.sh --config config/telangana.json      # choose among the bundled configs
+./run.sh --config /etc/skald/live.json       # a config from outside the bundle
 ```
 
-To package a different fixed configuration, pass the output directory and
-config path:
+Ship as many configs as the recipient needs — every argument after the output
+directory is copied into the bundle, and each may be a file or a directory of
+`*.json`:
 
 ```bash
 bash scripts/package_rhel7.sh dist/telangana-ration config/telangana_ration.json
+bash scripts/package_rhel7.sh dist/all-datasets config/
 ```
 
 The binary is statically linked against musl, so it does not depend on the
-recipient's RHEL 7 glibc version.
+recipient's RHEL 7 glibc version — and nothing else is installed on the host,
+including no PostgreSQL client: the connector below speaks the wire protocol
+directly and its TLS trust store is compiled in.
+
+See [`RHEL7_VM_TESTING.md`](RHEL7_VM_TESTING.md) for VM sizing and a
+test plan for the RHEL 7 host.
+
+---
+
+## PostgreSQL input and output
+
+A config can read its rows straight from PostgreSQL instead of from a file, and
+load the anonymized result back into a table. Both are optional and independent:
+a config with neither section behaves exactly as it always has, and the files
+under `output/` are written either way — the database sink is an additional
+destination, never a replacement.
+
+```jsonc
+{
+  "data_type": "health",
+  "health": {
+    "input": {
+      "type": "postgres",
+      "host": "db.internal",
+      "port": 5432,
+      "database": "health",
+      "user": "skald",
+      "password_env": "SKALD_PG_PASSWORD",   // names the variable, not the secret
+      "sslmode": "verify-full",
+      "table": "public.patients"             // or "query": "SELECT … WHERE …"
+    },
+    "output_sink": {
+      "type": "postgres",                    // connection omitted → reuse the input's
+      "table": "anonymized.patients",
+      "mode": "replace"
+    }
+    // … the usual suppress / hashing / quasi_identifiers / k_anonymize fields
+  }
+}
+```
+
+```bash
+SKALD_PG_PASSWORD=… ./skald_pipeline --config /etc/skald/live.json
+```
+
+### `input`
+
+| Field | Meaning |
+|---|---|
+| `type` | `"file"` (default) or `"postgres"` |
+| `dsn` | A libpq URI or key/value string. Discrete fields below override it |
+| `host`, `port`, `database`, `user` | Connection details; `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER` fill in anything unset |
+| `password` / `password_env` | The password, or the name of the variable holding it. `PGPASSWORD` is the last fallback |
+| `sslmode` | `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full` — libpq's meanings |
+| `sslrootcert` | PEM bundle to verify against. Absent → the Mozilla root program's CAs, compiled in |
+| `connect_timeout_seconds`, `application_name` | Passed to the driver |
+| `table` | Read this whole table — mutually exclusive with `query` |
+| `columns`, `limit` | Narrow a `table` read |
+| `query` | A `SELECT` to read instead of a table |
+
+`prefer` and `require` encrypt the connection but do **not** authenticate the
+server — the same trade libpq makes. Use `verify-full` where a man in the middle
+matters.
+
+### `output_sink`
+
+| Field | Meaning |
+|---|---|
+| `type` | `"none"` (default) or `"postgres"` |
+| `connection` / inline fields | Omit entirely to reuse the input's connection |
+| `table` | Destination, `table` or `schema.table` (required) |
+| `mode` | `create` (default), `append`, `truncate`, `replace` |
+| `create_schema` | `CREATE SCHEMA IF NOT EXISTS` first. Default `true` |
+| `empty_as_null` | Empty fields load as SQL `NULL`. Default `true` |
+
+| Mode | Before loading |
+|---|---|
+| `append` | Nothing — the table must already exist |
+| `create` | `CREATE TABLE IF NOT EXISTS` with every column `text` |
+| `truncate` | Create if absent, then `TRUNCATE` |
+| `replace` | `DROP TABLE IF EXISTS`, then create |
+
+`truncate` and `replace` destroy rows already in the destination; both are
+logged at WARN before anything happens. The DDL and the load share one
+transaction, so a failed load leaves the destination as it was rather than half
+populated.
+
+### How it works, and what it changes
+
+Both directions stream through `COPY … (FORMAT csv)`. The server does the CSV
+quoting and the text conversion of every type it knows; the client only moves
+bytes, so nothing larger than a buffer is ever held in memory. Reads are wrapped
+as:
+
+```sql
+COPY (SELECT replace(replace("col"::text, E'\r', ' '), E'\n', ' ') AS "col", …
+      FROM (<your query>) AS skald_source)
+TO STDOUT WITH (FORMAT csv, HEADER true)
+```
+
+Two consequences worth knowing:
+
+- **Every value arrives as text.** Generalized output is text anyway (`[22-30]`),
+  so `create`/`replace` build all-`text` tables.
+- **CR and LF inside values become spaces.** The chunker splits on line
+  boundaries, so a newline inside an address field would corrupt every row after
+  it. This is the one place the connector alters the data, and it is logged.
+
+Credentials never reach the log: connections are reported as
+`user@host:port/database sslmode=…` and nothing else.
+
+Staged input lands in `chunks/_pg_input.csv`, which — like everything in
+`chunks/` — is deleted at the start of the next run.
+
+**Precedence.** When more than one input is configured, the most specific wins,
+and every override is logged: the free-text anonymization handoff first, then a
+file named with `--data`, then a `postgres` input, then the data directory scan.
 
 ---
 
@@ -325,6 +492,9 @@ emptied at the start of every run with no opt-in needed.
 | 400 | `CONFIG_PARSE_ERROR` | Config JSON is malformed |
 | 400 | `CONFIG_MISSING_FIELD` | Required field absent |
 | 400 | `CONFIG_INVALID_VALUE` | Field value out of range |
+| 400 | `CLI_INVALID_ARGUMENT` | Unknown flag, missing flag value, or a stray path — run `--help` |
+| 400 | `DB_CONFIG_INVALID` | Malformed `input`/`output_sink`: no connection, no table/query, bad mode or sslmode |
+| 400 | `ENV_VAR_MISSING` | Config references `${VAR}` and it isn't set — export it or write `${VAR:-default}` |
 | 422 | `DATA_DIR_MISSING` | `data/` directory not found |
 | 422 | `DATA_NO_CSV` | No CSV, JSON, or Excel file in `data/` |
 | 422 | `DATA_AMBIGUOUS_INPUT` | More than one input file in `data/` |
@@ -336,10 +506,14 @@ emptied at the start of every run with no opt-in needed.
 | 422 | `PREPROCESS_CONFIG_INVALID` | Malformed preprocessing entry |
 | 422 | `ANON_INFEASIBLE` | k-anonymity unsatisfiable — raise `suppression_limit` or lower `k` |
 | 422 | `ANON_NO_QIS` | No quasi-identifiers defined |
+| 422 | `DB_NO_ROWS` | The configured query returned no rows — nothing to anonymize |
 | 500 | `IO_READ_FAILED` | File not found or unreadable |
 | 500 | `IO_WRITE_FAILED` | Disk full or output not writable |
 | 500 | `IO_PERMISSION_DENIED` | Permission denied |
 | 500 | `INTERNAL_ERROR` | Unexpected error — check `output/pipeline.log` |
+| 502 | `DB_CONNECT_FAILED` | Could not reach the database — host, credentials, sslmode, `pg_hba.conf`, firewall |
+| 502 | `DB_READ_FAILED` | The input query failed on the server |
+| 502 | `DB_WRITE_FAILED` | The load failed — nothing was committed |
 
 Full reference with suggested fixes: [`error_codes.txt`](error_codes.txt)
 
@@ -359,8 +533,12 @@ SKALD/
     bin/skald_pipeline.rs  Binary entry point
     pipeline/
       bootstrap.rs         Config parsing, Logger, error types, CSV utilities
+      cli.rs               Flags, SKALD_* variables, path resolution
       pipeline.rs          Orchestrator — phase-tagged logging with elapsed time
       multitabular.rs      CSV/JSON/Excel input resolution, multi-sheet joins
+      connectors/
+        mod.rs             input/output_sink config, ${VAR} expansion, identifier quoting
+        postgres.rs        COPY-based PostgreSQL reader and writer, rustls TLS
       anonymization/       OLA-1, OLA-2, Z-histogram, hierarchical generalization
       preprocess/          Suppress, hash, mask, encrypt, tokenize
       pyffx_compat.rs      Pure-Rust pyffx-compatible FPE (HMAC-SHA1 Feistel)
