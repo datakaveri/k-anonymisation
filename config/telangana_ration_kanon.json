@@ -1,4 +1,10 @@
 {
+  "operations": [
+    "suppress",
+    "hashing_with_salt",
+    "masking",
+    "k_anonymize"
+  ],
   "data_type": "telangana_ration",
   "telangana_ration": {
     "insensitive_columns": [
@@ -54,7 +60,11 @@
     "suppression_limit": 0.05,
     "compute_parameter_grid": false,
     "quasi_identifiers": {
-      "categorical": [],
+      "categorical": [
+        {
+          "column": "district"
+        }
+      ],
       "numerical": [
         {
           "column": "age",
@@ -66,15 +76,11 @@
     "size": {
       "age": 5
     },
-    "_k": "Every released age band must cover at least this many people. Age alone is weakly identifying in 100k records, so k has to be large before banding kicks in; with a second quasi-identifier such as district, a much smaller k bites.",
     "k_anonymize": {
-      "k": 2000
-    }
-  },
-  "operations": [
-    "suppress",
-    "hashing_with_salt",
-    "masking",
-    "k_anonymize"
-  ]
+      "k": 10
+    },
+    "_what_this_shows": "The same data with TWO quasi-identifiers instead of one. Age alone is weakly identifying across 100k records, so it needs a very large k before it generalizes at all. Add district and k=10 already does real work \u2014 which is the honest way to choose k: by what the quasi-identifier set can support.",
+    "_flow_mode": "DIRECT is required: OLA-1 only knows the categorical names blood group / gender / profession, so district fails under the ORIGINAL flow.",
+    "flow_mode": "direct"
+  }
 }

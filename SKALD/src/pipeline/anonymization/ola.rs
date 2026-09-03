@@ -225,10 +225,19 @@ fn max_categorical_level_ola1(col: &str) -> Result<i64, PipelineError> {
         "blood group" => Ok(3),
         "gender" => Ok(2),
         "profession" => Ok(4),
+        // OLA-1 has no generalization ladder for any other categorical column.
+        // The DIRECT flow does, so say so here — the generic "lower k / raise
+        // suppression_limit" hint attached to this code is actively wrong for
+        // this case and sends people down the wrong path.
         _ => Err(validation(
             "GENERALIZATION_FAILED",
             "Unsupported categorical column in OLA-1",
-            col,
+            &format!(
+                "'{col}' — OLA-1 has a generalization ladder only for \
+                 'blood group', 'gender' and 'profession'. Set \"flow_mode\": \"direct\" \
+                 in the config to use the DIRECT flow, which handles any categorical \
+                 column, or drop '{col}' from quasi_identifiers."
+            ),
         )),
     }
 }

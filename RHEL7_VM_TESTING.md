@@ -1,7 +1,8 @@
 # Testing the SKALD binary on a RHEL 7 VM
 
-**If you are a Claude Code session running on the RHEL 7 VM, read this first —
-it is the whole brief.**
+**If you are a Claude Code session working on this, read this first — it is the
+whole brief.** You are most likely running on the *developer machine* and
+driving the VM over SSH; see "Getting at the VM" below for why.
 
 ---
 
@@ -93,24 +94,86 @@ rather than deleted unless the config sets `"clean_output": true` — so several
 runs accumulate. 100 GB leaves room to iterate without housekeeping between
 runs.
 
-**Why 16 GB and not 8.** At ~200 bytes a row, 6 GB is roughly 30 million rows.
-The peak is the histogram, and which one is built depends on the data:
+**Why 32 GB, measured rather than guessed.** A 2.15 GB / 14.4-million-row input
+was run on this VM three ways:
 
-- the DIRECT flow holds ~16 bytes per record — ~500 MB here, comfortable;
-- the ORIGINAL flow holds one entry per *distinct* quasi-identifier
-  combination, at roughly 100–150 bytes each. A few million distinct
-  combinations is under a gigabyte; tens of millions is several.
+| Configuration | Wall clock | Peak RSS | Peak disk |
+|---|---|---|---|
+| Default (parameter grid on, AUTO → ORIGINAL) | 68.5 min | 9.66 GB | 11.1 GB |
+| `compute_parameter_grid: false` | 27.3 min | 9.66 GB | 10.5 GB |
+| …plus `flow_mode: "direct"` | 23.5 min | 9.66 GB | 10.4 GB |
 
-16 GB covers both, and also lets the chunker use its full 10-million-row
-chunks instead of splitting the work more finely. **Go to 32 GB** if the run
-logs a `Warning: Z-histogram needs ~NNNMB` line, or if the quasi-identifier
-columns are high-cardinality (a PIN code plus an exact age plus a district is
-already a large space).
+All three produced the same answer (479,228 equivalence classes), and all three
+peaked at the same memory to within 0.01%.
+
+**Memory tracks distinct quasi-identifier combinations, not rows or file size.**
+The base histogram held 13,354,633 buckets for 14,400,000 rows — a mean of 1.1
+rows per bucket, because `PINCode` was a quasi-identifier at its full 687,001
+values. That works out to ~760 bytes per bucket: a `HashMap<Vec<i64>, i64>` key
+allocation plus hashmap overhead and resize headroom.
+
+So a 5–6 GB input with quasi-identifiers this fine-grained wants **32 GB**. With
+coarser ones it may need far less — the honest way to find out is to run a
+sample of the real data and read the `buckets=` line from `pipeline.log`, then
+multiply by 760 bytes.
+
+**Two things that do *not* reduce memory**, despite looking as though they
+should:
+
+- `compute_parameter_grid: false` saves 41 of the 68 minutes and nothing at all
+  in RAM. Set it anyway — it is the single biggest time saving available — but
+  do not size the machine around it.
+- `flow_mode: "direct"` saves a further 4 minutes and also nothing in RAM. The
+  Z-histogram is compact (~16 bytes per entry), but `pipeline.rs` converts it
+  into the `SparseHist` unconditionally to feed the parameter grid, k-optimal
+  and the equivalence-class stats, so the large representation gets built
+  either way. Worth revisiting in the pipeline itself; not something to plan
+  around today.
+
+The lever that *does* work is coarsening the quasi-identifiers — a larger
+`size` value for a numerical QI, or removing a high-cardinality column from the
+QI set entirely.
 
 **Why only 4 vCPU.** The pipeline is single-threaded — the eighth core would
 sit idle. Spend the budget on disk throughput instead: the run reads and writes
 tens of gigabytes sequentially, so a slow disk, not the CPU, is what will make
 it take all afternoon.
+
+### Azure specifically: do not test on `/mnt`
+
+A default Azure RHEL 7 image partitions far smaller than this workload needs.
+The VM this was first tested on came up as:
+
+```
+/dev/mapper/rootvg-rootlv  2.0G   /
+/dev/mapper/rootvg-homelv  1014M  /home
+/dev/sdb1                   32G   /mnt
+```
+
+Two problems. `/` and `/home` are far too small to hold even one copy of a 6 GB
+input, and `/mnt` — the only roomy filesystem — is the Azure **temporary disk**:
+its contents are lost when the VM is deallocated, resized, or moved to another
+host. It is fine for scratch and for a throwaway test, and wrong for results
+and key material, which cannot be regenerated.
+
+**Attach a managed data disk** (100 GB, Premium SSD) and mount it, rather than
+working in `/mnt`:
+
+```bash
+sudo mkfs.xfs /dev/sdc
+sudo mkdir -p /data && sudo mount /dev/sdc /data
+echo "/dev/sdc /data xfs defaults,nofail 0 2" | sudo tee -a /etc/fstab
+sudo chown "$USER" /data
+```
+
+Then keep the bundle, the input and the output under `/data`. Pointing
+`--chunks` at `/mnt` and `--output` at `/data` is a reasonable split — scratch
+on the ephemeral disk, results on the durable one:
+
+```bash
+./run.sh --config /data/cfg/live.json --data /data/in/patients.csv \
+         --output /data/runs/$(date +%F) --chunks /mnt/skald-scratch
+```
 
 ### Other VM settings
 
@@ -137,6 +200,73 @@ it take all afternoon.
 
 ---
 
+## Getting at the VM
+
+**Modern editor tooling does not run on RHEL 7, and does not need to.**
+
+VS Code Server has required glibc ≥ 2.28 since VS Code 1.86 (January 2024).
+RHEL 7 ships glibc 2.17, so Remote-SSH refuses to connect:
+
+```
+The remote host does not meet the prerequisites for running VS Code Server
+… find GLIBC >= v2.28.0 (but found v2.17.0 instead)
+```
+
+The same wall stands in front of Node.js: official Linux builds from Node 18
+onward are linked against glibc 2.28, so Claude Code cannot be installed on the
+VM from the normal packages either.
+
+**Do not fight this.** Nothing is supposed to be installed on that host — that
+is the entire premise of shipping a static binary. Keep the editor and Claude
+Code on the developer machine and treat the VM as a machine you send commands
+to:
+
+```bash
+# From the developer machine
+scp skald-rhel7.tar.gz rhel7-vm:/tmp/
+ssh rhel7-vm 'cd /opt/skald && ./run.sh --config config/pg.json'
+ssh rhel7-vm 'cat /opt/skald/output/status.json'
+scp rhel7-vm:/opt/skald/output/pipeline.log ./
+```
+
+A Claude Code session on the developer machine can run those `ssh` and `scp`
+commands directly, which is the smoothest way to work through the test plan
+below: the repo, the git history and the editor stay where the tooling works,
+and only the binary and its inputs cross to the VM.
+
+Set up an SSH alias so every command is one word shorter and no password is
+retyped:
+
+```
+# ~/.ssh/config on the developer machine
+Host rhel7-vm
+    HostName 10.0.0.42
+    User skald
+    IdentityFile ~/.ssh/id_ed25519
+    ServerAliveInterval 30
+```
+
+### If you really need an editor on the VM
+
+Two options, both worse than the above:
+
+- **Pin VS Code to 1.85.2** — the last release whose server runs on glibc 2.17.
+  The *client* must be 1.85.2 too (the server version is chosen by the client's
+  commit), the Remote-SSH extension must be pinned to a compatible version, and
+  auto-update must be off (`"update.mode": "none"`,
+  `"extensions.autoUpdate": false`). You are then frozen on a 2024 editor with
+  no security updates — acceptable for a short test, not as a working setup.
+- **Install Node from the unofficial glibc-217 builds** at
+  `unofficial-builds.nodejs.org` (`linux-x64-glibc-217` variants exist for
+  Node 20 and 22) and run Claude Code on the VM itself. These are community
+  builds, not the official release artifacts — reasonable for a throwaway test
+  VM, not something to standardise on.
+
+Neither changes what is being tested. The pipeline binary does not care what
+editor is attached to the host.
+
+---
+
 ## Setup
 
 ### If you cloned the repo onto the VM
@@ -154,7 +284,8 @@ binary, and building one here is the fallback, not the plan:
   which is the opposite of what the bundle is for.
 
 So: build the bundle on the developer machine as below, and use the clone on
-the VM only for configs and reference. If you genuinely cannot move a file onto
+the VM only for configs and reference — or skip the clone entirely and drive
+the VM over SSH, as in "Getting at the VM" above. If you genuinely cannot move a file onto
 the VM, building here with `rustup` will work and is worth saying out loud in
 the test report, because it means a different binary was tested than the one
 that ships.
@@ -321,13 +452,35 @@ Verified on the developer machine:
   the connection-failure path are unit-tested; a refused connection reports
   `DB_CONNECT_FAILED`.
 
-**Not yet verified anywhere — this is what the VM is for:**
+Verified on a real RHEL 7.9 host (kernel 3.10.0-1160, glibc 2.17, 4 vCPU,
+15 GB RAM) against PostgreSQL 13.14 from Red Hat Software Collections:
 
-- Anything against a **live PostgreSQL server**. No server was reachable from
-  the development environment, so every successful read and write path is
-  untested: `COPY` streaming, type-to-text conversion, the DDL modes, and TLS
-  against a real certificate.
-- The **Docker/Alpine build of the bundle**. The musl binary was cross-built
-  locally with the host C compiler for `ring`; on Alpine the native gcc targets
-  musl, which is the supported path, but that exact build has not been run.
-- **RHEL 7 itself.** Nothing in this branch has executed on a RHEL 7 kernel.
+- The static binary runs with no shared libraries. (`file` calls it a "shared
+  object" — that is `file` misreading a static-PIE image; `ldd` says
+  `statically linked`.)
+- The fixed layout, `--config`/`--data`/`--output`/`--chunks`, and the `SKALD_*`
+  variables all work; key material follows `--output`.
+- 50,003 rows read over TLS and 50,003 written back. Every column type came
+  through faithfully — `date`, `numeric`, `boolean`, `timestamptz`, `jsonb`,
+  `bigint` — NULLs stayed NULL, embedded commas and quotes survived, and an
+  embedded newline was replaced with spaces as documented. The source table was
+  untouched.
+- Sink modes `append`/`create`/`truncate`/`replace` behave as specified;
+  `append` to a missing table fails with `DB_CONFIG_INVALID` and creates
+  nothing.
+- TLS: `disable`, `require`, `verify-ca` and `verify-full` all connect against a
+  CA-signed certificate (via both a DNS and an IP SAN), and against a
+  self-signed certificate supplied as `sslrootcert`. The wrong CA, no CA, and a
+  different pinned certificate are all correctly refused.
+- Passwords appear nowhere in `pipeline.log` or `status.json`.
+
+**Still not verified:**
+
+- The **Docker/Alpine build of the bundle**. Everything above ran a musl binary
+  cross-built on the developer machine with the host C compiler for `ring`; on
+  Alpine the native gcc targets musl, which is the supported path, but that
+  exact build has not been run. Build it once with
+  `scripts/package_rhel7.sh` and repeat tests 1 and 2 against the result.
+- A run at **5–6 GB scale**. The largest measured here was 2.15 GB / 14.4M rows
+  (see the sizing table above), which completed successfully in every
+  configuration.

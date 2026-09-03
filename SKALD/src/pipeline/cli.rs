@@ -51,16 +51,26 @@ impl Paths {
     /// keys). Normally the config's `output_directory`, resolved against `root`
     /// — but an explicit `--output` wins, so relocating the run's outputs takes
     /// the keys with it instead of stranding them under the old root.
+    ///
+    /// Always absolute. Preprocessing falls back to re-deriving this directory
+    /// from the chunk paths when it is given a relative one, which lands the
+    /// keys somewhere else entirely as soon as `--chunks` is not a sibling of
+    /// the output directory — `--output out --chunks scratch/x` wrote them to
+    /// `scratch/out`. Handing over an absolute path removes the guesswork.
     pub fn key_material_dir(&self, config_output_directory: &str) -> PathBuf {
-        if self.output_dir_explicit {
-            return self.output_dir.clone();
-        }
-        let configured = Path::new(config_output_directory);
-        if configured.is_absolute() {
-            configured.to_path_buf()
+        let chosen = if self.output_dir_explicit {
+            self.output_dir.clone()
         } else {
-            self.root.join(configured)
-        }
+            let configured = Path::new(config_output_directory);
+            if configured.is_absolute() {
+                configured.to_path_buf()
+            } else {
+                self.root.join(configured)
+            }
+        };
+        // Purely lexical — no filesystem access, so this works for a directory
+        // that does not exist yet.
+        std::path::absolute(&chosen).unwrap_or(chosen)
     }
 
     /// Path of `pipeline.log`, as reported in `status.json`.
@@ -390,6 +400,23 @@ mod tests {
         // …even when the config names some other relative directory, because
         // splitting the keys from the results they decrypt helps nobody.
         assert_eq!(relocated.key_material_dir("keys"), PathBuf::from("/var/skald/out"));
+    }
+
+    #[test]
+    fn key_material_dir_is_always_absolute() {
+        // Preprocessing re-derives a relative key directory from the chunk
+        // paths, which put the keys in `<chunks parent>/<relative path>` —
+        // `--output selftest/result --chunks selftest/scratch` wrote them to
+        // `selftest/selftest/result`. An absolute path is never re-derived.
+        for args in [
+            vec!["--output", "relative/out"],
+            vec!["--root", "relative/root"],
+            vec![],
+        ] {
+            let paths = run(parse_args_with_env(argv(&args), no_env).expect("parse"));
+            let dir = paths.key_material_dir("output");
+            assert!(dir.is_absolute(), "{args:?} produced a relative key directory: {}", dir.display());
+        }
     }
 
     #[test]

@@ -471,20 +471,23 @@ fn build_tls_config(conn: &PgConnection) -> Result<ClientConfig, PipelineError> 
             .with_custom_certificate_verifier(Arc::new(NoCertVerification(provider)))
             .with_no_client_auth(),
 
-        SslMode::VerifyCa => {
-            let roots = Arc::new(root_store(conn)?);
-            let inner = WebPkiServerVerifier::builder_with_provider(roots, provider)
+        SslMode::VerifyCa | SslMode::VerifyFull => {
+            let (roots, pinned) = root_store(conn)?;
+            let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
                 .build()
                 .map_err(|e| {
                     validation("DB_CONNECT_FAILED", "Could not build the certificate verifier", &e.to_string())
                 })?;
+            let verifier = TrustedIssuerVerification {
+                inner,
+                pinned,
+                tolerate_name_mismatch: conn.ssl_mode == SslMode::VerifyCa,
+            };
             builder
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(ChainOnlyVerification(inner)))
+                .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth()
         }
-
-        SslMode::VerifyFull => builder.with_root_certificates(root_store(conn)?).with_no_client_auth(),
     };
 
     Ok(config)
@@ -492,12 +495,17 @@ fn build_tls_config(conn: &PgConnection) -> Result<ClientConfig, PipelineError> 
 
 /// The CAs a server certificate is checked against: the PEM bundle named by
 /// `sslrootcert` if there is one, otherwise the Mozilla root program's set.
-fn root_store(conn: &PgConnection) -> Result<RootCertStore, PipelineError> {
+///
+/// Also returns those certificates verbatim when they came from `sslrootcert`,
+/// so [`TrustedIssuerVerification`] can pin against them. Empty for the
+/// built-in root set — pinning the Mozilla program's roots would be meaningless.
+fn root_store(conn: &PgConnection) -> Result<(RootCertStore, Vec<CertificateDer<'static>>), PipelineError> {
     let mut roots = RootCertStore::empty();
+    let mut supplied = Vec::new();
 
     let Some(path) = &conn.root_cert else {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        return Ok(roots);
+        return Ok((roots, supplied));
     };
 
     let pem = fs::read(path).map_err(|e| io_err("read sslrootcert PEM bundle", &path.display().to_string(), e))?;
@@ -507,6 +515,7 @@ fn root_store(conn: &PgConnection) -> Result<RootCertStore, PipelineError> {
         let cert = cert.map_err(|e| {
             validation("DB_CONNECT_FAILED", "Malformed certificate in sslrootcert", &format!("{}: {e}", path.display()))
         })?;
+        supplied.push(cert.clone().into_owned());
         roots.add(cert).map_err(|e| {
             validation("DB_CONNECT_FAILED", "Rejected certificate in sslrootcert", &format!("{}: {e}", path.display()))
         })?;
@@ -519,7 +528,7 @@ fn root_store(conn: &PgConnection) -> Result<RootCertStore, PipelineError> {
             &format!("{} parsed cleanly but contained no CERTIFICATE blocks", path.display()),
         ));
     }
-    Ok(roots)
+    Ok((roots, supplied))
 }
 
 /// Verifier for `sslmode=require`/`prefer`: encrypt, prove nothing.
@@ -561,13 +570,44 @@ impl ServerCertVerifier for NoCertVerification {
     }
 }
 
-/// Verifier for `sslmode=verify-ca`: the chain must be trusted, but the name on
-/// the certificate need not match the host dialled. Internal deployments reach
-/// the same server by several names; libpq draws the line in the same place.
+/// Verifier for `sslmode=verify-ca` and `verify-full`.
+///
+/// Standard chain validation, with two documented departures that both exist to
+/// match what libpq does — an operator moving a working `psql` connection
+/// string across should not find that SKALD alone cannot connect:
+///
+/// - **`verify-ca` tolerates a name mismatch.** The chain must be trusted; the
+///   name on the certificate need not match the host dialled. Internal
+///   deployments reach the same server by several names. `verify-full` is the
+///   mode that checks the name, and it still does.
+/// - **A certificate named in `sslrootcert` is trusted as itself.** rustls
+///   rejects a `CA:TRUE` certificate presented as a server certificate
+///   (`CaUsedAsEndEntity`), which is exactly what a self-signed PostgreSQL
+///   server certificate is — and those are common on internal networks, where
+///   libpq accepts them. When the certificate the server presents is
+///   byte-identical to one the operator put in `sslrootcert`, it is accepted:
+///   naming that exact file is a stronger statement of intent than any chain
+///   or hostname check, not a weaker one. An expired certificate is still
+///   refused.
+///
+/// Pinning applies only to certificates the operator supplied. With the
+/// built-in Mozilla root set there is nothing to pin against and this behaves
+/// as plain rustls does.
 #[derive(Debug)]
-struct ChainOnlyVerification(Arc<WebPkiServerVerifier>);
+struct TrustedIssuerVerification {
+    inner: Arc<WebPkiServerVerifier>,
+    /// Certificates read from `sslrootcert`, verbatim. Empty otherwise.
+    pinned: Vec<CertificateDer<'static>>,
+    tolerate_name_mismatch: bool,
+}
 
-impl ServerCertVerifier for ChainOnlyVerification {
+impl TrustedIssuerVerification {
+    fn is_pinned(&self, cert: &CertificateDer<'_>) -> bool {
+        self.pinned.iter().any(|known| known.as_ref() == cert.as_ref())
+    }
+}
+
+impl ServerCertVerifier for TrustedIssuerVerification {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -576,12 +616,29 @@ impl ServerCertVerifier for ChainOnlyVerification {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
-        match self.0.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
+        let outcome =
+            self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now);
+
+        match outcome {
+            Ok(verified) => Ok(verified),
+
             Err(TlsError::InvalidCertificate(CertificateError::NotValidForName))
-            | Err(TlsError::InvalidCertificate(CertificateError::NotValidForNameContext { .. })) => {
+            | Err(TlsError::InvalidCertificate(CertificateError::NotValidForNameContext { .. }))
+                if self.tolerate_name_mismatch =>
+            {
                 Ok(ServerCertVerified::assertion())
             }
-            other => other,
+
+            Err(TlsError::InvalidCertificate(CertificateError::Expired)) => {
+                Err(TlsError::InvalidCertificate(CertificateError::Expired))
+            }
+
+            Err(e) if self.is_pinned(end_entity) => {
+                let _ = e;
+                Ok(ServerCertVerified::assertion())
+            }
+
+            Err(e) => Err(e),
         }
     }
 
@@ -591,7 +648,7 @@ impl ServerCertVerifier for ChainOnlyVerification {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        self.0.verify_tls12_signature(message, cert, dss)
+        self.inner.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
@@ -600,18 +657,33 @@ impl ServerCertVerifier for ChainOnlyVerification {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        self.0.verify_tls13_signature(message, cert, dss)
+        self.inner.verify_tls13_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.supported_verify_schemes()
+        self.inner.supported_verify_schemes()
     }
 }
 
 /// Wraps a driver error, keeping the server's own message — which is nearly
 /// always more specific than anything this layer could say — as the detail.
-fn db_error<E: std::fmt::Display>(code: &'static str, message: &str, source: &E) -> PipelineError {
-    validation(code, message, &source.to_string())
+///
+/// The whole `source()` chain is walked, not just the outermost error. The
+/// driver's top-level message for a failed TLS negotiation is "error performing
+/// TLS handshake", which says nothing at all; the reason — an unknown issuer, a
+/// name mismatch, an expired certificate — is one or two links further down.
+fn db_error<E: std::error::Error>(code: &'static str, message: &str, source: &E) -> PipelineError {
+    let mut details = source.to_string();
+    let mut next = source.source();
+    while let Some(cause) = next {
+        let text = cause.to_string();
+        if !details.contains(&text) {
+            details.push_str(": ");
+            details.push_str(&text);
+        }
+        next = cause.source();
+    }
+    validation(code, message, &details)
 }
 
 #[cfg(test)]

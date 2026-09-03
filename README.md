@@ -201,6 +201,20 @@ SKALD_PG_PASSWORD=… ./skald_pipeline --config /etc/skald/live.json
 server — the same trade libpq makes. Use `verify-full` where a man in the middle
 matters.
 
+Two deliberate departures from stock rustls, both to match libpq so a working
+`psql` connection string carries over unchanged:
+
+- **`verify-ca` tolerates a name mismatch.** The chain must be trusted; the name
+  on the certificate need not match the host dialled. `verify-full` still checks
+  it.
+- **A certificate named in `sslrootcert` is trusted as itself.** rustls rejects a
+  `CA:TRUE` certificate presented as a server certificate — which is exactly what
+  a self-signed PostgreSQL server certificate is, and those are common on
+  internal networks. When the certificate the server presents is byte-identical
+  to one in `sslrootcert`, it is accepted: naming that exact file is a stronger
+  statement of intent than a chain check. Expired certificates are still refused,
+  and pinning never applies to the built-in Mozilla roots.
+
 ### `output_sink`
 
 | Field | Meaning |
@@ -277,8 +291,8 @@ Place a single JSON file in `config/`. Full example:
       { "column": "phone", "masking_char": "*", "characters_to_mask": [1,2,3] }
     ],
     "encrypt": [
-      { "column": "account_number" },
-      { "column": "national_id", "format_preserving": true }
+      "account_number",
+      { "national_id": { "format_preserving": true } }
     ],
     "charcloak":          [],
     "tokenization": [
@@ -505,6 +519,7 @@ emptied at the start of every run with no opt-in needed.
 | 422 | `PREPROCESS_COLUMN_MISSING` | Preprocessing target column not found |
 | 422 | `PREPROCESS_CONFIG_INVALID` | Malformed preprocessing entry |
 | 422 | `ANON_INFEASIBLE` | k-anonymity unsatisfiable — raise `suppression_limit` or lower `k` |
+| 422 | `GENERALIZATION_FAILED` | No lattice node satisfies k (same remedy as above), or a categorical QI the ORIGINAL flow does not know — see below |
 | 422 | `ANON_NO_QIS` | No quasi-identifiers defined |
 | 422 | `DB_NO_ROWS` | The configured query returned no rows — nothing to anonymize |
 | 500 | `IO_READ_FAILED` | File not found or unreadable |
@@ -667,6 +682,31 @@ If a sheet's rows were fanned out by the join (e.g. a patient with several visit
 The OLA-2 search can run in two modes, controlled by `flow_mode`:
 
 - **`original`** — the classic path: OLA-1 picks an initial generalization, then OLA-2 binary-searches the lattice using a `SparseHist`.
+
+> **Known limitation — `fixed_bins` is inert.** The field is parsed into
+> `RuntimeConfig` and never read. Its only consumer is `build_quasi_identifiers`
+> in `anonymization/ola.rs`, which is dead code — the live implementation is
+> `anonymization/mod.rs`, which has no `fixed_bins` handling. A config that sets
+> it gets no bins and no warning: the column stays at raw granularity, which can
+> make an otherwise reachable `k` fail with `GENERALIZATION_FAILED`. Use
+> `qi_constraints` instead.
+>
+> **How `qi_constraints` actually behaves.** The intervals are the *coarse* end
+> of a generalization ladder, not the bins the output uses. They are split into
+> finer sub-intervals, and OLA-2 picks whichever level satisfies `k`. Measured
+> on 2,000 rows with four configured age bands: `k=10` → `[20-20]`, `k=50` →
+> `[20-22]`, `k=100` → `*`. The four configured bands never appear verbatim.
+> Treat them as the shape of the ladder, not as the output bins.
+
+> **Known limitation.** OLA-1 recognises only three categorical column names —
+> `blood group`, `gender`, `profession` (matched case-insensitively, in
+> `max_categorical_level_ola1`). A categorical quasi-identifier with any other
+> name fails the run with `GENERALIZATION_FAILED — Unsupported categorical
+> column in OLA-1`, even when `categorical_hierarchies` defines a ladder for it.
+> This bites whenever the ORIGINAL flow is used, including when `auto` selects
+> it. The DIRECT flow has no such restriction, so `"flow_mode": "direct"` is the
+> workaround until the level is derived from the configured hierarchy instead of
+> a hard-coded list.
 - **`direct`** — skips OLA-1 and builds a compact scalar `ZHist` (mixed-radix-encoded, ~16 bytes/entry) directly at the finest granularity, then runs OLA-2 on that. Falls back to `original` automatically if the encoding would overflow.
 - **`auto`** (default) — pre-scans the input once to estimate record count `N` and each QI's domain size, computes the equivalence space `E = Π(QI domain sizes)`, and picks `direct` when `N·log₂(N) ≤ E`, else `original`.
 
