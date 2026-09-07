@@ -253,7 +253,7 @@ pub(super) fn pseudo_encrypt(value: &str, key: &str, column: &str) -> String {
 ///
 /// # Arguments
 /// * `value` — the string whose alphanumeric characters are to be randomized.
-pub(super) fn randomize_preserving_class(value: &str) -> String {
+pub(crate) fn randomize_preserving_class(value: &str) -> String {
     use std::io::Read;
     let char_count = value.chars().count();
     let byte_count = char_count * 4;

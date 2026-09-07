@@ -19,8 +19,8 @@
 //! The `crypto` submodule contains the cryptographic primitives and the
 //! `masking` submodule contains configuration parsing and masking logic.
 
-mod crypto;
-mod masking;
+pub(crate) mod crypto;
+pub(crate) mod masking;
 
 use crate::pipeline::bootstrap::{csv_row_to_line, split_csv_line_basic, validation, PipelineError, RuntimeConfig};
 use serde_json::Value;

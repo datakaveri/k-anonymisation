@@ -22,6 +22,11 @@ coverage.txt
 target/
 SKALD/target/
 
+# Real NHA claim bundles — one file is one patient, so these are live PII and
+# must never be committed. Keep local samples here; the anonymized output goes
+# to output/nha/, which is already ignored.
+data/nha/
+
 # Runtime generated folders/files
 chunks/
 output/

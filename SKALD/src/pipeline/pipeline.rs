@@ -15,6 +15,7 @@ use crate::pipeline::connectors::{postgres as pg, DataSink, DataSource};
 use crate::pipeline::multitabular::{
     resolve_pipeline_input, write_output_in_format, write_restored_workbook, InputFormat, SheetRestorePlan,
 };
+use crate::pipeline::nested_json;
 use crate::pipeline::preprocess::preprocess_chunks;
 use serde_json::json;
 use std::fs;
@@ -81,6 +82,16 @@ pub fn run_pipeline_with(paths: &Paths) -> Result<StatusPayload, PipelineError> 
     // the chunk paths.
     cfg.output_directory = paths.key_material_dir(&cfg.output_directory).display().to_string();
     log.info("config", &format!("Key material directory: {}", cfg.output_directory));
+    // ── Nested-JSON de-identification ───────────────────────────────────────
+    // A separate terminal flow, not a stage of the tabular one. These inputs
+    // are one document per patient, so there is no cohort to hide a record in
+    // and k-anonymity does not apply — see `nested_json`'s module docs. It
+    // returns here rather than falling through to chunking, which would only
+    // flatten a single subject into a single row and search a lattice over it.
+    if cfg.nested_json.enabled {
+        return run_nested_json(&mut log, &cfg, paths, &log_file);
+    }
+
     let pass = cfg.pass.clone();
     log.info("config", &format!(
         "pass={}, k={}, suppression_limit={:.3}",
@@ -639,6 +650,91 @@ fn stage_input(
             Ok(Some(staged))
         }
     }
+}
+
+/// Runs the nested-JSON de-identification flow and builds its status payload.
+///
+/// Reports the census alongside the documents deliberately: with a key space
+/// this open-ended, "which paths did this run let through?" is not a detail of
+/// the run, it is the run's main safety claim, and the answer has to be
+/// somewhere the operator will look.
+fn run_nested_json(
+    log: &mut Logger,
+    cfg: &RuntimeConfig,
+    paths: &Paths,
+    log_file: &str,
+) -> Result<StatusPayload, PipelineError> {
+    log.info(
+        "nested-json",
+        &format!(
+            "Nested-JSON de-identification: {} rule(s), default_action={:?} — \
+             one document per patient, so the k-anonymity flow is not run",
+            cfg.nested_json.rules.len(),
+            cfg.nested_json.default_action,
+        ),
+    );
+
+    let mut nested = cfg.nested_json.clone();
+    nested.key_material_dir = PathBuf::from(&cfg.output_directory);
+    let report = nested_json::run(&nested, &paths.root)?;
+
+    for (name, why) in &report.files_skipped {
+        log.warn("nested-json", &format!("skipped {name}: {why}"));
+    }
+    if report.salt_created {
+        log.info(
+            "nested-json",
+            &format!(
+                "Generated a new hash salt at {} — back it up with the run's other key material; \
+                 later runs reuse it so their pseudonyms match this run's",
+                report.salt_path.display(),
+            ),
+        );
+    }
+    if report.dry_run {
+        log.info(
+            "nested-json",
+            &format!(
+                "DRY RUN — {} document(s) examined, none written. {} path(s) seen, {} would be kept. Review {}",
+                report.documents_examined,
+                report.paths_seen,
+                report.paths_kept,
+                report.census_path.display(),
+            ),
+        );
+    } else {
+        log.info(
+            "nested-json",
+            &format!(
+                "{} document(s) written to {}; {} path(s) seen, {} kept — review {}",
+                report.files_written,
+                report.output_dir.display(),
+                report.paths_seen,
+                report.paths_kept,
+                report.census_path.display(),
+            ),
+        );
+    }
+
+    Ok(StatusPayload {
+        status: "ok".to_string(),
+        phase: Some("done".to_string()),
+        outputs: Some(json!({
+            "mode": if report.dry_run { "nested_json_dry_run" } else { "nested_json_deidentification" },
+            "dry_run": report.dry_run,
+            "documents_examined": report.documents_examined,
+            "documents_written": report.files_written,
+            "documents_skipped": report.files_skipped.len(),
+            "output_directory": report.output_dir.display().to_string(),
+            "key_census": report.census_path.display().to_string(),
+            "paths_seen": report.paths_seen,
+            "paths_kept": report.paths_kept,
+            "k_anonymity_applied": false,
+            "hash_salt_created": report.salt_created,
+        })),
+        error: None,
+        log_file: log_file.to_string(),
+    })
 }
 
 /// Loads the anonymized CSV into the configured database sink, if there is one.

@@ -100,6 +100,9 @@ pub struct RuntimeConfig {
     pub restore_sheets: bool,
     /// Optional free-text anonymization handoff.
     pub free_text_anonymization: FreeTextAnonymizationConfig,
+    /// Nested-JSON de-identification. When enabled this replaces the tabular
+    /// flow outright rather than feeding it — see `nested_json`'s module docs.
+    pub nested_json: crate::pipeline::nested_json::NestedJsonConfig,
     /// When true, delete leftover files from a previous run out of `output/`
     /// before this run starts (key material and the active log are kept).
     /// Defaults to false — stale files are only reported, never removed.
@@ -688,6 +691,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
 
         FreeTextAnonymizationConfig { enabled, columns, staged_input_path }
     };
+    let nested_json = crate::pipeline::nested_json::parse_nested_json(section)?;
     let clean_output = section.get("clean_output").and_then(Value::as_bool).unwrap_or(false);
 
     // A sink that names no connection of its own writes back to the database
@@ -729,6 +733,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         sheet_joins,
         restore_sheets,
         free_text_anonymization,
+        nested_json,
         clean_output,
         input_source,
         output_sink,
