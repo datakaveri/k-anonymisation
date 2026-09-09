@@ -79,3 +79,5 @@ fhir_anonymizer/
 *.coverage
 
 run_supp0/
+data/nha/
+dist/

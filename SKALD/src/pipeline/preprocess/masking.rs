@@ -100,6 +100,22 @@ pub(super) fn parse_encrypt_config(entry: &Value) -> Result<EncryptConfigLite, P
 
 // ── Regex masking config ──────────────────────────────────────────────────────
 
+/// How many characters a delimiter-anchored pattern masks.
+///
+/// Parsed from the optional `length` key of a `regex_patterns` entry:
+/// - `"length": "all"` → [`MaskLength::All`] — mask every character on the
+///   chosen side of the delimiter.
+/// - `"length": 4` → [`MaskLength::Count`] — mask exactly that many characters
+///   adjacent to the delimiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MaskLength {
+    /// Mask the whole side of the delimiter (everything before it, or
+    /// everything after it, up to the first occurrence of the delimiter).
+    All,
+    /// Mask exactly this many characters next to each delimiter occurrence.
+    Count(usize),
+}
+
 /// Describes how a regex pattern is specified — either as a literal regex string
 /// or as a semantic descriptor that is converted to a regex at apply time.
 #[derive(Debug, Clone)]
@@ -123,9 +139,10 @@ pub(super) struct RegexPatternConfig {
     pub(super) kind: RegexPatternKind,
     /// Character used to replace matched text (may override the column default).
     pub(super) masking_char: char,
-    /// Optional character count for delimiter-length masking
-    /// (`type=before`/`after` + `length` key).
-    pub(super) length: Option<usize>,
+    /// Optional length for delimiter-anchored masking
+    /// (`type=before`/`after` + `length` key): a fixed character count, or
+    /// [`MaskLength::All`] for the whole side of the delimiter.
+    pub(super) length: Option<MaskLength>,
     /// Optional group-level masking: pairs of `(capture_group_index, "full"|"partial")`.
     pub(super) mask_groups: Vec<(usize, String)>,
     /// Semantic type (`"before"`, `"after"`, `"in_between"`) — stored regardless
@@ -227,7 +244,28 @@ pub(super) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, P
                 .map(|s| s.chars().next().unwrap_or(masking_char))
                 .unwrap_or(masking_char);
 
-            let length = pobj.get("length").and_then(Value::as_i64).map(|n| n.max(0) as usize);
+            let length = match pobj.get("length") {
+                None | Some(Value::Null) => None,
+                Some(v) if v.is_i64() || v.is_u64() => {
+                    let n = v.as_i64().unwrap_or(0);
+                    if n <= 0 {
+                        return Err(validation(
+                            "PREPROCESS_CONFIG_INVALID",
+                            "regex pattern 'length' must be > 0 or the string \"all\"",
+                            &column,
+                        ));
+                    }
+                    Some(MaskLength::Count(n as usize))
+                }
+                Some(Value::String(s)) if s.trim().eq_ignore_ascii_case("all") => Some(MaskLength::All),
+                Some(_) => {
+                    return Err(validation(
+                        "PREPROCESS_CONFIG_INVALID",
+                        "regex pattern 'length' must be a positive integer or the string \"all\"",
+                        &column,
+                    ));
+                }
+            };
 
             // mask_groups: {"1": "full", "2": "partial"}
             let mut mask_groups: Vec<(usize, String)> = Vec::new();
@@ -333,20 +371,23 @@ pub(super) fn derive_regex(pattern_type: &str, delimiter: Option<&str>, start: O
 /// Applies length-limited masking before or after a delimiter — mirrors Python
 /// `_apply_delimiter_length_mask`.
 ///
-/// Finds every occurrence of `delimiter` in `text` and masks `length` characters
-/// immediately before (`"before"`) or after (`"after"`) it.
+/// With [`MaskLength::Count`], every occurrence of `delimiter` is found and
+/// `n` characters immediately before (`"before"`) or after (`"after"`) it are
+/// masked. With [`MaskLength::All`], only the first occurrence is used and the
+/// whole side of it is masked — everything from the start of the value up to
+/// the delimiter (`"before"`), or from the delimiter to the end (`"after"`).
 ///
 /// # Arguments
 /// * `text` — the original string value.
 /// * `pattern_type` — `"before"` or `"after"`.
 /// * `delimiter` — the substring that acts as the masking anchor.
-/// * `length` — number of characters to mask on either side of the delimiter.
+/// * `length` — how much to mask on the chosen side of the delimiter.
 /// * `mask_char` — the replacement character.
 ///
 /// # Returns
 /// `(masked_text, changed)` where `changed` is `true` if any masking occurred.
-pub(super) fn apply_delimiter_length_mask(text: &str, pattern_type: &str, delimiter: &str, length: usize, mask_char: char) -> (String, bool) {
-    if delimiter.is_empty() || length == 0 {
+pub(super) fn apply_delimiter_length_mask(text: &str, pattern_type: &str, delimiter: &str, length: MaskLength, mask_char: char) -> (String, bool) {
+    if delimiter.is_empty() || length == MaskLength::Count(0) {
         return (text.to_string(), false);
     }
     let mut chars: Vec<char> = text.chars().collect();
@@ -365,17 +406,27 @@ pub(super) fn apply_delimiter_length_mask(text: &str, pattern_type: &str, delimi
 
         let (start_ci, end_ci) = if pattern_type == "after" {
             let s = char_before + delim_char_len;
-            (s, (s + length).min(chars.len()))
+            match length {
+                MaskLength::All => (s, chars.len()),
+                MaskLength::Count(n) => (s, (s + n).min(chars.len())),
+            }
         } else {
             // before
             let e = char_before;
-            (e.saturating_sub(length), e)
+            match length {
+                MaskLength::All => (0, e),
+                MaskLength::Count(n) => (e.saturating_sub(n), e),
+            }
         };
 
         for i in start_ci..end_ci {
             chars[i] = mask_char;
             changed = true;
         }
+
+        // "all" is anchored to the first occurrence only — masking around every
+        // occurrence would swallow the delimiters' surrounding text twice over.
+        if length == MaskLength::All { break; }
 
         search_start = abs_byte + delimiter.len();
         if search_start >= text_str.len() { break; }
@@ -388,9 +439,11 @@ pub(super) fn apply_delimiter_length_mask(text: &str, pattern_type: &str, delimi
 ///
 /// Processing order:
 /// 1. **Delimiter-length masking** — if `length` is set and the pattern is a
-///    derived `before`/`after` type with a delimiter, call
+///    `before`/`after` type with a delimiter, call
 ///    [`apply_delimiter_length_mask`] and return immediately if it produced a
-///    change.
+///    change. `length: "all"` masks the whole side of the delimiter; on an
+///    `in_between` pattern it is a no-op, since the derived regex already
+///    masks everything between the two anchors.
 /// 2. **Build regex** — from the literal or derived kind.
 /// 3. **Compile** — falls back to returning the original value on compile error.
 /// 4. **Apply** — group masking via [`apply_regex_group_mask`], or full-match
@@ -565,4 +618,80 @@ pub(super) fn apply_masking_value(
     }
 
     masked
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn pattern(entry: serde_json::Value) -> RegexPatternConfig {
+        let cfg = parse_masking_config(&json!({
+            "column": "c",
+            "masking_char": "*",
+            "regex_patterns": [entry],
+        }))
+        .expect("config parses");
+        cfg.regex_patterns.into_iter().next().expect("one pattern")
+    }
+
+    #[test]
+    fn length_all_masks_everything_before_the_delimiter() {
+        let p = pattern(json!({"type": "before", "delimiter": "@", "length": "all"}));
+        assert_eq!(p.length, Some(MaskLength::All));
+        assert_eq!(apply_regex_pattern("john.doe@example.com", &p, "c"), "********@example.com");
+    }
+
+    #[test]
+    fn length_all_masks_everything_after_the_delimiter() {
+        let p = pattern(json!({"type": "after", "delimiter": "@", "length": "all"}));
+        assert_eq!(apply_regex_pattern("john.doe@example.com", &p, "c"), "john.doe@***********");
+    }
+
+    #[test]
+    fn length_all_is_anchored_to_the_first_delimiter_occurrence() {
+        let p = pattern(json!({"type": "after", "delimiter": "-", "length": "all"}));
+        assert_eq!(apply_regex_pattern("AB-CD-EF", &p, "c"), "AB-*****");
+
+        let p = pattern(json!({"type": "before", "delimiter": "-", "length": "all"}));
+        assert_eq!(apply_regex_pattern("AB-CD-EF", &p, "c"), "**-CD-EF");
+    }
+
+    #[test]
+    fn length_all_accepts_mixed_case_and_surrounding_space() {
+        let p = pattern(json!({"type": "before", "delimiter": "@", "length": " ALL "}));
+        assert_eq!(p.length, Some(MaskLength::All));
+    }
+
+    #[test]
+    fn numeric_length_still_masks_a_fixed_count_at_every_occurrence() {
+        let p = pattern(json!({"type": "after", "delimiter": "-", "length": 1}));
+        assert_eq!(p.length, Some(MaskLength::Count(1)));
+        assert_eq!(apply_regex_pattern("AB-CD-EF", &p, "c"), "AB-*D-*F");
+    }
+
+    #[test]
+    fn length_all_leaves_the_value_alone_when_the_delimiter_is_absent() {
+        let p = pattern(json!({"type": "before", "delimiter": "@", "length": "all"}));
+        assert_eq!(apply_regex_pattern("no-delimiter-here", &p, "c"), "no-delimiter-here");
+    }
+
+    #[test]
+    fn length_all_on_in_between_falls_through_to_the_derived_regex() {
+        let p = pattern(json!({"type": "in_between", "start": "(", "end": ")", "length": "all"}));
+        assert_eq!(apply_regex_pattern("call (022) 1234", &p, "c"), "call (***) 1234");
+    }
+
+    #[test]
+    fn a_bad_length_is_a_config_error() {
+        for bad in [json!("half"), json!(0), json!(-3), json!(true)] {
+            let err = parse_masking_config(&json!({
+                "column": "c",
+                "regex_patterns": [{"type": "before", "delimiter": "@", "length": bad}],
+            }));
+            assert!(err.is_err(), "expected 'length' rejection");
+        }
+    }
 }

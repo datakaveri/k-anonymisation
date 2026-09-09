@@ -290,6 +290,8 @@ def mask_columns(dataframe: pd.DataFrame, masking_info: List[Dict]) -> pd.DataFr
             Apply partial masking around a delimiter when `length` is provided.
             - type=after: masks exactly `length` chars after delimiter
             - type=before: masks exactly `length` chars before delimiter
+            - length="all": masks the whole side of the first delimiter
+              occurrence (everything after it, or everything before it)
             """
             pattern_type = str(pattern_config.get("type", "")).strip().lower()
             delimiter = pattern_config.get("delimiter")
@@ -300,13 +302,19 @@ def mask_columns(dataframe: pd.DataFrame, masking_info: List[Dict]) -> pd.DataFr
             if delimiter is None or length is None:
                 return text_value, False
 
-            try:
-                n = int(length)
-            except Exception:
-                raise ValueError("'length' in regex pattern must be an integer")
+            mask_all = isinstance(length, str) and length.strip().lower() == "all"
+            if mask_all:
+                n = 0
+            else:
+                try:
+                    n = int(length)
+                except Exception:
+                    raise ValueError(
+                        "'length' in regex pattern must be an integer or the string \"all\""
+                    )
 
-            if n <= 0:
-                raise ValueError("'length' in regex pattern must be > 0")
+                if n <= 0:
+                    raise ValueError("'length' in regex pattern must be > 0")
 
             delim = str(delimiter)
             if not delim:
@@ -322,14 +330,18 @@ def mask_columns(dataframe: pd.DataFrame, masking_info: List[Dict]) -> pd.DataFr
 
                 if pattern_type == "after":
                     start_idx = idx + len(delim)
-                    end_idx = min(len(chars), start_idx + n)
+                    end_idx = len(chars) if mask_all else min(len(chars), start_idx + n)
                 else:
                     end_idx = idx
-                    start_idx = max(0, end_idx - n)
+                    start_idx = 0 if mask_all else max(0, end_idx - n)
 
                 for i in range(start_idx, end_idx):
                     chars[i] = pattern_masking_char
                     changed = True
+
+                # "all" is anchored to the first occurrence only.
+                if mask_all:
+                    break
 
                 search_start = idx + len(delim)
 
