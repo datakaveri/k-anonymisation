@@ -15,6 +15,11 @@ Implements the OLA-1 / OLA-2 lattice algorithms for optimal generalization with 
 
 Reverse-operation scripts (`scripts/reverse_*.py`) can recover original values from anonymized output for authorized holders of the generated key/vault files.
 
+The same pipeline is also available as three independently pullable, independently
+attestable blocks — `preprocess`, `crypto` and `kanon` — for orchestrators that
+column-shard a dataset and hand each shard only to the container that needs it.
+The monolithic binary documented below is unchanged. See **[BLOCKS.md](BLOCKS.md)**.
+
 ---
 
 ## Quick start — Docker (recommended)
@@ -329,15 +334,25 @@ SKALD/
   preprocess.py            Reference Python implementation of preprocessing transforms
                            (parity spec for the Rust port; backs scripts/reverse_*.py)
   src/
-    bin/skald_pipeline.rs  Binary entry point
+    bin/skald_pipeline.rs  Monolith entry point (unchanged)
+    bin/skald_ao.rs        Orchestrator toolkit: plan, keygen, stamp, project, split, stitch
+    bin/skald_preprocess.rs  Block 1 worker — suppress, mask, charcloak, tokenize
+    bin/skald_crypto.rs    Block 2 worker — hashing, encryption, FPE
+    bin/skald_kanon.rs     Block 3 worker — scan / solve / apply
     pipeline/
       bootstrap.rs         Config parsing, Logger, error types, CSV utilities
       pipeline.rs          Orchestrator — phase-tagged logging with elapsed time
       multitabular.rs      CSV/JSON/Excel input resolution, multi-sheet joins
       anonymization/       OLA-1, OLA-2, Z-histogram, hierarchical generalization
       preprocess/          Suppress, hash, mask, encrypt, tokenize
+      blocks/              Block runtime — manifest, planner, sharding, block bodies
       pyffx_compat.rs      Pure-Rust pyffx-compatible FPE (HMAC-SHA1 Feistel)
       entry.rs             Error mapping → structured status.json
+docker/
+  Dockerfile.block         Per-block scratch image (BLOCK_BIN selects the binary)
+  Dockerfile.ao            Orchestrator toolkit image (skald_ao + skald_preprocess)
+  build-blocks.sh          Builds all four images
+BLOCKS.md                  Block split, manifest contract, AO integration
 scripts/
   reverse_encryption.py    Reverses AES-GCM `encrypt` using symmetric_keys.json
   reverse_fpe.py           Reverses format-preserving encryption using fpe_keys.json

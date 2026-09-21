@@ -1,0 +1,51 @@
+# =============================================================================
+# SKALD orchestrator-side toolkit.
+#
+# This is the one image that runs inside the AO's TEE, and it bundles two
+# binaries because they share that trust boundary:
+#
+#   /skald_ao         plan, keygen, stamp, project, split, stitch
+#   /skald_preprocess the preprocessing block
+#
+# Preprocessing lives here rather than in a dispatched worker because its token
+# vault is reversible plaintext mapping — the one recoverable artifact the
+# system produces. Shipping it to a worker would put it outside the boundary
+# the user attested before sending their data.
+#
+#   docker build -f docker/Dockerfile.ao -t ghcr.io/datakaveri/skald-ao:v1 .
+#   docker run --rm -v "$PWD/job:/job" ghcr.io/datakaveri/skald-ao:v1 \
+#       plan --config /job/config/job.json --data /job/data/input.csv
+# =============================================================================
+
+FROM rust:1.92-alpine AS builder
+LABEL org.opencontainers.image.source=https://github.com/datakaveri/k-anonymisation-SKALD
+
+RUN apk add --no-cache musl-dev \
+    && rustup target add x86_64-unknown-linux-musl
+
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+WORKDIR /build
+
+COPY SKALD/Cargo.toml SKALD/Cargo.lock ./
+RUN mkdir -p src/pipeline src/bin \
+    && echo 'pub mod pipeline { pub mod entry {} }' > src/lib.rs \
+    && echo 'fn main() {}' > src/bin/skald_ao.rs \
+    && echo 'fn main() {}' > src/bin/skald_preprocess.rs \
+    && cargo build --release --target x86_64-unknown-linux-musl \
+                   --bin skald_ao --bin skald_preprocess 2>/dev/null || true \
+    && rm -rf src
+
+COPY SKALD/src ./src
+RUN touch src/lib.rs \
+    && cargo build --release --target x86_64-unknown-linux-musl \
+                   --bin skald_ao --bin skald_preprocess
+
+FROM scratch AS runtime
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/skald_ao /skald_ao
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/skald_preprocess /skald_preprocess
+
+WORKDIR /job
+VOLUME ["/job"]
+
+ENTRYPOINT ["/skald_ao"]

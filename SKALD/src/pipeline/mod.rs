@@ -1,4 +1,5 @@
 pub mod anonymization;
+pub mod blocks;
 pub mod bootstrap;
 pub mod entry;
 pub mod multitabular;

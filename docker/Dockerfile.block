@@ -1,0 +1,62 @@
+# =============================================================================
+# SKALD block image — one binary per image, selected by BLOCK_BIN.
+#
+# Each block gets its own image on purpose. A single image with three
+# entrypoints would give the three blocks one measurement, so the coordinator
+# could not attest "this container can only hash" separately from "this
+# container can only generalize". Separate binaries mean separate digests mean
+# separate measurements, which is the property the attestation step in the AO
+# flow actually depends on.
+#
+# Build one image per block:
+#   docker build -f docker/Dockerfile.block --build-arg BLOCK_BIN=skald_crypto \
+#                -t ghcr.io/datakaveri/skald-crypto:v1 .
+#
+# I/O contract (identical for every block):
+#   Mount the job directory → /job     (manifest, config, shards, artifacts)
+#   Run                     → /skald_block --manifest /job/manifest.json
+#   Read the result from    → <artifacts_dir>/<shard_id>.status.json
+# Exit code is 0 on success, 1 on a reported error, 2 on a usage error.
+# =============================================================================
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+# Pinned to keep the image byte-reproducible, which is what makes the
+# measurement stable across rebuilds. Same toolchain floor as the monolith.
+FROM rust:1.92-alpine AS builder
+LABEL org.opencontainers.image.source=https://github.com/datakaveri/k-anonymisation-SKALD
+
+ARG BLOCK_BIN
+RUN test -n "$BLOCK_BIN" || (echo "BLOCK_BIN build-arg is required" >&2; exit 1)
+
+RUN apk add --no-cache musl-dev \
+    && rustup target add x86_64-unknown-linux-musl
+
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+WORKDIR /build
+
+# Dependency layer, cached independently of our source.
+COPY SKALD/Cargo.toml SKALD/Cargo.lock ./
+RUN mkdir -p src/pipeline src/bin \
+    && echo 'pub mod pipeline { pub mod entry {} }' > src/lib.rs \
+    && echo 'fn main() {}' > "src/bin/${BLOCK_BIN}.rs" \
+    && cargo build --release --target x86_64-unknown-linux-musl \
+                   --bin "${BLOCK_BIN}" 2>/dev/null || true \
+    && rm -rf src
+
+COPY SKALD/src ./src
+RUN touch src/lib.rs \
+    && cargo build --release --target x86_64-unknown-linux-musl --bin "${BLOCK_BIN}" \
+    && cp "target/x86_64-unknown-linux-musl/release/${BLOCK_BIN}" /block
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+# 'scratch' — no shell, no package manager, no OS. A worker that holds one
+# column shard and one key should be able to do nothing else.
+FROM scratch AS runtime
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /block /skald_block
+
+WORKDIR /job
+VOLUME ["/job"]
+
+ENTRYPOINT ["/skald_block"]
+CMD ["--manifest", "/job/manifest.json"]

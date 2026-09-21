@@ -14,7 +14,7 @@
 //! a flat `pipeline::anonymization::*` import surface.
 
 mod ola;
-mod generalization;
+pub(crate) mod generalization;
 
 pub use ola::{
     build_interval_hierarchy,

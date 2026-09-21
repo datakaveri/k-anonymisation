@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 ///
 /// # Returns
 /// A string of the form `"[bucket_start-bucket_end]"`.
-fn generalize_numeric_label(value: i64, min_val: i64, step: i64) -> String {
+pub(crate) fn generalize_numeric_label(value: i64, min_val: i64, step: i64) -> String {
     let bucket_start = min_val + ((value - min_val) / step.max(1)) * step.max(1);
     let bucket_end = bucket_start + step.max(1) - 1;
     format!("[{}-{}]", bucket_start, bucket_end)
@@ -47,7 +47,7 @@ fn generalize_numeric_label(value: i64, min_val: i64, step: i64) -> String {
 /// `level - 2` of the levels list, defaulting to `"*"` if the index is out of
 /// range. Columns absent from the hierarchy are returned unchanged at level 1
 /// and suppressed to `"*"` at higher levels.
-fn generalize_categorical_value(hierarchies: &HierarchyMap, column_name: &str, value: &str, level: i64) -> String {
+pub(crate) fn generalize_categorical_value(hierarchies: &HierarchyMap, column_name: &str, value: &str, level: i64) -> String {
     if level <= 1 {
         return value.to_string();
     }

@@ -30,7 +30,7 @@ use std::path::Path;
 ///
 /// # Returns
 /// A 32-character lowercase hexadecimal string.
-pub(super) fn generate_random_key_hex() -> String {
+pub(crate) fn generate_random_key_hex() -> String {
     use std::io::Read;
     let mut buf = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -45,7 +45,7 @@ pub(super) fn generate_random_key_hex() -> String {
 ///
 /// # Returns
 /// A 64-character lowercase hexadecimal string.
-pub(super) fn generate_random_salt_hex() -> String {
+pub(crate) fn generate_random_salt_hex() -> String {
     use std::io::Read;
     let mut buf = [0u8; 32];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -61,7 +61,7 @@ pub(super) fn generate_random_salt_hex() -> String {
 ///
 /// # Arguments
 /// * `input` — the plaintext string to hash.
-pub(super) fn hash_hex(input: &str) -> String {
+pub(crate) fn hash_hex(input: &str) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(input.as_bytes());
@@ -73,7 +73,7 @@ pub(super) fn hash_hex(input: &str) -> String {
 /// Returns `true` when `v` should be left unchanged (empty or `"nan"`).
 ///
 /// Used before every transformation step to preserve missing-value markers.
-pub(super) fn should_skip_value(v: &str) -> bool {
+pub(crate) fn should_skip_value(v: &str) -> bool {
     let t = v.trim();
     t.is_empty() || t.eq_ignore_ascii_case("nan")
 }
@@ -118,7 +118,7 @@ pub(super) fn read_json_map_string(path: &Path) -> Result<BTreeMap<String, Strin
 ///
 /// # Errors
 /// Returns [`PipelineError`] if directory creation, file write, or rename fails.
-pub(super) fn write_json_pretty(path: &Path, v: &Value) -> Result<(), PipelineError> {
+pub(crate) fn write_json_pretty(path: &Path, v: &Value) -> Result<(), PipelineError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -171,7 +171,7 @@ pub(super) fn derive_key(master_key: &str, context: &str) -> [u8; 16] {
 /// * `value` — the plaintext string.
 /// * `master_key` — the column-level master key.
 /// * `column` — the column name (used in key derivation context).
-pub(super) fn format_preserving_encrypt_general(value: &str, master_key: &str, column: &str) -> String {
+pub(crate) fn format_preserving_encrypt_general(value: &str, master_key: &str, column: &str) -> String {
     let text = value.to_string();
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0usize;
@@ -224,7 +224,7 @@ pub(super) fn format_preserving_encrypt_general(value: &str, master_key: &str, c
 /// * `value` — the plaintext string.
 /// * `key` — the column-level key.
 /// * `column` — the column name (used in HMAC context `"<column>:<block_idx>"`).
-pub(super) fn pseudo_encrypt(value: &str, key: &str, column: &str) -> String {
+pub(crate) fn pseudo_encrypt(value: &str, key: &str, column: &str) -> String {
     // Build a keystream via successive HMAC-SHA256 blocks so the pattern never repeats,
     // regardless of value length. Each 16-byte block i uses context "<column>:<i>".
     let plaintext = value.as_bytes();
@@ -253,7 +253,7 @@ pub(super) fn pseudo_encrypt(value: &str, key: &str, column: &str) -> String {
 ///
 /// # Arguments
 /// * `value` — the string whose alphanumeric characters are to be randomized.
-pub(super) fn randomize_preserving_class(value: &str) -> String {
+pub(crate) fn randomize_preserving_class(value: &str) -> String {
     use std::io::Read;
     let char_count = value.chars().count();
     let byte_count = char_count * 4;

@@ -1,5 +1,5 @@
 use crate::pipeline::bootstrap::{split_csv_line_basic, validation, PipelineError, RuntimeConfig};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -1314,7 +1314,7 @@ pub fn find_ola2_best_rf_detailed(
 }
 
 /// One cell in the (k × suppression_limit) parameter grid.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GridEntry {
     pub k: i64,
     pub suppression_limit: f64,

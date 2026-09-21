@@ -21,13 +21,13 @@ use serde_json::Value;
 /// Tokenization replaces original values with opaque sequential tokens of the
 /// form `<prefix><zero-padded-id>`, preserving a reversible vault mapping.
 #[derive(Debug)]
-pub(super) struct TokenizationConfigLite {
+pub(crate) struct TokenizationConfigLite {
     /// Target CSV column name.
-    pub(super) column: String,
+    pub(crate) column: String,
     /// Token prefix string (default: `"TK-"`).
-    pub(super) prefix: String,
+    pub(crate) prefix: String,
     /// Number of zero-padded digits in the token suffix (default: `6`).
-    pub(super) digits: usize,
+    pub(crate) digits: usize,
 }
 
 /// Parses a single tokenization config entry from the pipeline JSON.
@@ -38,7 +38,7 @@ pub(super) struct TokenizationConfigLite {
 /// # Errors
 /// Returns [`PipelineError`] with code `PREPROCESS_CONFIG_INVALID` if the
 /// entry is not an object, `"column"` is missing, or `"digits"` is ≤ 0.
-pub(super) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationConfigLite, PipelineError> {
+pub(crate) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationConfigLite, PipelineError> {
     let obj = entry
         .as_object()
         .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "Each tokenization entry must be an object", "tokenization"))?;
@@ -62,12 +62,12 @@ pub(super) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationCon
 /// Supports both pseudo-encryption (XOR keystream, `format_preserving: false`)
 /// and format-preserving general encryption (`format_preserving: true`).
 #[derive(Debug)]
-pub(super) struct EncryptConfigLite {
+pub(crate) struct EncryptConfigLite {
     /// Target CSV column name.
-    pub(super) column: String,
+    pub(crate) column: String,
     /// `true` → use [`format_preserving_encrypt_general`]; `false` → use
     /// [`pseudo_encrypt`] (XOR keystream, hex output with `"ENC$"` prefix).
-    pub(super) format_preserving: bool,
+    pub(crate) format_preserving: bool,
 }
 
 /// Parses a single encrypt config entry from the pipeline JSON.
@@ -79,7 +79,7 @@ pub(super) struct EncryptConfigLite {
 /// # Errors
 /// Returns [`PipelineError`] with code `PREPROCESS_CONFIG_INVALID` for
 /// malformed entries.
-pub(super) fn parse_encrypt_config(entry: &Value) -> Result<EncryptConfigLite, PipelineError> {
+pub(crate) fn parse_encrypt_config(entry: &Value) -> Result<EncryptConfigLite, PipelineError> {
     if let Some(col) = entry.as_str() {
         return Ok(EncryptConfigLite { column: col.to_string(), format_preserving: false });
     }
@@ -134,11 +134,11 @@ pub(super) enum RegexPatternKind {
 
 /// Per-pattern masking configuration within a column's `regex_patterns` list.
 #[derive(Debug, Clone)]
-pub(super) struct RegexPatternConfig {
+pub(crate) struct RegexPatternConfig {
     /// How the pattern is specified.
     pub(super) kind: RegexPatternKind,
     /// Character used to replace matched text (may override the column default).
-    pub(super) masking_char: char,
+    pub(crate) masking_char: char,
     /// Optional length for delimiter-anchored masking
     /// (`type=before`/`after` + `length` key): a fixed character count, or
     /// [`MaskLength::All`] for the whole side of the delimiter.
@@ -167,23 +167,23 @@ pub(super) struct RegexPatternConfig {
 /// 3. **class** — replace each character with a fixed or random character of
 ///    the same class.
 #[derive(Debug)]
-pub(super) struct MaskingConfigLite {
+pub(crate) struct MaskingConfigLite {
     /// Target CSV column name.
-    pub(super) column: String,
+    pub(crate) column: String,
     /// Default masking character for this column (e.g. `'*'`).
-    pub(super) masking_char: char,
+    pub(crate) masking_char: char,
     /// 1-based character positions to mask (applied in the `"characters"` step).
-    pub(super) characters_to_mask: Vec<usize>,
+    pub(crate) characters_to_mask: Vec<usize>,
     /// Regex patterns applied in the `"regex"` step.
-    pub(super) regex_patterns: Vec<RegexPatternConfig>,
+    pub(crate) regex_patterns: Vec<RegexPatternConfig>,
     /// Ordered list of steps to apply: `"characters"`, `"regex"`, `"class"`.
-    pub(super) apply_order: Vec<String>,
+    pub(crate) apply_order: Vec<String>,
     /// Class masking mode: `"random_class"` or `"fixed_class"`, or `None`.
-    pub(super) class_masking_mode: Option<String>,
+    pub(crate) class_masking_mode: Option<String>,
     /// Character used to replace letters in `"fixed_class"` mode (default `'X'`).
-    pub(super) class_letter: char,
+    pub(crate) class_letter: char,
     /// Character used to replace digits in `"fixed_class"` mode (default `'0'`).
-    pub(super) class_digit: char,
+    pub(crate) class_digit: char,
 }
 
 /// Parses a single masking config entry from the pipeline JSON.
@@ -197,7 +197,7 @@ pub(super) struct MaskingConfigLite {
 /// # Errors
 /// Returns [`PipelineError`] with code `PREPROCESS_CONFIG_INVALID` for
 /// malformed entries.
-pub(super) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, PipelineError> {
+pub(crate) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, PipelineError> {
     let obj = entry
         .as_object()
         .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "Each masking entry must be an object", "masking"))?;
@@ -574,7 +574,7 @@ pub(super) fn apply_regex_group_mask(value: &str, re: &Regex, mask_groups: &[(us
 /// * `cfg` — the parsed masking configuration for this column.
 /// * `randomize_fn` — callback that implements class-preserving randomization
 ///   (typically [`super::crypto::randomize_preserving_class`]).
-pub(super) fn apply_masking_value(
+pub(crate) fn apply_masking_value(
     value: &str,
     cfg: &MaskingConfigLite,
     randomize_fn: &dyn Fn(&str) -> String,
