@@ -49,11 +49,13 @@
 //! directory, so the AO can mount a self-contained job directory and never
 //! has to care about the container's working directory.
 
+pub mod contract;
 pub mod crypto_block;
 pub mod kanon_block;
 pub mod plan;
 pub mod preprocess_block;
 pub mod shard;
+pub mod stage;
 
 #[cfg(test)]
 mod tests;

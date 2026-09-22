@@ -1341,12 +1341,43 @@ pub fn compute_parameter_grid(
     size_factors: &HashMap<String, i64>,
     total_records: i64,
 ) -> Vec<GridEntry> {
-    const K_VALUES: &[i64] = &[5, 10, 50, 100];
-    const SUPP_VALUES: &[f64] = &[0.0, 0.01, 0.1];
+    compute_parameter_grid_over(
+        qis,
+        base_hist,
+        initial_ri,
+        size_factors,
+        total_records,
+        DEFAULT_GRID_K,
+        DEFAULT_GRID_SUPPRESSION,
+    )
+}
 
-    let mut entries = Vec::with_capacity(K_VALUES.len() * SUPP_VALUES.len());
-    for &k in K_VALUES {
-        for &supp in SUPP_VALUES {
+/// Default axes, used when a caller does not supply its own.
+pub const DEFAULT_GRID_K: &[i64] = &[5, 10, 50, 100];
+pub const DEFAULT_GRID_SUPPRESSION: &[f64] = &[0.0, 0.01, 0.1];
+
+/// [`compute_parameter_grid`] over caller-chosen axes.
+///
+/// The orchestrator drives these: the k × suppression-limit table it shows a
+/// user between the measure and apply phases is this grid, and which cells are
+/// worth showing depends on the dataset rather than on a constant compiled in
+/// here. Every cell is a full OLA-2 search over the already-built histogram, so
+/// the cost is in the axis sizes and not in the data.
+pub fn compute_parameter_grid_over(
+    qis: &[QuasiIdentifierLite],
+    base_hist: &SparseHist,
+    initial_ri: &[i64],
+    size_factors: &HashMap<String, i64>,
+    total_records: i64,
+    k_values: &[i64],
+    supp_values: &[f64],
+) -> Vec<GridEntry> {
+    let k_axis = k_values;
+    let supp_axis = supp_values;
+
+    let mut entries = Vec::with_capacity(k_axis.len() * supp_axis.len());
+    for &k in k_axis {
+        for &supp in supp_axis {
             match find_ola2_best_rf_detailed(qis, base_hist, initial_ri, size_factors, k, supp, total_records) {
                 Ok(result) => {
                     let suppression_count = result

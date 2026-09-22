@@ -6,36 +6,63 @@ describes the split form that the AO drives.
 
 ---
 
-## 1. The three blocks
+## 1. The blocks
 
-| Block | Operations | Secret state | Runs on | Image |
+| Unit | Work | Secret state | Runs on | Container role |
 |---|---|---|---|---|
-| `preprocess` | `suppress`, `masking`, `charcloak`, `tokenization` | token vault | the AO, in-TEE | `skald-preprocess` |
+| `stage` | data cleaning, `suppress`, row-id stamping | none | the AO, in-TEE | — |
+| `preprocess` | `masking`, `charcloak`, `tokenization` | token vault | dispatched container | `skald-preprocess` |
 | `crypto` | `hashing_with_salt`, `hashing_without_salt`, `encrypt`, FPE | per-column keys | dispatched container | `skald-crypto` |
-| `kanon` | `scan` → `solve` → `apply` | none (derived histograms only) | dispatched containers | `skald-kanon` |
+| `kanon` | `scan` → **solve (on the AO)** → `apply` | none (derived histograms only) | dispatched containers | `skald-kanon` |
 
-Plus `skald-ao`, the orchestrator-side toolkit (planning, key minting,
-sharding, stitching), which also carries `skald_preprocess`.
+`skald_ao` is the orchestrator-side toolkit: staging, planning, key minting,
+sharding, solving, stitching, and emitting the Co-ordinator's chunk manifest.
 
-### Why operations fall where they do
+### What the AO keeps, and why
 
-The three-way split in the brief left two operations unassigned and put one in
-a place worth revisiting:
+Only two kinds of work stay on the orchestrator, and they are there for
+different reasons.
 
-- **`masking` → preprocess.** Unkeyed, deterministic, no secret state. It has
-  nothing in common with the keyed operations and everything in common with
-  `charcloak`.
+**Data cleaning.** Missing-value sentinels normalised to one representation,
+whitespace settled, unusable rows dropped. This is not an anonymisation
+technique and is deliberately separate from the `preprocess` operations. It is
+here because it *decides the row set*: dropping a row shifts every row range in
+the chunk manifest, so it has to settle before anything is chunked or the
+manifest describes a dataset that no longer exists. It also stops a missing
+value reaching k-anonymisation as the literal string `"N/A"`, where it becomes
+its own quasi-identifier value and splits equivalence classes that should have
+merged.
+
+**Suppression.** A column dropped on the orchestrator never reaches a container
+at all. That is a stronger property than dropping it later, and it costs
+nothing: the staging pass already has the file open.
+
+Everything else is ordinary column work and belongs in a worker. Masking,
+charcloak and tokenisation are dispatched.
+
+### Operations the original three-way split left unplaced
+
+- **`masking` → preprocess.** Unkeyed, deterministic, no secret state — nothing
+  in common with the keyed operations, everything in common with `charcloak`.
 - **FPE → crypto.** The config spells it as an `encrypt` variant, but it is
-  keyed, so it belongs with the other key-bearing work whatever the config
-  calls it.
-- **`tokenization` stays in preprocess, but on the AO.** It needs no key, so it
-  reads as preprocessing — but its vault is a *reversible* mapping from token
-  back to plaintext. That is the one recoverable artifact the system produces.
-  Sending it to a worker would put it outside the boundary the user attested
-  before handing over their data, so it stays inside the TEE.
-- **`suppress` runs first, and on the AO, before any sharding.** A column
-  dropped on the orchestrator never reaches a container at all. Dropping it
-  later would produce the same file and a weaker guarantee.
+  keyed, so it belongs with the other key-bearing work whatever it is called.
+
+### One caveat on tokenisation in a container
+
+Tokenisation keeps a *reversible* vault mapping token back to plaintext. Running
+it in a worker means that vault is produced outside the TEE, so it must come
+back to the AO as an artifact and be treated as key material, not as output.
+
+It also cannot be split across rows: two shards of one tokenised column each
+start their id counter at 1 and mint the same token for different values.
+Column sharding is safe — each column goes to exactly one container — so the
+planner marks the group `row_parallel: false` whenever a tokenised column is
+present, and the AO must give that column a single shard covering all its rows.
+
+If row-parallel tokenisation is ever needed, the fix is a *keyed deterministic*
+token (`prefix` + truncated HMAC of the value) rather than a sequential id.
+That is stateless and shards freely, at the cost of a vault the AO has to
+assemble from the workers' outputs rather than one a single worker owns.
 
 ---
 
@@ -155,23 +182,68 @@ same histogram. Under the AO that is not merely wasteful: the raw dataset has
 to be held — or re-fetched and re-exposed to workers — across a human decision
 point that may take minutes or days.
 
-So `solve` persists the merged histogram as `artifacts/histogram.json`:
+**No container waits for the user.** The measure containers run, emit their
+partial histograms, and exit. `solve` then runs *on the orchestrator*, because
+it never touches a row: it reduces the scan artifacts into a histogram and
+searches the lattice over that. The apply containers are not started until a k
+has been chosen.
 
 ```
-pass1 :  scan (fan-out)  →  solve   → k_optimal, parameter grid, histogram.json
-         ──────── user picks k ────────
-pass2 :  solve (inputs: [])          → final_rf, below-k classes
-         apply (fan-out)             → generalized shards
+measure   N containers, fan out, EXIT          ~seconds
+   │      each emits a partial qi_histogram
+   ▼
+barrier   AO merges → artifacts/histogram.json   no container
+   │      AO computes the k × σ table            no container
+   ▼
+   ⏸      user chooses. Hours, days. Nothing is running.
+   │      the table can be recomputed for any axes, free
+   ▼
+solve     AO, on the histogram alone             ~400 ms
+   │
+   ▼
+apply     N containers, fan out, EXIT           ~seconds
 ```
 
-Pass 2 is a pure re-solve over a derived aggregate. It re-reads no rows and
-needs no access to the data at all — verified in
-`pass_two_resolves_from_the_persisted_histogram_with_no_data_present`, which
-deletes every input file before solving. A job can be re-solved for several
-candidate k values at essentially zero cost and zero additional exposure.
+This is what the chunk-manifest contract already asks for: the measure phase's
+artifact "is small, contains no row data, and is returned to the AO **before
+the next phase is planned**".
 
-Set `pass` to `no_bounds` to run scan → solve → apply in one go with a
-pre-chosen k.
+The alternative — holding a measure container open with a timeout — costs
+container-hours per waiting job, needs a timeout policy nobody can set well
+(what is the right deadline for a human decision?), and puts a process holding
+QI data inside the wait. It also does not avoid a second container start, since
+the apply phase needs different containers anyway. The only thing it would save
+is the measure container's own startup, which is milliseconds for a 1.3 MB
+scratch image.
+
+Two consequences worth stating:
+
+- **Exploring costs nothing.** `skald_ao grid` recomputes the table for any k
+  and suppression-limit axes the UI asks for, straight from `histogram.json`.
+  A user can change their mind as often as they like.
+- **Pinning k skips the measure phase entirely.** When `k` is set in the config
+  there is no barrier and the job streams once — which is the trade-off the
+  `job-config` schema spells out.
+
+### Cleaning changes what suppression costs
+
+`solve` reports two numbers, not one:
+
+- `suppressed_records` — rows the lattice suppresses to reach k.
+- `unplaceable_records` — rows the scan could not place at all, because a
+  quasi-identifier did not parse, fell outside every configured interval, or
+  was not in the categorical domain. They never entered the histogram, so no
+  class vouches for them and `apply` stars them.
+
+`effective_suppression_rate` is the two together over the full row count, and it
+is what the user actually loses. The lattice cannot see the second number — it
+only knows about rows that reached the histogram — so without reporting it here
+the loss would only become visible after the apply phase had already run.
+
+Cleaning is the usual source. Emptying a QI column turns those rows into
+unplaceable ones. Putting the QI columns in `cleaning.required_columns` drops
+them up front instead, so the row count the user is shown is the row count they
+get. `solve` warns when the effective rate exceeds the configured limit.
 
 ### What this fixes about suppression
 
@@ -208,32 +280,40 @@ whose class size is unknown.
 ## 5. End-to-end
 
 ```sh
-CFG=config/job.json; DATA=data/input.csv; JOB=job-123
+CFG=config/job.json; RAW=data/input.csv; JOB=3f1c9b2e-...
 
 # ── On the AO, in-TEE ────────────────────────────────────────────────────────
-skald_ao plan   --config $CFG --job $JOB --data $DATA --out plan.json
-skald_ao keygen --config $CFG --out keys.json
-skald_ao stamp  --input $DATA --out staged/staged.csv
+# One pass: clean, suppress, stamp row ids. Must finish before anything is
+# chunked, because cleaning decides the row set.
+skald_ao stage  --config $CFG --input $RAW --out staged.csv --report stage.json
 
-# One shard per block group, holding only that group's columns.
-skald_ao project --input staged/staged.csv --out shards/pre.csv    --columns "PatientID,Name,DoctorID"
-skald_ao project --input staged/staged.csv --out shards/crypto.csv --columns "Aadhaar,Phone,Email"
-skald_ao project --input staged/staged.csv --out shards/kanon.csv  --columns "Age,PINCode,Gender,BloodGroup"
+# Plan against the RAW header: the plan is what tells staging what to suppress.
+skald_ao plan     --config $CFG --job $JOB --data $RAW --out plan.json
+skald_ao keygen   --config $CFG --out keys.json
+skald_ao manifest --config $CFG --job $JOB --data $RAW --out manifest.json
+skald_ao chunks   --manifest manifest.json --input staged.csv \
+                  --out-dir chunks/ --rows 250000
 
-skald_preprocess --manifest manifests/preprocess.json          # order 1, on the AO
+# ── Dispatched: preprocess phase ─────────────────────────────────────────────
+skald_preprocess --manifest manifests/preprocess.json   # mask, charcloak, tokenize
+skald_crypto     --manifest manifests/crypto.json       # hash, encrypt, FPE
 
-# ── Dispatched ───────────────────────────────────────────────────────────────
-skald_crypto --manifest manifests/crypto.json                  # order 2, fan out freely
+# ── Dispatched: measure phase (barrier) ──────────────────────────────────────
+skald_kanon --manifest manifests/scan_$i.json           # one per row shard, then EXIT
 
-skald_ao split --input shards/kanon.csv --out-dir shards/rows --prefix k --rows 100000
-skald_kanon --manifest manifests/scan_$i.json                  # order 3, one per row shard
-skald_kanon --manifest manifests/solve.json                    #          exactly once
-skald_kanon --manifest manifests/apply_$i.json                 #          one per row shard
+# ── Back on the AO: barrier, then the user ───────────────────────────────────
+skald_ao solve --config $CFG --artifacts art/ --scans "art/mea_1.scan.json,…"
+skald_ao grid  --config $CFG --histogram art/histogram.json \
+               --k 5,10,25,50,100 --suppression 0,0.01,0.05
+#   ... user chooses k. Nothing is running. ...
+skald_ao solve --config $CFG_WITH_K --artifacts art/     # re-solve, no scan, no data
+
+# ── Dispatched: apply phase ──────────────────────────────────────────────────
+skald_kanon --manifest manifests/apply_$i.json          # one per row shard
 
 # ── Back on the AO ───────────────────────────────────────────────────────────
-skald_ao stitch --base staged/staged.csv --out output/anonymized.csv \
-                --shards "shards/pre.out.csv,shards/crypto.out.csv,shards/rows/k_1.out.csv,…" \
-                --routed "PatientID,Name,DoctorID,Aadhaar,Phone,Email,Age,PINCode,Gender,BloodGroup"
+skald_ao stitch --base staged.csv --out output/anonymized.csv \
+                --shards "…" --routed "…"
 ```
 
 `--routed` is every column sent to any block. It is what separates the two
@@ -246,25 +326,110 @@ deletes one it asked to keep.
 `stitch` fails with `BLOCK_SHARD_INCOMPLETE` if any row id is unaccounted for.
 A worker that lost rows must not produce output that merely looks shorter.
 
+### Cleaning configuration
+
+```jsonc
+"cleaning": {
+  "enabled": true,
+  "null_tokens": ["", "na", "n/a", "null", "nil", "none", "nan", "-", "?", "unknown"],
+  "null_replacement": "",
+  "trim": true,
+  "collapse_whitespace": true,
+  "drop_all_empty_rows": true,
+  "required_columns": ["Age"],        // row dropped when these are missing
+  "numeric_columns": ["Age", "PINCode"],  // non-numeric becomes missing
+  "max_dropped_fraction": 0.05        // refuse the job past this
+}
+```
+
+Absent means disabled: cleaning changes the row set, so it is never applied to a
+job that did not ask for it. `max_dropped_fraction` is the guard — a cleaning
+step that discards half the dataset has changed the answer rather than tidied
+the input, and `STAGE_TOO_MANY_DROPPED` names the reasons rather than only the
+count.
+
+Put the quasi-identifier columns in `required_columns` unless you have a reason
+not to. See **Cleaning changes what suppression costs** above.
+
 ---
 
-## 6. The plan
+## 6. The Co-ordinator contract
+
+`skald_ao manifest` and `skald_ao chunks` emit a document conforming to
+`chunk-manifest.schema.json` in `anamika-control-plane`. SKALD is the
+application whose column roles and phase structure that manifest describes, so
+deriving it from the same config that drives the blocks keeps one source of
+truth rather than having the AO restate SKALD's requirements somewhere they can
+drift.
+
+| SKALD | Contract phase |
+|---|---|
+| `stage` | — (runs before chunking; not a phase) |
+| `preprocess` + `crypto` blocks | `preprocess` |
+| `kanon scan` | `measure` (barrier, produces `qi_histogram`) |
+| `kanon solve` | — (the AO's barrier reduce; not a phase) |
+| `kanon apply` | `apply` (consumes `qi_histogram`) |
+
+Two things this deliberately does not do:
+
+- **It never names an image.** Phases carry a `container_role` and the
+  Co-ordinator resolves it to a digest. An image reference emitted here would
+  be a guess about something this side does not own, and the digest that matters
+  is the one the Co-ordinator reports back after attesting.
+- **It does not encrypt.** Each chunk's `digest` is the SHA-256 of the chunk
+  *plaintext*, as the schema specifies, because the container checks it after
+  decrypting. Encryption and delivery are the AO's.
+
+### Known gap: two preprocess roles
+
+SKALD ships `preprocess` and `crypto` as separate images so the crypto block can
+be attested separately. The contract cannot express that today:
+
+- `Chunk.phase` is an enum of three names, so a chunk cannot say which of two
+  `preprocess` phases it belongs to.
+- `/jobs/{job_id}/phases/{phase}/start` is keyed by the same name, so the two
+  phases have no distinct address.
+
+**Proposed minimal change:** give `Phase` a unique `id`, and have `Chunk.phase`
+and the start endpoint reference that id, leaving `name` as the semantic kind.
+Adding an optional field and moving the reference is one breaking change to
+`Chunk.phase` rather than a redesign.
+
+```jsonc
+// Phase
+"id":   { "type": "string", "minLength": 1 },   // unique within the manifest
+"name": { "enum": ["preprocess", "measure", "apply"] }   // unchanged, now the kind
+// Chunk
+"phase": { "type": "string" }   // references Phase.id, was the name enum
+```
+
+Until then `skald_ao manifest` emits one `preprocess` phase and one role.
+`--split-crypto` emits two and prints why the result will not validate.
+
+## 7. The plan
 
 `skald_ao plan` answers the three questions the AO cannot answer itself:
 
 ```jsonc
 {
   "groups": [
-    { "block": "preprocess", "order": 1, "runs_on": "orchestrator",
-      "columns": ["PatientID", "Name", "DateOfBirth", "HospitalName", "DoctorID"],
-      "operations": ["suppress:PatientID", "…", "tokenize:DoctorID"],
+    { "block": "stage", "order": 0, "runs_on": "orchestrator", "container_role": null,
+      "columns": ["Age", "PINCode", "PatientID", "Name", "DateOfBirth"],
+      "operations": ["clean:*", "require_non_null:Age", "suppress:PatientID", "…"],
       "row_parallel": false,
-      "row_parallel_note": "tokenization allocates sequential ids from a shared vault (DoctorID) — …" },
-    { "block": "crypto", "order": 2, "runs_on": "container", "row_parallel": true,
+      "row_parallel_note": "cleaning decides the row set, so it must complete before the dataset is chunked — …" },
+    { "block": "preprocess", "order": 1, "runs_on": "container", "container_role": "skald-preprocess",
+      "columns": ["HospitalName", "DoctorID"],
+      "operations": ["charcloak:HospitalName", "tokenize:DoctorID"],
+      "row_parallel": false,
+      "row_parallel_note": "tokenisation allocates sequential ids from a shared vault (DoctorID) — …" },
+    { "block": "crypto", "order": 2, "runs_on": "container", "container_role": "skald-crypto",
+      "row_parallel": true,
       "columns": ["AadhaarNumber", "InsuranceID", "PhoneNumber", "Email"] },
-    { "block": "kanon",  "order": 3, "runs_on": "container", "row_parallel": true,
+    { "block": "kanon",  "order": 3, "runs_on": "container", "container_role": "skald-kanon",
+      "row_parallel": true,
       "columns": ["Age", "PINCode", "Gender", "BloodGroup"],
-      "stages": ["scan", "solve", "apply"] }
+      "stages": ["scan", "apply"] }
   ],
   "passthrough_columns": ["Diagnosis", "MedicationPrescribed"],
   "keys_required": { "hash_salts": ["AadhaarNumber", "InsuranceID"],
@@ -295,7 +460,7 @@ would generalize digests and numeric ordering would not survive.
 
 ---
 
-## 7. Error codes
+## 8. Error codes
 
 | Code | Meaning |
 |---|---|
@@ -314,12 +479,14 @@ would generalize digests and numeric ordering would not survive.
 | `BLOCK_SHARD_INCOMPLETE` | Stitching found row ids no shard accounted for |
 | `PLAN_COLUMN_CONFLICT` | Config assigns a column to blocks that cannot both have it |
 | `PLAN_COLUMN_MISSING` | Config targets a column the dataset does not have |
+| `STAGE_COLUMN_MISSING` | A cleaning or suppression column is not in the input |
+| `STAGE_TOO_MANY_DROPPED` | Cleaning would discard more rows than the job allows |
 
 All other codes are the monolith's existing ones, unchanged.
 
 ---
 
-## 8. Images
+## 9. Images
 
 ```sh
 TAG=v1 REGISTRY=ghcr.io/datakaveri ./docker/build-blocks.sh
@@ -337,7 +504,7 @@ else with them.
 
 ---
 
-## 9. Open items
+## 10. Open items
 
 - **`kanon solve` is a single reduce and holds the merged histogram in memory.**
   It is bounded by the number of distinct QI tuples, not by row count, but a
@@ -347,6 +514,11 @@ else with them.
 - **Blocks read and write plain CSV.** Fine at current volumes and it keeps one
   dialect end to end, but a columnar format would cut the projection and stitch
   cost substantially at scale.
+- **Row-parallel tokenisation is not supported.** Sequential ids need a single
+  shard per tokenised column. The keyed-deterministic alternative is described
+  in §1 and is not implemented.
+- **The `chunk-manifest` phase-id gap above is unresolved**, so the crypto block
+  cannot currently be attested separately under the contract as written.
 - **The index-space / label-space divergence is worked around, not resolved.**
   `solve` evaluates suppression in label space, which is correct for the
   released table, but OLA-2 still searches the lattice using integer division

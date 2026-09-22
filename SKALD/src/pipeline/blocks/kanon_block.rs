@@ -44,7 +44,7 @@ use crate::pipeline::anonymization::generalization::{
 };
 use crate::pipeline::anonymization::{
     base_col_name, build_quasi_identifiers, compute_equivalence_space, compute_k_optimal,
-    compute_parameter_grid, equivalence_class_stats, find_ola1_initial_ri,
+    compute_parameter_grid, compute_parameter_grid_over, equivalence_class_stats, find_ola1_initial_ri,
     find_ola2_best_rf_detailed, merge_histogram, GridEntry, QuasiIdentifierLite, SparseHist,
 };
 use crate::pipeline::bootstrap::{
@@ -128,6 +128,20 @@ pub struct Solution {
     pub suppressed_classes: Vec<Vec<String>>,
     #[serde(default)]
     pub suppressed_records: i64,
+    /// Rows the scan could not place: a quasi-identifier that did not parse,
+    /// fell outside every configured interval, or was not in the categorical
+    /// domain. They never entered the histogram, so no class vouches for them
+    /// and `apply` stars them.
+    ///
+    /// Reported here because they are real utility loss that the lattice search
+    /// cannot see. A cleaning step that empties a QI column produces exactly
+    /// this, and without the number the loss only becomes visible after the
+    /// apply phase has already run.
+    #[serde(default)]
+    pub unplaceable_records: i64,
+    /// `(suppressed + unplaceable) / rows_total` — what the user actually loses.
+    #[serde(default)]
+    pub effective_suppression_rate: f64,
 }
 
 /// The persisted global histogram, so pass 2 never re-reads raw data.
@@ -141,6 +155,59 @@ pub struct HistogramArtifact {
     pub numeric_bounds: BTreeMap<String, (f64, f64)>,
     pub categorical_domains: BTreeMap<String, Vec<String>>,
     pub hist: Vec<(Vec<String>, i64)>,
+}
+
+/// Recomputes the k x suppression_limit table from a persisted histogram.
+///
+/// This is the table the user chooses from between the measure and apply
+/// phases, and it is a pure function of the histogram: no rows, no containers,
+/// milliseconds. That is what makes it reasonable to let a user sit with the
+/// numbers, change their mind, and ask for different axes — none of it costs
+/// container time, and nothing is held open waiting for them.
+pub fn grid_from_histogram(
+    config_path: &Path,
+    histogram_path: &Path,
+    k_values: &[i64],
+    supp_values: &[f64],
+) -> Result<serde_json::Value, PipelineError> {
+    let cfg = parse_runtime_config(config_path)?;
+    let agg: HistogramArtifact = read_json(histogram_path)?;
+    let qis = build_quasi_identifiers(&cfg, &agg.numeric_bounds)?;
+    let cat_domains: Vec<Vec<String>> = qis
+        .iter()
+        .map(|q| {
+            if q.is_categorical {
+                agg.categorical_domains.get(&q.column_name).cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    let (fine, total_records) = raw_hist_to_sparse(&agg, &qis, &agg.qi_columns, &cat_domains)?;
+    let initial_ri = vec![1i64; qis.len()];
+
+    let entries = compute_parameter_grid_over(
+        &qis,
+        &fine,
+        &initial_ri,
+        &cfg.size_factors,
+        total_records,
+        k_values,
+        supp_values,
+    );
+
+    // The suppression count OLA-2 reports is in index space; what a user
+    // actually loses is in label space. Recomputing per cell would mean one
+    // merge per cell, so the reported count is left as the lattice's own and
+    // labelled as such rather than quietly presented as the final figure.
+    Ok(json!({
+        "job_id": agg.job_id,
+        "total_records": total_records,
+        "k_values": k_values,
+        "suppression_limits": supp_values,
+        "cells": entries,
+        "note": "suppression_count is the lattice search's own figure, in histogram index                  space. The published figure comes from the solve stage, which evaluates it                  over the generalized labels that actually get written.",
+    }))
 }
 
 pub fn run(manifest: &BlockManifest) -> Result<BlockReport, PipelineError> {
@@ -386,6 +453,8 @@ fn run_solve(manifest: &BlockManifest) -> Result<BlockReport, PipelineError> {
         parameter_grid,
         suppressed_classes: vec![],
         suppressed_records: 0,
+        unplaceable_records: agg.rows_total - agg.rows_valid,
+        effective_suppression_rate: 0.0,
     };
 
     let mut extra = json!({
@@ -463,12 +532,39 @@ fn run_solve(manifest: &BlockManifest) -> Result<BlockReport, PipelineError> {
 
         extra["top_ola2_nodes"] = serde_json::to_value(&ola2.top_nodes).unwrap_or(json!([]));
         extra["node_trace"] = serde_json::to_value(&ola2.node_trace).unwrap_or(json!([]));
+        solution.effective_suppression_rate = if agg.rows_total > 0 {
+            (suppressed_records + solution.unplaceable_records) as f64 / agg.rows_total as f64
+        } else {
+            0.0
+        };
+
         extra["published_equivalence_classes"] = json!(label_counts.len());
         extra["suppression_rate"] = json!(if total_records > 0 {
             suppressed_records as f64 / total_records as f64
         } else {
             0.0
         });
+        extra["unplaceable_records"] = json!(solution.unplaceable_records);
+        extra["effective_suppression_rate"] = json!(solution.effective_suppression_rate);
+
+        // The lattice honours suppression_limit over the rows it can see. Rows
+        // it never saw are loss too, and the two together are what the user
+        // gets. Saying so here means the number arrives before the apply phase
+        // runs rather than after.
+        if solution.effective_suppression_rate > cfg.suppression_limit {
+            extra["warning"] = json!(format!(
+                "Effective suppression is {:.3}%, above the configured limit of {:.3}%. \
+                 {} row(s) satisfy the lattice but {} more cannot be placed at all — a \
+                 quasi-identifier is empty or out of range in those rows. Cleaning that \
+                 empties a QI column is the usual cause; adding the QI columns to \
+                 cleaning.required_columns drops those rows up front instead, so the \
+                 row count the user is shown is the row count they get.",
+                solution.effective_suppression_rate * 100.0,
+                cfg.suppression_limit * 100.0,
+                suppressed_records,
+                solution.unplaceable_records,
+            ));
+        }
     }
 
     let out = manifest

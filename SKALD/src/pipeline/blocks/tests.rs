@@ -539,7 +539,8 @@ fn the_plan_routes_each_column_to_exactly_one_block() {
     let by_block = |b: &str| {
         plan.groups.iter().find(|g| g.block == b).map(|g| g.columns.clone()).unwrap_or_default()
     };
-    assert_eq!(by_block("preprocess"), vec!["name"]);
+    // Suppression is the orchestrator's: a dropped column reaches no container.
+    assert_eq!(by_block("stage"), vec!["name"]);
     assert_eq!(by_block("crypto"), vec!["secret"]);
     assert_eq!(by_block("kanon"), vec!["age", "city"]);
     assert_eq!(plan.passthrough_columns, vec!["id"]);
@@ -548,8 +549,60 @@ fn the_plan_routes_each_column_to_exactly_one_block() {
 
     // Ordering is what the orchestrator schedules on.
     let order = |b: &str| plan.groups.iter().find(|g| g.block == b).unwrap().order;
-    assert!(order("preprocess") < order("crypto"));
+    assert!(order("stage") < order("crypto"));
     assert!(order("crypto") < order("kanon"));
+}
+
+#[test]
+fn only_the_staging_group_runs_on_the_orchestrator() {
+    let d = tmp("placement");
+    let cfg = config_json(
+        &d,
+        &CFG.replace(
+            r#""suppress": ["name"]"#,
+            r#""suppress": ["name"], "charcloak": ["city"]"#,
+        ),
+    );
+    let plan = build_plan(&cfg, "j", None).unwrap();
+    for g in &plan.groups {
+        let expected = if g.block == "stage" { "orchestrator" } else { "container" };
+        assert_eq!(g.runs_on, expected, "block {} runs on the wrong side", g.block);
+    }
+    // Masking, charcloak and tokenisation are ordinary column transforms and
+    // belong in a worker, not on the orchestrator.
+    let pre = plan.groups.iter().find(|g| g.block == "preprocess").unwrap();
+    assert_eq!(pre.runs_on, "container");
+    assert_eq!(pre.operations, vec!["charcloak:city"]);
+    assert!(!pre.operations.iter().any(|o| o.starts_with("suppress")));
+}
+
+#[test]
+fn the_plan_names_container_roles_and_never_images() {
+    let d = tmp("roles");
+    let cfg = config_json(&d, CFG);
+    let plan = build_plan(&cfg, "j", None).unwrap();
+    let json = serde_json::to_string(&plan).unwrap();
+    // Resolution is the Co-ordinator's business; an image reference emitted
+    // here would be a guess about something this side does not own.
+    assert!(!json.contains("ghcr.io"), "plan named an image: {json}");
+    assert!(!json.contains("sha256:"), "plan named a digest: {json}");
+    for g in plan.groups.iter().filter(|g| g.runs_on == "container") {
+        assert!(g.container_role.is_some(), "{} has no container_role", g.block);
+    }
+    assert!(plan.groups.iter().find(|g| g.block == "stage").unwrap().container_role.is_none());
+}
+
+#[test]
+fn solve_is_not_planned_as_a_container_stage() {
+    let d = tmp("solve_placement");
+    let cfg = config_json(&d, CFG);
+    let plan = build_plan(&cfg, "j", None).unwrap();
+    let kanon = plan.groups.iter().find(|g| g.block == "kanon").unwrap();
+    // Solve reduces a histogram, never rows. Dispatching it would mean a
+    // container held open across the user's choice of k for no benefit.
+    assert!(!kanon.stages.contains(&"solve".to_string()), "{:?}", kanon.stages);
+    assert_eq!(kanon.stages, vec!["scan", "apply"]);
+    assert!(plan.notes.iter().any(|n| n.contains("runs on the orchestrator")));
 }
 
 #[test]
@@ -638,6 +691,341 @@ fn a_manifest_from_a_future_schema_is_refused_rather_than_guessed_at() {
         .unwrap();
     let err = BlockManifest::load(&m).unwrap_err();
     assert!(format!("{err}").contains("BLOCK_SCHEMA_MISMATCH"), "{err}");
+}
+
+// ── Staging: cleaning, suppression, row ids ──────────────────────────────────
+
+const DIRTY: &str = "\
+id,name,age,city
+1, Asha ,34,Pune
+2,N/A,41,  New   Delhi
+3,Meena,n/a,Delhi
+,,,\u{20}
+5,Kabir,notanumber,Pune
+";
+
+const CLEAN_CFG: &str = r#"{
+  "data_type": "t",
+  "t": {
+    "pass": "no_bounds",
+    "output_path": "out.csv",
+    "suppression_limit": 0.5,
+    "flow_mode": "direct",
+    "suppress": ["name"],
+    "cleaning": {
+      "enabled": true,
+      "numeric_columns": ["age"],
+      "required_columns": ["age"]
+    },
+    "quasi_identifiers": {
+      "numerical": [{"column": "age", "type": "int"}],
+      "categorical": [{"column": "city"}]
+    },
+    "size": {"age": 2},
+    "compute_parameter_grid": false,
+    "k_anonymize": {"k": 2}
+  }
+}"#;
+
+#[test]
+fn staging_normalises_missing_values_trims_and_collapses_whitespace() {
+    let d = tmp("cleaning");
+    let input = d.join("dirty.csv");
+    fs::write(&input, DIRTY).unwrap();
+    let cfg = config_json(&d, &CLEAN_CFG.replace(r#""required_columns": ["age"]"#, r#""required_columns": []"#));
+    let out = d.join("staged.csv");
+
+    let report = super::stage::stage(&cfg, &input, &out, DEFAULT_ROW_ID_COLUMN, false).unwrap();
+    let body = fs::read_to_string(&out).unwrap();
+
+    // " Asha " trimmed; "  New   Delhi" trimmed and internally collapsed.
+    assert!(body.contains("0,1,Asha,34,Pune"), "{body}");
+    assert!(body.contains("1,2,,41,New Delhi"), "{body}");
+    // "N/A" and "n/a" both became the missing-value representation, so they can
+    // no longer key their own equivalence class downstream.
+    assert!(!body.contains("N/A") && !body.contains("n/a"), "{body}");
+    // "notanumber" in a numeric column is missing data in disguise.
+    assert!(body.contains("3,5,Kabir,,Pune"), "{body}");
+    assert_eq!(report.non_numeric.get("age"), Some(&1));
+    assert!(report.nulls_normalised.get("name").is_some());
+    assert!(report.whitespace_fixed.get("city").is_some());
+    // The all-empty row is gone; the rest survive.
+    assert_eq!(report.rows_in, 5);
+    assert_eq!(report.rows_out, 4);
+    assert_eq!(report.dropped_by_reason.get("all_fields_empty"), Some(&1));
+}
+
+#[test]
+fn staging_drops_rows_missing_a_required_column() {
+    let d = tmp("required");
+    let input = d.join("dirty.csv");
+    fs::write(&input, DIRTY).unwrap();
+    let cfg = config_json(&d, CLEAN_CFG);
+    let out = d.join("staged.csv");
+
+    let report = super::stage::stage(&cfg, &input, &out, DEFAULT_ROW_ID_COLUMN, false).unwrap();
+    // Rows 3 (age "n/a"), 4 (empty) and 5 (age "notanumber") all lose `age`.
+    assert_eq!(report.rows_out, 2);
+    // Row 4 is empty throughout and goes first; rows 3 and 5 lose `age` to
+    // the missing-value and numeric-coercion rules respectively.
+    assert_eq!(report.dropped_by_reason.get("required_column_empty:age"), Some(&2));
+    assert_eq!(report.dropped_by_reason.get("all_fields_empty"), Some(&1));
+}
+
+#[test]
+fn staging_refuses_to_quietly_discard_most_of_the_dataset() {
+    let d = tmp("too_many_dropped");
+    let input = d.join("dirty.csv");
+    fs::write(&input, DIRTY).unwrap();
+    let cfg = config_json(
+        &d,
+        &CLEAN_CFG.replace(
+            r#""required_columns": ["age"]"#,
+            r#""required_columns": ["age"], "max_dropped_fraction": 0.2"#,
+        ),
+    );
+    let err = super::stage::stage(&cfg, &input, &d.join("o.csv"), DEFAULT_ROW_ID_COLUMN, false)
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("STAGE_TOO_MANY_DROPPED"), "{msg}");
+    // The message has to say what was dropped, not only how much.
+    assert!(msg.contains("required_column_empty:age"), "{msg}");
+    assert!(!d.join("o.csv").exists(), "a refused stage must leave no output");
+}
+
+#[test]
+fn staging_suppresses_columns_and_stamps_dense_row_ids() {
+    let d = tmp("stage_suppress");
+    let input = d.join("dirty.csv");
+    fs::write(&input, DIRTY).unwrap();
+    let cfg = config_json(&d, CLEAN_CFG);
+    let out = d.join("staged.csv");
+
+    let report = super::stage::stage(&cfg, &input, &out, DEFAULT_ROW_ID_COLUMN, true).unwrap();
+    assert_eq!(report.columns_suppressed, vec!["name"]);
+    assert_eq!(report.columns_out, vec!["__skald_rid", "id", "age", "city"]);
+
+    let body = fs::read_to_string(&out).unwrap();
+    assert!(!body.contains("Asha") && !body.contains("Kabir"), "suppressed column survived:\n{body}");
+    // Ids are assigned after cleaning, so they are dense over the rows that
+    // actually exist rather than over the rows the input happened to have.
+    let ids: Vec<&str> = body.lines().skip(1).map(|l| l.split(',').next().unwrap()).collect();
+    assert_eq!(ids, vec!["0", "1"]);
+}
+
+#[test]
+fn staging_without_a_cleaning_section_only_suppresses_and_stamps() {
+    let d = tmp("no_cleaning");
+    let input = d.join("dirty.csv");
+    fs::write(&input, DIRTY).unwrap();
+    let cfg = config_json(&d, CFG); // no "cleaning" key at all
+    let out = d.join("staged.csv");
+
+    let report = super::stage::stage(&cfg, &input, &out, DEFAULT_ROW_ID_COLUMN, false).unwrap();
+    // Cleaning changes the row set, so it is never applied to a job that did
+    // not ask for it.
+    assert!(!report.cleaning_enabled);
+    assert_eq!(report.rows_in, report.rows_out);
+    assert!(fs::read_to_string(&out).unwrap().contains("N/A"));
+}
+
+#[test]
+fn staging_fails_on_a_cleaning_column_the_data_lacks() {
+    let d = tmp("clean_missing_col");
+    let input = d.join("dirty.csv");
+    fs::write(&input, DIRTY).unwrap();
+    let cfg = config_json(&d, &CLEAN_CFG.replace(r#""numeric_columns": ["age"]"#, r#""numeric_columns": ["nope"]"#));
+    let err = super::stage::stage(&cfg, &input, &d.join("o.csv"), DEFAULT_ROW_ID_COLUMN, false)
+        .unwrap_err();
+    assert!(format!("{err}").contains("STAGE_COLUMN_MISSING"), "{err}");
+}
+
+#[test]
+fn solve_counts_rows_no_class_can_vouch_for_before_apply_runs() {
+    let d = tmp("unplaceable");
+    let cfg = config_json(&d, CFG);
+    // One row whose `age` is empty — what cleaning produces from "N/A" when the
+    // column is not in required_columns. It never enters the histogram, so the
+    // lattice cannot see it, but `apply` will star it.
+    let input = d.join("in.csv");
+    fs::write(
+        &input,
+        "id,name,secret,age,city\n1,A,X,34,Pune\n2,B,Y,34,Pune\n3,C,Z,,Delhi\n",
+    )
+    .unwrap();
+    let staged = d.join("staged.csv");
+    stamp_row_ids(&input, &staged, DEFAULT_ROW_ID_COLUMN).unwrap();
+    let qi = d.join("qi.csv");
+    project_columns(&staged, &qi, &["age".into(), "city".into()], DEFAULT_ROW_ID_COLUMN).unwrap();
+    let art = d.join("art");
+
+    for (name, extra) in [
+        ("scan.json", serde_json::json!({"stage": "scan", "input": qi.clone()})),
+        ("solve.json", serde_json::json!({"stage": "solve", "inputs": [art.join("s0.scan.json")]})),
+    ] {
+        let mut m = serde_json::json!({
+            "schema_version": 1, "job_id": "j", "shard_id": "s0", "block": "kanon",
+            "config": cfg, "artifacts_dir": art
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            m[k] = v.clone();
+        }
+        super::kanon_block::run(&BlockManifest::load(&manifest_at(&d, name, m)).unwrap()).unwrap();
+    }
+
+    let sol: super::kanon_block::Solution =
+        serde_json::from_str(&fs::read_to_string(art.join("solution.json")).unwrap()).unwrap();
+    assert_eq!(sol.unplaceable_records, 1);
+    assert_eq!(sol.total_records, 2, "the unplaceable row is not in the histogram");
+
+    // The prediction has to hold against what apply actually does, or the
+    // number shown to the user before the phase runs is worth nothing.
+    let out = d.join("applied.csv");
+    let m = manifest_at(
+        &d,
+        "apply.json",
+        serde_json::json!({
+            "schema_version": 1, "job_id": "j", "shard_id": "s0", "block": "kanon",
+            "stage": "apply", "config": cfg, "input": qi, "output": out,
+            "solution": art.join("solution.json"), "artifacts_dir": art
+        }),
+    );
+    let report = super::kanon_block::run(&BlockManifest::load(&m).unwrap()).unwrap();
+    let starred = report.extra.as_ref().unwrap()["rows_suppressed"].as_i64().unwrap();
+    assert_eq!(starred, sol.suppressed_records + sol.unplaceable_records);
+}
+
+// ── Parameter grid ───────────────────────────────────────────────────────────
+
+#[test]
+fn the_grid_is_recomputed_from_the_histogram_over_caller_chosen_axes() {
+    let d = tmp("grid");
+    let cfg = config_json(&d, CFG);
+    let staged = d.join("staged.csv");
+    stamp_row_ids(&write_csv(&d), &staged, DEFAULT_ROW_ID_COLUMN).unwrap();
+    let qi = d.join("qi.csv");
+    project_columns(&staged, &qi, &["age".into(), "city".into()], DEFAULT_ROW_ID_COLUMN).unwrap();
+    let art = d.join("art");
+
+    for (name, body) in [
+        ("scan.json", serde_json::json!({"stage": "scan", "input": qi.clone()})),
+        ("solve.json", serde_json::json!({"stage": "solve", "inputs": [art.join("s0.scan.json")]})),
+    ] {
+        let mut m = serde_json::json!({
+            "schema_version": 1, "job_id": "j", "shard_id": "s0", "block": "kanon",
+            "config": cfg, "artifacts_dir": art
+        });
+        for (k, v) in body.as_object().unwrap() {
+            m[k] = v.clone();
+        }
+        super::kanon_block::run(&BlockManifest::load(&manifest_at(&d, name, m)).unwrap()).unwrap();
+    }
+
+    // The raw data is irrelevant from here on — the table is a function of the
+    // histogram, which is why a user can sit with it for as long as they like.
+    fs::remove_file(&qi).unwrap();
+    fs::remove_file(&staged).unwrap();
+
+    let table = super::kanon_block::grid_from_histogram(
+        &cfg,
+        &art.join("histogram.json"),
+        &[2, 3],
+        &[0.0, 0.5],
+    )
+    .unwrap();
+    assert_eq!(table["cells"].as_array().unwrap().len(), 4);
+    assert_eq!(table["total_records"], 4);
+    assert_eq!(table["k_values"], serde_json::json!([2, 3]));
+}
+
+// ── Chunk manifest ───────────────────────────────────────────────────────────
+
+#[test]
+fn the_chunk_manifest_matches_the_coordinator_contract() {
+    let d = tmp("contract");
+    let cfg = config_json(&d, CFG);
+    let header: Vec<String> = "id,name,secret,age,city".split(',').map(str::to_string).collect();
+    let plan = build_plan(&cfg, "3f1c9b2e-5a47-4d18-9e30-8b6a1d4c7f20", Some(&header)).unwrap();
+    let doc = super::contract::manifest_skeleton(&plan, &cfg, false).unwrap();
+
+    assert_eq!(doc["manifest_version"], 1);
+    assert_eq!(doc["application"], "kanon");
+
+    // Every column the config touches is classified; the contract wants a
+    // column nobody classified to be an error, not a silent leak.
+    let pre = doc["column_roles"]["preprocess"].as_array().unwrap();
+    assert!(pre.iter().any(|p| p["column"] == "name" && p["operation"] == "suppress"));
+    assert!(pre.iter().any(|p| p["column"] == "secret" && p["operation"] == "hash_salted"));
+    assert_eq!(doc["column_roles"]["passthrough"], serde_json::json!(["id"]));
+
+    // k is pinned here, so there is no measure phase and the job streams once.
+    let phases = doc["phases"].as_array().unwrap();
+    let names: Vec<&str> = phases.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["preprocess", "apply"]);
+    assert_eq!(doc["parameters"]["k"], 2);
+    for p in phases {
+        // Roles, never images.
+        let role = p["container_role"].as_str().unwrap();
+        assert!(!role.contains('/') && !role.contains(':'), "role looks like an image: {role}");
+    }
+}
+
+#[test]
+fn omitting_k_puts_a_measure_barrier_in_front_of_apply() {
+    let d = tmp("contract_measure");
+    let cfg = config_json(&d, &CFG.replace(r#""pass": "no_bounds""#, r#""pass": "pass1""#));
+    let plan = build_plan(&cfg, "j", None).unwrap();
+    let doc = super::contract::manifest_skeleton(&plan, &cfg, false).unwrap();
+
+    let phases = doc["phases"].as_array().unwrap();
+    let measure = phases.iter().find(|p| p["name"] == "measure").unwrap();
+    assert_eq!(measure["barrier"], true);
+    assert_eq!(measure["columns"], "quasi_identifiers");
+    assert_eq!(measure["produces"], "qi_histogram");
+
+    let apply = phases.iter().find(|p| p["name"] == "apply").unwrap();
+    assert_eq!(apply["consumes"], "qi_histogram");
+    assert_eq!(apply["barrier"], false);
+    assert_eq!(doc["parameters"]["k"], serde_json::Value::Null);
+}
+
+#[test]
+fn chunks_cover_every_row_exactly_once_per_phase() {
+    let d = tmp("chunks");
+    let cfg = config_json(&d, &CFG.replace(r#""pass": "no_bounds""#, r#""pass": "pass1""#));
+    let staged = d.join("staged.csv");
+    stamp_row_ids(&write_csv(&d), &staged, DEFAULT_ROW_ID_COLUMN).unwrap();
+    let plan = build_plan(&cfg, "j", None).unwrap();
+    let doc = super::contract::manifest_skeleton(&plan, &cfg, false).unwrap();
+
+    let entries =
+        super::contract::materialise_chunks(&doc, &staged, &d.join("c"), 3, DEFAULT_ROW_ID_COLUMN)
+            .unwrap();
+
+    for phase in ["preprocess", "measure", "apply"] {
+        let mut ranges: Vec<(u64, u64)> =
+            entries.iter().filter(|c| c.phase == phase).map(|c| (c.rows.start, c.rows.end)).collect();
+        ranges.sort_unstable();
+        // Disjoint and covering: that is what makes the apply outputs safely
+        // concatenable, and for DP it is a privacy property rather than only
+        // bookkeeping.
+        assert_eq!(ranges, vec![(0, 3), (3, 4)], "phase {phase}");
+    }
+
+    // The measure phase sees only the QI columns; apply sees everything.
+    let measure = entries.iter().find(|c| c.phase == "measure").unwrap();
+    let body = fs::read_to_string(&measure.path).unwrap();
+    assert!(!body.contains("secret"), "measure chunk carried a non-QI column:\n{body}");
+    assert!(body.starts_with("__skald_rid,age,city\n"), "{body}");
+
+    // Digests are over the plaintext, and differ per projection of the same rows.
+    let apply = entries.iter().find(|c| c.phase == "apply" && c.rows.start == 0).unwrap();
+    let mea0 = entries.iter().find(|c| c.phase == "measure" && c.rows.start == 0).unwrap();
+    assert_ne!(apply.digest, mea0.digest);
+    for c in &entries {
+        assert_eq!(c.digest.len(), 64);
+        assert!(c.digest.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
 }
 
 fn manifest_at(dir: &Path, name: &str, body: serde_json::Value) -> PathBuf {

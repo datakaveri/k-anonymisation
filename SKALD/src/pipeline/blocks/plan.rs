@@ -44,9 +44,16 @@ pub struct BlockGroup {
     pub row_parallel_note: Option<String>,
     /// Where this group is expected to execute.
     pub runs_on: String,
-    /// The container image to pull, for groups the AO dispatches.
+    /// Logical name the Co-ordinator resolves to an image digest.
+    ///
+    /// Deliberately not an image reference. Resolution is the Co-ordinator's
+    /// business, so changing which image a role points at is not a change to
+    /// anything the AO emits — and the digest that gets attested is the one the
+    /// Co-ordinator reports back, never one this side guessed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    pub container_role: Option<String>,
+    /// Which phase of the chunk manifest this group belongs to.
+    pub phase: String,
     /// `kanon` only.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stages: Vec<String>,
@@ -96,9 +103,12 @@ pub struct MultiBlockColumn {
     pub blocks: Vec<String>,
 }
 
-const IMAGE_PREPROCESS: &str = "ghcr.io/datakaveri/skald-preprocess";
-const IMAGE_CRYPTO: &str = "ghcr.io/datakaveri/skald-crypto";
-const IMAGE_KANON: &str = "ghcr.io/datakaveri/skald-kanon";
+/// Logical container roles, matching the names the chunk-manifest contract's
+/// worked example uses. These are resolved to image digests by the
+/// Co-ordinator, not here.
+const ROLE_PREPROCESS: &str = "skald-preprocess";
+const ROLE_CRYPTO: &str = "skald-crypto";
+const ROLE_KANON: &str = "skald-kanon";
 
 /// Builds the plan for a job config.
 ///
@@ -151,16 +161,36 @@ pub fn build_plan(
         .chain(cfg.categorical_qis.iter().cloned())
         .collect();
 
-    // ── Group 1: preprocess, on the AO ───────────────────────────────────────
-    // Suppression first and on the orchestrator: a dropped column is a column
-    // that never reaches a container at all, which is a stronger property than
-    // dropping it later would give.
+    // ── Group 0: staging, on the AO ──────────────────────────────────────────
+    // Cleaning and suppression are the orchestrator's, and for different
+    // reasons. Cleaning decides the row set, so it has to settle before
+    // anything is chunked or the row ranges in the manifest describe a dataset
+    // that no longer exists. Suppression drops whole columns, and doing it here
+    // means those columns never reach a container at all.
+    //
+    // Nothing else stays: masking, charcloak and tokenisation are ordinary
+    // column transforms and belong in a worker.
+    let mut stage_ops = Vec::new();
+    let mut stage_cols: Vec<String> = Vec::new();
+    if cfg.cleaning.enabled {
+        stage_ops.push("clean:*".to_string());
+        for c in &cfg.cleaning.required_columns {
+            stage_ops.push(format!("require_non_null:{c}"));
+            push_unique(&mut stage_cols, c);
+        }
+        for c in &cfg.cleaning.numeric_columns {
+            stage_ops.push(format!("coerce_numeric:{c}"));
+            push_unique(&mut stage_cols, c);
+        }
+    }
+    for c in &cfg.suppress {
+        stage_ops.push(format!("suppress:{c}"));
+        push_unique(&mut stage_cols, c);
+    }
+
+    // ── Group 1: preprocess, dispatched ──────────────────────────────────────
     let mut pre_ops = Vec::new();
     let mut pre_cols: Vec<String> = Vec::new();
-    for c in &cfg.suppress {
-        pre_ops.push(format!("suppress:{c}"));
-        push_unique(&mut pre_cols, c);
-    }
     for c in &masking_cols {
         pre_ops.push(format!("masking:{c}"));
         push_unique(&mut pre_cols, c);
@@ -217,6 +247,30 @@ pub fn build_plan(
                 &format!("'{c}' is dropped before the crypto block runs — remove it from one of them"),
             ));
         }
+        if pre_cols.iter().any(|x| x == c) {
+            return Err(validation(
+                "PLAN_COLUMN_CONFLICT",
+                "A column is both suppressed and sent to the preprocess block",
+                &format!(
+                    "'{c}' is dropped during staging, before any container runs — \
+                     remove it from one of them"
+                ),
+            ));
+        }
+    }
+
+    // Cleaning reads columns the staging pass must still have in hand.
+    for c in cfg.cleaning.required_columns.iter().chain(cfg.cleaning.numeric_columns.iter()) {
+        if cfg.suppress.iter().any(|s| s == c) {
+            return Err(validation(
+                "PLAN_COLUMN_CONFLICT",
+                "A column used by cleaning is also suppressed",
+                &format!(
+                    "'{c}' — staging cleans before it suppresses, so this works, but the \
+                     intent is ambiguous enough to be worth stating explicitly"
+                ),
+            ));
+        }
     }
 
     // Hashing or encrypting a QI destroys the ordering and the domain the
@@ -243,20 +297,35 @@ pub fn build_plan(
     if let Some(cols) = header {
         let known: BTreeSet<&String> = cols.iter().collect();
         let mut missing = Vec::new();
-        for c in pre_cols.iter().chain(crypto_cols.iter()).chain(qi_cols.iter()) {
+        for c in stage_cols.iter().chain(pre_cols.iter()).chain(crypto_cols.iter()).chain(qi_cols.iter()) {
             if !known.contains(c) && c != DEFAULT_ROW_ID_COLUMN {
                 push_unique(&mut missing, c);
             }
         }
         if !missing.is_empty() {
+            // The most likely cause is passing an already-staged file: planning
+            // happens before staging, because the plan is what decides which
+            // columns staging suppresses.
+            let suppressed_and_missing: Vec<&String> =
+                missing.iter().filter(|c| cfg.suppress.contains(c)).collect();
+            let hint = if suppressed_and_missing.is_empty() {
+                "check the column names against the dataset header — they are case-sensitive"
+            } else {
+                "these are all suppressed columns, so this looks like a staged file — \
+                 plan against the RAW input, since the plan is what tells staging to drop them"
+            };
             return Err(validation(
                 "PLAN_COLUMN_MISSING",
                 "The config targets columns that are not in the dataset",
-                &format!("{}", missing.join(", ")),
+                &format!("{} — {hint}", missing.join(", ")),
             ));
         }
-        let touched: BTreeSet<&String> =
-            pre_cols.iter().chain(crypto_cols.iter()).chain(qi_cols.iter()).collect();
+        let touched: BTreeSet<&String> = stage_cols
+            .iter()
+            .chain(pre_cols.iter())
+            .chain(crypto_cols.iter())
+            .chain(qi_cols.iter())
+            .collect();
         for c in cols {
             if c != &cfg.output_path && !touched.contains(c) && c != DEFAULT_ROW_ID_COLUMN {
                 passthrough.push(c.clone());
@@ -267,11 +336,33 @@ pub fn build_plan(
     // ── Assemble ─────────────────────────────────────────────────────────────
     let mut groups = Vec::new();
 
+    if !stage_ops.is_empty() {
+        groups.push(BlockGroup {
+            block: "stage".to_string(),
+            order: 0,
+            columns: stage_cols.clone(),
+            operations: stage_ops,
+            // One pass over the whole file on the orchestrator. It could be
+            // parallelised, but it has to finish before row ranges exist at
+            // all, so there is nothing yet to parallelise against.
+            row_parallel: false,
+            row_parallel_note: Some(
+                "cleaning decides the row set, so it must complete before the dataset is \
+                 chunked — there are no row ranges to fan out over until it has"
+                    .to_string(),
+            ),
+            runs_on: "orchestrator".to_string(),
+            container_role: None,
+            phase: "stage".to_string(),
+            stages: vec![],
+        });
+    }
+
     if !pre_ops.is_empty() {
-        // Tokenization allocates sequential ids from a shared vault. Two row
-        // shards of one tokenized column would each start from their own
-        // counter and mint the same token for different values. Column sharding
-        // is safe (each column goes to one place); row sharding is not.
+        // Tokenisation allocates sequential ids from a shared vault. Two row
+        // shards of one tokenised column would each start from their own
+        // counter and mint the same token for different values, so the column
+        // may be split by column but never by row.
         let tokenized = !token_cols.is_empty();
         groups.push(BlockGroup {
             block: "preprocess".to_string(),
@@ -281,14 +372,15 @@ pub fn build_plan(
             row_parallel: !tokenized,
             row_parallel_note: tokenized.then(|| {
                 format!(
-                    "tokenization allocates sequential ids from a shared vault ({}) — \
-                     run row shards of these columns serially, or give each tokenized column \
-                     its own single-shard group",
+                    "tokenisation allocates sequential ids from a shared vault ({}) — \
+                     give each tokenised column a single shard covering all its rows. \
+                     The vault comes back as an artifact and belongs in the TEE.",
                     token_cols.join(", ")
                 )
             }),
-            runs_on: "orchestrator".to_string(),
-            image: Some(IMAGE_PREPROCESS.to_string()),
+            runs_on: "container".to_string(),
+            container_role: Some(ROLE_PREPROCESS.to_string()),
+            phase: "preprocess".to_string(),
             stages: vec![],
         });
     }
@@ -304,7 +396,8 @@ pub fn build_plan(
             row_parallel: true,
             row_parallel_note: None,
             runs_on: "container".to_string(),
-            image: Some(IMAGE_CRYPTO.to_string()),
+            container_role: Some(ROLE_CRYPTO.to_string()),
+            phase: "preprocess".to_string(),
             stages: vec![],
         });
     }
@@ -321,23 +414,35 @@ pub fn build_plan(
             row_parallel: true,
             row_parallel_note: None,
             runs_on: "container".to_string(),
-            image: Some(IMAGE_KANON.to_string()),
+            container_role: Some(ROLE_KANON.to_string()),
+            phase: "measure+apply".to_string(),
+            // `solve` is absent on purpose: it reduces scan artifacts and runs
+            // on the orchestrator. See the note below.
             stages: if cfg.pass == "pass1" {
-                vec!["scan".to_string(), "solve".to_string()]
+                vec!["scan".to_string()]
             } else {
-                vec!["scan".to_string(), "solve".to_string(), "apply".to_string()]
+                vec!["scan".to_string(), "apply".to_string()]
             },
         });
         notes.push(
-            "kanon row shards fan out for 'scan' and 'apply'; 'solve' is a single reduce over \
-             every scan artifact. Never split the QI columns across shards."
+            "kanon row shards fan out for 'scan' (the measure phase) and 'apply'. Never split \
+             the QI columns across shards — k-anonymity over part of the tuple is a different \
+             and weaker guarantee than the one the job asked for."
+                .to_string(),
+        );
+        notes.push(
+            "'solve' runs on the orchestrator, not in a container: it reduces the scan artifacts \
+             and searches the lattice over a histogram, never over rows. Keeping it here means no \
+             container is held open across the user's choice of k — the measure containers exit \
+             at the barrier and the apply containers are not started until the choice is made."
                 .to_string(),
         );
         if cfg.pass == "pass1" {
             notes.push(
-                "pass1 stops after 'solve' and persists artifacts/histogram.json. To run pass 2, \
-                 set pass=pass2 and k in the config and re-run 'solve' with an empty 'inputs' — \
-                 it reuses the histogram and never re-reads the data."
+                "pass1 ends at the measure barrier and persists artifacts/histogram.json. The \
+                 k x suppression_limit table comes from `skald_ao grid` against that file, costs \
+                 no container time, and can be recomputed for any axes the UI asks for. Pass 2 is \
+                 `skald_ao solve` over the same file, then the apply phase."
                     .to_string(),
             );
         }
@@ -346,9 +451,17 @@ pub fn build_plan(
     }
 
     let mut multi_block_columns = Vec::new();
-    let all: BTreeSet<&String> = pre_cols.iter().chain(crypto_cols.iter()).chain(qi_cols.iter()).collect();
+    let all: BTreeSet<&String> = stage_cols
+        .iter()
+        .chain(pre_cols.iter())
+        .chain(crypto_cols.iter())
+        .chain(qi_cols.iter())
+        .collect();
     for c in all {
         let mut blocks = Vec::new();
+        if stage_cols.contains(c) {
+            blocks.push("stage".to_string());
+        }
         if pre_cols.contains(c) {
             blocks.push("preprocess".to_string());
         }

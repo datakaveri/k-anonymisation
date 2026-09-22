@@ -55,6 +55,63 @@ pub struct FreeTextAnonymizationConfig {
     pub staged_input_path: Option<PathBuf>,
 }
 
+/// Data cleaning, applied on the orchestrator before anything is chunked.
+///
+/// This is not an anonymisation technique and deliberately sits apart from the
+/// `preprocess` operations: it is the "is this data even usable" pass — missing
+/// value sentinels normalised to one representation, whitespace settled,
+/// unusable rows dropped.
+///
+/// It runs on the AO rather than in a container for two reasons. Dropping a row
+/// changes every row range downstream, so it has to happen before chunking or
+/// the chunk manifest describes a dataset that no longer exists. And a missing
+/// value that reaches k-anonymisation as the literal string `"N/A"` becomes its
+/// own quasi-identifier value, splitting equivalence classes that should have
+/// merged and silently costing utility.
+#[derive(Debug, Clone)]
+pub struct CleaningConfig {
+    pub enabled: bool,
+    /// Values treated as missing, compared case-insensitively after trimming.
+    pub null_tokens: Vec<String>,
+    /// What a missing value is rewritten to. Empty string by default, which is
+    /// what the rest of the pipeline already treats as absent.
+    pub null_replacement: String,
+    pub trim: bool,
+    /// Collapse runs of internal whitespace to a single space.
+    pub collapse_whitespace: bool,
+    /// Drop a row when every field is missing.
+    pub drop_all_empty_rows: bool,
+    /// Drop a row when any of these columns is missing.
+    pub required_columns: Vec<String>,
+    /// Columns that must parse as a number; non-numeric values become missing.
+    pub numeric_columns: Vec<String>,
+    /// Refuse the job when more than this fraction of rows would be dropped.
+    /// A cleaning step that silently discards half the dataset has changed the
+    /// answer, not tidied the input.
+    pub max_dropped_fraction: f64,
+}
+
+impl Default for CleaningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            null_tokens: [
+                "", "na", "n/a", "n.a.", "null", "nil", "none", "nan", "-", "--", "?", "unknown",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            null_replacement: String::new(),
+            trim: true,
+            collapse_whitespace: true,
+            drop_all_empty_rows: true,
+            required_columns: Vec::new(),
+            numeric_columns: Vec::new(),
+            max_dropped_fraction: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub enable_k_anonymity: bool,
@@ -99,6 +156,9 @@ pub struct RuntimeConfig {
     pub restore_sheets: bool,
     /// Optional free-text anonymization handoff.
     pub free_text_anonymization: FreeTextAnonymizationConfig,
+    /// Orchestrator-side data cleaning. Ignored by the monolith, which has no
+    /// separate staging step; consumed by `skald_ao stage`.
+    pub cleaning: CleaningConfig,
     /// When true, delete leftover files from a previous run out of `output/`
     /// before this run starts (key material and the active log are kept).
     /// Defaults to false — stale files are only reported, never removed.
@@ -644,6 +704,8 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
     };
     let clean_output = section.get("clean_output").and_then(Value::as_bool).unwrap_or(false);
 
+    let cleaning = parse_cleaning_config(section);
+
     Ok(RuntimeConfig {
         enable_k_anonymity: has_k_anonymize && has_qis,
         pass,
@@ -673,8 +735,54 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         sheet_joins,
         restore_sheets,
         free_text_anonymization,
+        cleaning,
         clean_output,
     })
+}
+
+/// Parses the optional `cleaning` section.
+///
+/// Absent means disabled: cleaning changes the row set, so it is never applied
+/// to a job that did not ask for it.
+fn parse_cleaning_config(section: &Value) -> CleaningConfig {
+    let Some(obj) = section.get("cleaning") else {
+        return CleaningConfig::default();
+    };
+    let d = CleaningConfig::default();
+    let strings = |key: &str, fallback: Vec<String>| -> Vec<String> {
+        obj.get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or(fallback)
+    };
+    CleaningConfig {
+        enabled: obj.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        null_tokens: strings("null_tokens", d.null_tokens)
+            .into_iter()
+            .map(|t| t.trim().to_lowercase())
+            .collect(),
+        null_replacement: obj
+            .get("null_replacement")
+            .and_then(Value::as_str)
+            .unwrap_or(&d.null_replacement)
+            .to_string(),
+        trim: obj.get("trim").and_then(Value::as_bool).unwrap_or(d.trim),
+        collapse_whitespace: obj
+            .get("collapse_whitespace")
+            .and_then(Value::as_bool)
+            .unwrap_or(d.collapse_whitespace),
+        drop_all_empty_rows: obj
+            .get("drop_all_empty_rows")
+            .and_then(Value::as_bool)
+            .unwrap_or(d.drop_all_empty_rows),
+        required_columns: strings("required_columns", d.required_columns),
+        numeric_columns: strings("numeric_columns", d.numeric_columns),
+        max_dropped_fraction: obj
+            .get("max_dropped_fraction")
+            .and_then(Value::as_f64)
+            .unwrap_or(d.max_dropped_fraction)
+            .clamp(0.0, 1.0),
+    }
 }
 
 /// Files in `output/` a run must never delete: the log it is currently writing,
