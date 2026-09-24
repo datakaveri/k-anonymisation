@@ -15,6 +15,7 @@ use crate::pipeline::connectors::{postgres as pg, DataSink, DataSource};
 use crate::pipeline::multitabular::{
     resolve_pipeline_input, write_output_in_format, write_restored_workbook, InputFormat, SheetRestorePlan,
 };
+use crate::pipeline::fhir_bundle;
 use crate::pipeline::nested_json;
 use crate::pipeline::preprocess::preprocess_chunks;
 use serde_json::json;
@@ -90,6 +91,10 @@ pub fn run_pipeline_with(paths: &Paths) -> Result<StatusPayload, PipelineError> 
     // flatten a single subject into a single row and search a lattice over it.
     if cfg.nested_json.enabled {
         return run_nested_json(&mut log, &cfg, paths, &log_file);
+    }
+    // Same shape of flow for FHIR Bundles, one per patient.
+    if cfg.fhir_bundle.enabled {
+        return run_fhir_bundle(&mut log, &cfg, paths, &log_file);
     }
 
     let pass = cfg.pass.clone();
@@ -731,6 +736,88 @@ fn run_nested_json(
             "paths_kept": report.paths_kept,
             "k_anonymity_applied": false,
             "hash_salt_created": report.salt_created,
+        })),
+        error: None,
+        log_file: log_file.to_string(),
+    })
+}
+
+/// Runs the FHIR Bundle de-identification flow and builds its status payload.
+///
+/// Reports the propagation sweep's hits and the dropped resources alongside the
+/// census: both are places the policy changed the bundle beyond what its path
+/// rules say, and a reviewer needs to see how often that happened.
+fn run_fhir_bundle(
+    log: &mut Logger,
+    cfg: &RuntimeConfig,
+    paths: &Paths,
+    log_file: &str,
+) -> Result<StatusPayload, PipelineError> {
+    log.info(
+        "fhir-bundle",
+        &format!(
+            "FHIR Bundle de-identification: {} path rule(s), {} code rule(s), default_action={:?} — \
+             one bundle per patient, so the k-anonymity flow is not run",
+            cfg.fhir_bundle.rules.len(),
+            cfg.fhir_bundle.code_rules.len() + cfg.fhir_bundle.coding_rules.len(),
+            cfg.fhir_bundle.default_action,
+        ),
+    );
+
+    let mut fhir = cfg.fhir_bundle.clone();
+    fhir.key_material_dir = PathBuf::from(&cfg.output_directory);
+    let report = fhir_bundle::run(&fhir, &paths.root)?;
+
+    for (name, why) in &report.files_skipped {
+        log.warn("fhir-bundle", &format!("skipped {name}: {why}"));
+    }
+    if report.salts_created > 0 {
+        log.info(
+            "fhir-bundle",
+            &format!(
+                "Generated {} new column salt(s) in {} ({} column(s) in total) — back it up with the run's \
+                 other key material; later runs reuse it so ids and pseudonyms match this run's",
+                report.salts_created,
+                report.salt_path.display(),
+                report.salt_columns,
+            ),
+        );
+    }
+    log.info(
+        "fhir-bundle",
+        &format!(
+            "{}{} bundle(s) examined, {} written to {}; {} path(s) seen, {} released as-is; \
+             {} resource(s) dropped by code rules, {} leaf value(s) suppressed by the propagation sweep — review {}",
+            if report.dry_run { "DRY RUN — " } else { "" },
+            report.documents_examined,
+            report.files_written,
+            report.output_dir.display(),
+            report.paths_seen,
+            report.paths_kept,
+            report.resources_dropped,
+            report.propagated,
+            report.census_path.display(),
+        ),
+    );
+
+    Ok(StatusPayload {
+        status: "ok".to_string(),
+        phase: Some("done".to_string()),
+        outputs: Some(json!({
+            "mode": if report.dry_run { "fhir_bundle_dry_run" } else { "fhir_bundle_deidentification" },
+            "dry_run": report.dry_run,
+            "documents_examined": report.documents_examined,
+            "documents_written": report.files_written,
+            "documents_skipped": report.files_skipped.len(),
+            "output_directory": report.output_dir.display().to_string(),
+            "key_census": report.census_path.display().to_string(),
+            "paths_seen": report.paths_seen,
+            "paths_kept": report.paths_kept,
+            "resources_dropped": report.resources_dropped,
+            "propagation_suppressed": report.propagated,
+            "k_anonymity_applied": false,
+            "hash_salts_created": report.salts_created,
+            "hash_salt_columns": report.salt_columns,
         })),
         error: None,
         log_file: log_file.to_string(),

@@ -79,13 +79,19 @@ pub enum Action {
     /// technique with no tabular counterpart — the tabular flow generalizes
     /// numbers and categorical hierarchies, and never parses a date.
     GeneralizeDate { month: bool },
+    /// `free_text`: released unchanged because the NER pipeline has already
+    /// anonymized it upstream, before the document reached SKALD. Behaves like
+    /// `Keep`, but is labelled apart in the census so a reviewer can tell
+    /// "cleared by policy" from "trusted to an upstream pass".
+    FreeText,
 }
 
 impl Action {
     /// The config key this action came from, for the census report.
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Action::Keep => "keep".into(),
+            Action::FreeText => "free_text".into(),
             Action::Suppress => "suppress".into(),
             Action::Masking { .. } => "masking".into(),
             Action::Hash => "hashing_with_salt".into(),
@@ -100,7 +106,7 @@ impl Action {
 /// Parses `default_action`, which can only be one of the two techniques that
 /// need no parameters — the fallback applies to paths nobody has named, and
 /// masking or generalizing an unknown field is not meaningful.
-fn parse_action(raw: &str) -> Option<Action> {
+pub(crate) fn parse_action(raw: &str) -> Option<Action> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "keep" => Some(Action::Keep),
         "suppress" | "drop" => Some(Action::Suppress),
@@ -142,13 +148,13 @@ struct Specificity {
 /// Tie-break when two equally narrow patterns both match: the more protective
 /// action wins. With `suppress` outranking `keep`, an accidental overlap fails
 /// closed rather than releasing a value.
-fn privacy_rank(a: &Action) -> u8 {
+pub(crate) fn privacy_rank(a: &Action) -> u8 {
     match a {
         Action::Suppress => 5,
         Action::Masking { .. } => 4,
         Action::Hash => 3,
         Action::GeneralizeSize { .. } | Action::GeneralizeDate { .. } => 2,
-        Action::Keep => 1,
+        Action::Keep | Action::FreeText => 1,
     }
 }
 
@@ -162,7 +168,11 @@ enum Segment {
 
 impl Rule {
     pub fn new(pattern: &str, action: Action) -> Rule {
-        let segments: Vec<Segment> = pattern
+        // Census paths print array indices glued to their key (`name[].text`),
+        // so accept that spelling too and a row can be pasted back as a rule.
+        let normalised = pattern.replace("[]", ".[]").replace("..[]", ".[]");
+        let segments: Vec<Segment> = normalised
+            .trim_start_matches('.')
             .split('.')
             .map(|s| {
                 if s == "**" {
@@ -321,14 +331,46 @@ pub fn parse_nested_json(section: &Value) -> Result<NestedJsonConfig, PipelineEr
         })?;
     }
 
+    let (rules, masking) = parse_policy_rules(section)?;
+    cfg.rules = rules;
+    cfg.masking = masking;
+
+    if cfg.input_path.is_none() {
+        return Err(validation(
+            "CONFIG_INVALID_VALUE",
+            "nested_json requires 'input_path'",
+            "Point it at a .json file or a directory of them",
+        ));
+    }
+    if cfg.rules.is_empty() && cfg.default_action == Action::Suppress {
+        return Err(validation(
+            "CONFIG_INVALID_VALUE",
+            "this policy would suppress every field",
+            "default_action is 'suppress' and no patterns were given",
+        ));
+    }
+
+    Ok(cfg)
+}
+
+/// Reads the technique buckets every per-document flow shares — `keep`,
+/// `suppress`, `hashing_with_salt`, `free_text`, `masking`, `size` and
+/// `qi_constraints` — into one rule set. The FHIR bundle flow reads its policy
+/// through this too, so a pattern means the same thing in either flow.
+pub(crate) fn parse_policy_rules(
+    section: &Value,
+) -> Result<(Vec<Rule>, Vec<MaskingConfigLite>), PipelineError> {
+    let mut rules = Vec::new();
+    let mut masking = Vec::new();
     // Techniques that take a plain list of targets, as in the tabular config.
     for (key, action) in [
         ("keep", Action::Keep),
         ("suppress", Action::Suppress),
         ("hashing_with_salt", Action::Hash),
+        ("free_text", Action::FreeText),
     ] {
         for pattern in string_list(section.get(key), key)? {
-            cfg.rules.push(Rule::new(&pattern, action.clone()));
+            rules.push(Rule::new(&pattern, action.clone()));
         }
     }
 
@@ -357,8 +399,8 @@ pub fn parse_nested_json(section: &Value) -> Result<NestedJsonConfig, PipelineEr
                     ),
                 ));
             }
-            cfg.rules.push(Rule::new(&spec.column.clone(), Action::Masking { spec: cfg.masking.len() }));
-            cfg.masking.push(spec);
+            rules.push(Rule::new(&spec.column.clone(), Action::Masking { spec: masking.len() }));
+            masking.push(spec);
         }
     }
 
@@ -372,7 +414,7 @@ pub fn parse_nested_json(section: &Value) -> Result<NestedJsonConfig, PipelineEr
                     &format!("{pattern}: {v}"),
                 )
             })?;
-            cfg.rules.push(Rule::new(pattern, Action::GeneralizeSize { size: size as u32 }));
+            rules.push(Rule::new(pattern, Action::GeneralizeSize { size: size as u32 }));
         }
     }
 
@@ -393,26 +435,11 @@ pub fn parse_nested_json(section: &Value) -> Result<NestedJsonConfig, PipelineEr
                     ))
                 }
             };
-            cfg.rules.push(Rule::new(pattern, Action::GeneralizeDate { month }));
+            rules.push(Rule::new(pattern, Action::GeneralizeDate { month }));
         }
     }
 
-    if cfg.input_path.is_none() {
-        return Err(validation(
-            "CONFIG_INVALID_VALUE",
-            "nested_json requires 'input_path'",
-            "Point it at a .json file or a directory of them",
-        ));
-    }
-    if cfg.rules.is_empty() && cfg.default_action == Action::Suppress {
-        return Err(validation(
-            "CONFIG_INVALID_VALUE",
-            "this policy would suppress every field",
-            "default_action is 'suppress' and no patterns were given",
-        ));
-    }
-
-    Ok(cfg)
+    Ok((rules, masking))
 }
 
 /// A technique bucket holding a list of path globs.
@@ -441,7 +468,7 @@ fn string_list(v: Option<&Value>, key: &str) -> Result<Vec<String>, PipelineErro
 
 // ── Value transforms ─────────────────────────────────────────────────────────
 
-fn hash_token(salt: &str, value: &str) -> String {
+pub(crate) fn hash_token(salt: &str, value: &str) -> String {
     let mut h = Sha256::new();
     h.update(salt.as_bytes());
     h.update(value.as_bytes());
@@ -543,6 +570,17 @@ fn four_digit_year(s: &str) -> Option<i64> {
 
 /// Applies one action to one leaf. `None` means "remove this key".
 fn apply(action: &Action, value: &Value, cfg: &NestedJsonConfig, salt: &str) -> Option<Value> {
+    apply_action(action, value, &cfg.masking, salt)
+}
+
+/// [`apply`] against a bare list of masking specs, for flows that hold their
+/// policy in a config type of their own.
+pub(crate) fn apply_action(
+    action: &Action,
+    value: &Value,
+    masking: &[MaskingConfigLite],
+    salt: &str,
+) -> Option<Value> {
     let as_text = match value {
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
@@ -557,13 +595,13 @@ fn apply(action: &Action, value: &Value, cfg: &NestedJsonConfig, salt: &str) -> 
     let fallback = || None;
 
     match action {
-        Action::Keep => Some(value.clone()),
+        Action::Keep | Action::FreeText => Some(value.clone()),
         Action::Suppress => None,
         Action::Masking { spec } => {
             if empty {
                 return Some(value.clone());
             }
-            let spec = cfg.masking.get(*spec)?;
+            let spec = masking.get(*spec)?;
             Some(Value::String(apply_masking_value(&as_text, spec, &randomize_preserving_class)))
         }
         _ if empty => Some(value.clone()),
@@ -606,9 +644,22 @@ pub struct Census {
 
 impl Census {
     fn record(&mut self, path: &str, value: &Value, action: &Action, matched_by: &str) {
+        self.record_as(path, value, &action.label(), matched_by, matches!(action, Action::Keep));
+    }
+
+    /// Records one leaf under an explicit action label. `may_sample` must be
+    /// false for anything but a value released as-is — see below.
+    pub(crate) fn record_as(
+        &mut self,
+        path: &str,
+        value: &Value,
+        label: &str,
+        matched_by: &str,
+        may_sample: bool,
+    ) {
         let stat = self.stats.entry(path.to_string()).or_default();
         stat.seen += 1;
-        stat.action = action.label();
+        stat.action = label.to_string();
         stat.matched_by = matched_by.to_string();
         let text = match value {
             Value::String(s) => s.clone(),
@@ -620,7 +671,7 @@ impl Census {
             // Only ever sample a value the policy is keeping. An example drawn
             // from a suppressed path would put the exact PII under discussion
             // into a report that then gets shared around to tune the rules.
-            if stat.example.is_empty() && matches!(action, Action::Keep) {
+            if stat.example.is_empty() && may_sample {
                 stat.example = text.chars().take(40).collect();
             }
         }
@@ -650,7 +701,7 @@ impl Census {
         let mut v: Vec<(&str, usize)> = self
             .stats
             .iter()
-            .filter(|(_, s)| s.action == "keep")
+            .filter(|(_, s)| s.action == "keep" || s.action == "free_text")
             .map(|(k, s)| (k.as_str(), s.seen))
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
@@ -702,9 +753,15 @@ pub fn write_census(census: &Census, path: &Path) -> Result<(), PipelineError> {
 /// without being written twice. The full path is tried first, so an explicit
 /// `**.logos_present.[]` still takes precedence.
 fn decide<'a>(cfg: &'a NestedJsonConfig, path: &[String]) -> (&'a Action, &'a str) {
+    decide_in(&cfg.rules, &cfg.default_action, path)
+}
+
+/// [`decide`] over a bare rule set and fallback. `path` segments must already
+/// be lowercased, with array indices as `[]`.
+pub(crate) fn decide_in<'a>(rules: &'a [Rule], default: &'a Action, path: &[String]) -> (&'a Action, &'a str) {
     let pick = |p: &[String]| -> Option<&'a Rule> {
         let mut best: Option<&'a Rule> = None;
-        for rule in &cfg.rules {
+        for rule in rules {
             if !rule.matches(p) {
                 continue;
             }
@@ -728,11 +785,11 @@ fn decide<'a>(cfg: &'a NestedJsonConfig, path: &[String]) -> (&'a Action, &'a st
             return (&rule.action, rule.pattern.as_str());
         }
     }
-    (&cfg.default_action, "<default>")
+    (default, "<default>")
 }
 
 /// Renders match segments as a display path: `pages[].extracted_data.patient_name`.
-fn display_path(segments: &[String]) -> String {
+pub(crate) fn display_path(segments: &[String]) -> String {
     let mut out = String::new();
     for seg in segments {
         if seg == "[]" {
@@ -838,7 +895,7 @@ pub struct RunReport {
 }
 
 /// Every `*.json` directly under `dir`, sorted by name for deterministic output.
-fn json_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
+pub(crate) fn json_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
     let mut out = Vec::new();
     let entries =
         fs::read_dir(dir).map_err(|e| io_err("scan nested JSON directory", &dir.display().to_string(), e))?;

@@ -45,7 +45,7 @@ pub(super) fn generate_random_key_hex() -> String {
 ///
 /// # Returns
 /// A 64-character lowercase hexadecimal string.
-pub(super) fn generate_random_salt_hex() -> String {
+pub(crate) fn generate_random_salt_hex() -> String {
     use std::io::Read;
     let mut buf = [0u8; 32];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -61,7 +61,7 @@ pub(super) fn generate_random_salt_hex() -> String {
 ///
 /// # Arguments
 /// * `input` — the plaintext string to hash.
-pub(super) fn hash_hex(input: &str) -> String {
+pub(crate) fn hash_hex(input: &str) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(input.as_bytes());

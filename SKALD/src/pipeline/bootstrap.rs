@@ -103,6 +103,9 @@ pub struct RuntimeConfig {
     /// Nested-JSON de-identification. When enabled this replaces the tabular
     /// flow outright rather than feeding it — see `nested_json`'s module docs.
     pub nested_json: crate::pipeline::nested_json::NestedJsonConfig,
+    /// FHIR Bundle de-identification. Like `nested_json`, replaces the tabular
+    /// flow outright — see `fhir_bundle`'s module docs.
+    pub fhir_bundle: crate::pipeline::fhir_bundle::FhirBundleConfig,
     /// When true, delete leftover files from a previous run out of `output/`
     /// before this run starts (key material and the active log are kept).
     /// Defaults to false — stale files are only reported, never removed.
@@ -692,6 +695,14 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         FreeTextAnonymizationConfig { enabled, columns, staged_input_path }
     };
     let nested_json = crate::pipeline::nested_json::parse_nested_json(section)?;
+    let fhir_bundle = crate::pipeline::fhir_bundle::parse_fhir_bundle(section)?;
+    if nested_json.enabled && fhir_bundle.enabled {
+        return Err(validation(
+            "CONFIG_INVALID_VALUE",
+            "nested_json and fhir_bundle are both enabled",
+            "They are separate flows over different input shapes — enable one per config",
+        ));
+    }
     let clean_output = section.get("clean_output").and_then(Value::as_bool).unwrap_or(false);
 
     // A sink that names no connection of its own writes back to the database
@@ -734,6 +745,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         restore_sheets,
         free_text_anonymization,
         nested_json,
+        fhir_bundle,
         clean_output,
         input_source,
         output_sink,

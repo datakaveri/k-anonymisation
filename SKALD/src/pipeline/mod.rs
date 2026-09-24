@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod cli;
 pub mod connectors;
 pub mod entry;
+pub mod fhir_bundle;
 pub mod multitabular;
 pub mod nested_json;
 pub mod pipeline;
