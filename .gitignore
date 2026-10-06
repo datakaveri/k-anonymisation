@@ -80,4 +80,5 @@ fhir_anonymizer/
 
 run_supp0/
 data/nha/
+data/nha_fhir/
 dist/
