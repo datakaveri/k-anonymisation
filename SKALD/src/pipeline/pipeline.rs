@@ -696,6 +696,17 @@ fn run_nested_json(
             ),
         );
     }
+    if !report.key_files.is_empty() {
+        let files: Vec<String> = report.key_files.iter().map(|p| p.display().to_string()).collect();
+        log.info(
+            "nested-json",
+            &format!(
+                "Token vault / encryption keys at {} — anyone holding them can recover the original \
+                 values, so keep them apart from the released documents",
+                files.join(", "),
+            ),
+        );
+    }
     if report.dry_run {
         log.info(
             "nested-json",
@@ -736,6 +747,7 @@ fn run_nested_json(
             "paths_kept": report.paths_kept,
             "k_anonymity_applied": false,
             "hash_salt_created": report.salt_created,
+            "key_material_files": report.key_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         })),
         error: None,
         log_file: log_file.to_string(),

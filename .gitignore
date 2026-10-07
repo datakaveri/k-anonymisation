@@ -27,6 +27,7 @@ SKALD/target/
 # to output/nha/, which is already ignored.
 data/nha/
 data/nha_fhir/
+data/mharisadak/
 
 # Runtime generated folders/files
 chunks/

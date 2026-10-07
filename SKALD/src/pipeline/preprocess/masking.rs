@@ -20,14 +20,14 @@ use serde_json::Value;
 ///
 /// Tokenization replaces original values with opaque sequential tokens of the
 /// form `<prefix><zero-padded-id>`, preserving a reversible vault mapping.
-#[derive(Debug)]
-pub(super) struct TokenizationConfigLite {
+#[derive(Debug, Clone)]
+pub(crate) struct TokenizationConfigLite {
     /// Target CSV column name.
-    pub(super) column: String,
+    pub(crate) column: String,
     /// Token prefix string (default: `"TK-"`).
-    pub(super) prefix: String,
+    pub(crate) prefix: String,
     /// Number of zero-padded digits in the token suffix (default: `6`).
-    pub(super) digits: usize,
+    pub(crate) digits: usize,
 }
 
 /// Parses a single tokenization config entry from the pipeline JSON.
@@ -38,7 +38,7 @@ pub(super) struct TokenizationConfigLite {
 /// # Errors
 /// Returns [`PipelineError`] with code `PREPROCESS_CONFIG_INVALID` if the
 /// entry is not an object, `"column"` is missing, or `"digits"` is ≤ 0.
-pub(super) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationConfigLite, PipelineError> {
+pub(crate) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationConfigLite, PipelineError> {
     let obj = entry
         .as_object()
         .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "Each tokenization entry must be an object", "tokenization"))?;
@@ -62,12 +62,12 @@ pub(super) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationCon
 /// Supports both pseudo-encryption (XOR keystream, `format_preserving: false`)
 /// and format-preserving general encryption (`format_preserving: true`).
 #[derive(Debug)]
-pub(super) struct EncryptConfigLite {
+pub(crate) struct EncryptConfigLite {
     /// Target CSV column name.
-    pub(super) column: String,
+    pub(crate) column: String,
     /// `true` → use [`format_preserving_encrypt_general`]; `false` → use
     /// [`pseudo_encrypt`] (XOR keystream, hex output with `"ENC$"` prefix).
-    pub(super) format_preserving: bool,
+    pub(crate) format_preserving: bool,
 }
 
 /// Parses a single encrypt config entry from the pipeline JSON.
@@ -79,7 +79,7 @@ pub(super) struct EncryptConfigLite {
 /// # Errors
 /// Returns [`PipelineError`] with code `PREPROCESS_CONFIG_INVALID` for
 /// malformed entries.
-pub(super) fn parse_encrypt_config(entry: &Value) -> Result<EncryptConfigLite, PipelineError> {
+pub(crate) fn parse_encrypt_config(entry: &Value) -> Result<EncryptConfigLite, PipelineError> {
     if let Some(col) = entry.as_str() {
         return Ok(EncryptConfigLite { column: col.to_string(), format_preserving: false });
     }

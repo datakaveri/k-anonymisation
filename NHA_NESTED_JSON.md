@@ -82,20 +82,31 @@ flow beside it.
 
 ## Actions
 
-| Action | Effect |
+Each action is a config key of the section, holding path patterns — the
+tabular technique keys, with globs in place of column names.
+
+| Config key | Effect |
 |---|---|
 | `keep` | Value passes through unchanged |
 | `suppress` | Key removed from its parent object entirely |
-| `redact` | Key kept, non-empty value replaced with `redaction_placeholder` |
-| `hash` | Stable salted SHA-256 token (16 hex chars) — pseudonym, keeps linkage |
-| `age_band:N` | `"49Y"` → `"45-49"`; `90+` collapses to one band |
-| `date_month` / `date_year` | `"21-Apr-2025 03:11 PM"` → `"2025-04"` / `"2025"` |
-| `truncate:N` | Keep the leading N characters |
+| `hashing_with_salt` | Stable salted SHA-256 token (16 hex chars) — pseudonym, keeps linkage |
+| `masking` | Tabular masking entries (`column` = pattern): positions, regex, or class |
+| `charcloak` | Each letter/digit replaced by a random one of its class, punctuation kept — not stable across values or runs |
+| `tokenization` | `{"column", "prefix", "digits"}` → `PH-000001`; same value, same token; reversible through the vault |
+| `encrypt` | `"pattern"` → hex ciphertext, or `{"pattern": {"format_preserving": true}}` → same length and character classes; deterministic, reversible with the key |
+| `size` | `{"pattern": N}`: `"49Y"` → `"45-49"`; `90+` collapses to one band |
+| `qi_constraints` | `{"pattern": {"precision": "month"\|"year"}}`: `"21-Apr-2025 03:11 PM"` → `"2025-04"` / `"2025"` |
+| `free_text` | Passed through, labelled as cleared by an upstream NER pass |
+
+`hashing_without_salt` and `fpe` are refused when non-empty: an unsalted hash
+of a phone number is reversed by hashing every candidate, and `fpe` is
+`encrypt` with `format_preserving`. Null and empty values pass through every
+technique unchanged.
 
 Messy real values are handled: ages arrive as `49Y`, `18 Years`,
 `24 Yrs./Male`, `2 वर्ष`; dates as `27/10/2024`, `21/4/25`,
 `2025-04-21 2:24 pm`, `Oct 29, 2024, 04:57 p.m.`. A value that will not parse
-is **redacted, never passed through** (`redact_unparseable`, default true).
+is **suppressed, never passed through**.
 
 Structure is always preserved: containers are walked rather than matched, so no
 pattern can suppress a whole subtree; an object whose every leaf is suppressed
@@ -109,8 +120,10 @@ shifting every later index and making page numbers lie.
 - `**` spans any number of segments — `**.patient_name` matches it at any depth.
 - `*` inside a segment matches any run of characters within that segment.
 - Matching is case-insensitive.
-- **First match wins**, so narrow exceptions must sit above the broad patterns
-  they carve out of.
+- **The most specific pattern wins**, wherever it sits: fewer `**`, then fewer
+  `*`, then more literal characters. On an exact tie the more protective
+  action wins (suppress > masking > charcloak > hash > tokenization > encrypt >
+  generalization > keep), so an accidental overlap fails closed.
 
 ## Rule order is load-bearing
 
@@ -185,10 +198,17 @@ occupation, and the bundle's own structure.
   read the age out of `"24 Yrs./Male"` and silently drop the sex half. Use
   `patient_age` and `patient_gender`. Splitting them in the extractor would
   recover the field.
-- **`hash_salt` is key material.** The shipped config carries
-  `REPLACE_ME_AT_DEPLOY_TIME`; with the salt, any guessed `case_id` can be
-  re-derived. Inject it at deploy time. With no salt configured the run
-  generates one and warns that pseudonyms will not be reproducible.
+- **The salt, token vault and keys are key material.** They live in
+  `output_directory`, never in the config: `nested_json_salt.json`,
+  `nested_json_token_vault.json`, `nested_json_symmetric_keys.json`,
+  `nested_json_fpe_encrypt_keys.json`. With the salt any guessed `case_id`
+  can be re-derived; with the vault or a key, tokenized and encrypted values
+  are simply reversed. Each is keyed by the pattern that selected the value,
+  is reused by later runs so pseudonyms stay stable, and is written before
+  (keys) or after (vault) the documents — a run that fails part way must not
+  be released. The vault is a separate file from the tabular
+  `token_vault.json`, which the tabular flow rewrites with only its own
+  columns.
 - **A rare diagnosis can itself identify**, even with every identifier gone.
   Kept clinical fields are sensitive attributes, not identifiers — bounding
   that risk is the release agreement's job, not this pass's.

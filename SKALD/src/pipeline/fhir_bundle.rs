@@ -152,9 +152,19 @@ pub fn parse_fhir_bundle(section: &Value) -> Result<FhirBundleConfig, PipelineEr
         }
     }
 
-    let (rules, masking) = parse_policy_rules(section)?;
+    let (rules, specs) = parse_policy_rules(section)?;
+    // Bundles are walked without a token vault or key store, so a reversible
+    // technique here would have nowhere to keep its mapping. Refuse it rather
+    // than let the rule fall through to suppression unannounced.
+    if let Some(rule) = rules.iter().find(|r| matches!(r.action, Action::Tokenize { .. } | Action::Encrypt { .. })) {
+        return Err(validation(
+            "CONFIG_INVALID_VALUE",
+            "tokenization and encrypt are not supported by fhir_bundle",
+            &format!("{}: use hashing_with_salt for a stable pseudonym", rule.pattern),
+        ));
+    }
     cfg.rules = rules;
-    cfg.masking = masking;
+    cfg.masking = specs.masking;
 
     if let Some(block) = section.get("code_rules") {
         let obj = block.as_object().ok_or_else(|| {

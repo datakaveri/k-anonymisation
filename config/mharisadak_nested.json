@@ -1,0 +1,65 @@
+{
+  "data_type": "mharisadak",
+  "mharisadak": {
+    "nested_json": true,
+    "dry_run": false,
+    "input_path": "data/mharisadak/complaints.json",
+    "output_path": "mharisadak",
+    "output_directory": "output",
+    "default_action": "suppress",
+    "keep": [
+      "[].status",
+      "[].defect_flag",
+      "[].complaint_source_device",
+      "[].is_*",
+      "[].current_department_details.name",
+      "[].department_category_1_details.name",
+      "[].department_category_1_details.code",
+      "[].department_category_2_details.name",
+      "[].department_category_2_details.code",
+      "[].current_road_details.name",
+      "[].current_road_details.code",
+      "[].district_details.name",
+      "[].district_details.code",
+      "[].district_details.saral_district_code",
+      "[].district_details.state",
+      "[].district_details.latitude",
+      "[].district_details.longitude",
+      "[].current_assignee_details.designation_details.name",
+      "**.complaint_status",
+      "**.uploaded_by_content_type"
+    ],
+    "suppress": [
+      "**.name",
+      "**.phone",
+      "**.email",
+      "**.document",
+      "**.uploaded_by_object_id",
+      "**.external_code",
+      "**.internal_id",
+      "**.hewp_code",
+      "**.*lat*",
+      "**.*long*",
+      "[].location_accuracy",
+      "[].closing_remark",
+      "[].closing_remarks_reasons_details"
+    ],
+    "hashing_with_salt": [
+      "[].id",
+      "[].internal_id",
+      "[].citizen_details.id",
+      "**.complaint"
+    ],
+    "qi_constraints": {
+      "[].*_on": { "precision": "month" },
+      "[].target_date": { "precision": "month" },
+      "**.created": { "precision": "month" },
+      "**.modified": { "precision": "month" }
+    },
+    "masking": [],
+    "encrypt": [],
+    "charcloak": [],
+    "tokenization": [],
+    "fpe": []
+  }
+}

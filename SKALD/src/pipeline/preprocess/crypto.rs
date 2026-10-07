@@ -9,8 +9,9 @@
 //! - Class-preserving randomization.
 //! - JSON map I/O helpers used by `preprocess_chunks`.
 //!
-//! All functions are `pub(super)` — only the parent `preprocess` module can
-//! access them directly.
+//! Primitives the per-document flows (`nested_json`, `fhir_bundle`) also apply
+//! are `pub(crate)`, so a technique means the same thing in every flow; the
+//! rest are `pub(super)`.
 
 use crate::pipeline::bootstrap::PipelineError;
 use crate::pipeline::pyffx_compat::fpe_encrypt;
@@ -30,7 +31,7 @@ use std::path::Path;
 ///
 /// # Returns
 /// A 32-character lowercase hexadecimal string.
-pub(super) fn generate_random_key_hex() -> String {
+pub(crate) fn generate_random_key_hex() -> String {
     use std::io::Read;
     let mut buf = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -90,7 +91,7 @@ pub(super) fn should_skip_value(v: &str) -> bool {
 ///
 /// # Errors
 /// Returns [`PipelineError`] if the file exists but cannot be read or parsed.
-pub(super) fn read_json_map_string(path: &Path) -> Result<BTreeMap<String, String>, PipelineError> {
+pub(crate) fn read_json_map_string(path: &Path) -> Result<BTreeMap<String, String>, PipelineError> {
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
@@ -118,7 +119,7 @@ pub(super) fn read_json_map_string(path: &Path) -> Result<BTreeMap<String, Strin
 ///
 /// # Errors
 /// Returns [`PipelineError`] if directory creation, file write, or rename fails.
-pub(super) fn write_json_pretty(path: &Path, v: &Value) -> Result<(), PipelineError> {
+pub(crate) fn write_json_pretty(path: &Path, v: &Value) -> Result<(), PipelineError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -146,7 +147,7 @@ type HmacSha256 = Hmac<Sha256>;
 ///
 /// # Returns
 /// 16-byte derived key array.
-pub(super) fn derive_key(master_key: &str, context: &str) -> [u8; 16] {
+pub(crate) fn derive_key(master_key: &str, context: &str) -> [u8; 16] {
     let mut mac = HmacSha256::new_from_slice(master_key.as_bytes()).expect("HMAC init");
     mac.update(context.as_bytes());
     let digest = mac.finalize().into_bytes();
@@ -171,7 +172,7 @@ pub(super) fn derive_key(master_key: &str, context: &str) -> [u8; 16] {
 /// * `value` — the plaintext string.
 /// * `master_key` — the column-level master key.
 /// * `column` — the column name (used in key derivation context).
-pub(super) fn format_preserving_encrypt_general(value: &str, master_key: &str, column: &str) -> String {
+pub(crate) fn format_preserving_encrypt_general(value: &str, master_key: &str, column: &str) -> String {
     let text = value.to_string();
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0usize;
@@ -224,7 +225,7 @@ pub(super) fn format_preserving_encrypt_general(value: &str, master_key: &str, c
 /// * `value` — the plaintext string.
 /// * `key` — the column-level key.
 /// * `column` — the column name (used in HMAC context `"<column>:<block_idx>"`).
-pub(super) fn pseudo_encrypt(value: &str, key: &str, column: &str) -> String {
+pub(crate) fn pseudo_encrypt(value: &str, key: &str, column: &str) -> String {
     // Build a keystream via successive HMAC-SHA256 blocks so the pattern never repeats,
     // regardless of value length. Each 16-byte block i uses context "<column>:<i>".
     let plaintext = value.as_bytes();

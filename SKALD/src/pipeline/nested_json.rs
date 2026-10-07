@@ -37,8 +37,14 @@
 //! identifying key that no pattern has caught yet.
 
 use crate::pipeline::bootstrap::{io_err, validation, PipelineError};
-use crate::pipeline::preprocess::crypto::randomize_preserving_class;
-use crate::pipeline::preprocess::masking::{apply_masking_value, parse_masking_config, MaskingConfigLite};
+use crate::pipeline::preprocess::crypto::{
+    format_preserving_encrypt_general, generate_random_key_hex, pseudo_encrypt, randomize_preserving_class,
+    read_json_map_string, write_json_pretty,
+};
+use crate::pipeline::preprocess::masking::{
+    apply_masking_value, parse_encrypt_config, parse_masking_config, parse_tokenization_config, MaskingConfigLite,
+    TokenizationConfigLite,
+};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -84,6 +90,20 @@ pub enum Action {
     /// `Keep`, but is labelled apart in the census so a reviewer can tell
     /// "cleared by policy" from "trusted to an upstream pass".
     FreeText,
+    /// `charcloak`: every letter and digit replaced by a random one of the same
+    /// class, punctuation kept — `"9813548000"` → `"4170295836"`. Irreversible
+    /// and not stable: the same input gives a different output every time.
+    Charcloak,
+    /// `tokenization`: index into [`NestedJsonConfig::tokenization`]. The value
+    /// becomes `<prefix><n>`, recorded in the run's token vault under the
+    /// entry's pattern, so it can be reversed and the same value always gets
+    /// the same token.
+    Tokenize { spec: usize },
+    /// `encrypt`: reversible, deterministic encryption under a key generated
+    /// per pattern and kept with the run's key material. `format_preserving`
+    /// keeps each run of digits / upper / lower letters in its class and
+    /// length; otherwise the output is hex.
+    Encrypt { format_preserving: bool },
 }
 
 impl Action {
@@ -99,6 +119,10 @@ impl Action {
             Action::GeneralizeDate { month } => {
                 format!("generalization({})", if *month { "month" } else { "year" })
             }
+            Action::Charcloak => "charcloak".into(),
+            Action::Tokenize { .. } => "tokenization".into(),
+            Action::Encrypt { format_preserving: true } => "encrypt(format_preserving)".into(),
+            Action::Encrypt { format_preserving: false } => "encrypt".into(),
         }
     }
 }
@@ -150,9 +174,15 @@ struct Specificity {
 /// closed rather than releasing a value.
 pub(crate) fn privacy_rank(a: &Action) -> u8 {
     match a {
-        Action::Suppress => 5,
-        Action::Masking { .. } => 4,
-        Action::Hash => 3,
+        Action::Suppress => 8,
+        Action::Masking { .. } => 7,
+        Action::Charcloak => 6,
+        Action::Hash => 5,
+        // Reversible by whoever holds the vault or key, so below the one-way
+        // techniques; a token reveals nothing of the value's shape, ciphertext
+        // reveals its length (and its format, when format-preserving).
+        Action::Tokenize { .. } => 4,
+        Action::Encrypt { .. } => 3,
         Action::GeneralizeSize { .. } | Action::GeneralizeDate { .. } => 2,
         Action::Keep | Action::FreeText => 1,
     }
@@ -281,6 +311,9 @@ pub struct NestedJsonConfig {
     /// Masking specs, parsed by the tabular masker's own `parse_masking_config`
     /// so nested masking and column masking cannot drift apart.
     pub masking: Vec<MaskingConfigLite>,
+    /// Tokenization specs, parsed by the tabular `parse_tokenization_config`;
+    /// `column` holds the path pattern, which also names the vault entry.
+    pub(crate) tokenization: Vec<TokenizationConfigLite>,
 }
 
 impl Default for NestedJsonConfig {
@@ -294,6 +327,7 @@ impl Default for NestedJsonConfig {
             dry_run: false,
             key_material_dir: PathBuf::from("output"),
             masking: Vec::new(),
+            tokenization: Vec::new(),
         }
     }
 }
@@ -331,9 +365,10 @@ pub fn parse_nested_json(section: &Value) -> Result<NestedJsonConfig, PipelineEr
         })?;
     }
 
-    let (rules, masking) = parse_policy_rules(section)?;
+    let (rules, specs) = parse_policy_rules(section)?;
     cfg.rules = rules;
-    cfg.masking = masking;
+    cfg.masking = specs.masking;
+    cfg.tokenization = specs.tokenization;
 
     if cfg.input_path.is_none() {
         return Err(validation(
@@ -353,13 +388,46 @@ pub fn parse_nested_json(section: &Value) -> Result<NestedJsonConfig, PipelineEr
     Ok(cfg)
 }
 
+/// Parameters some rules point into by index, parsed alongside them.
+#[derive(Debug, Default)]
+pub(crate) struct PolicySpecs {
+    pub masking: Vec<MaskingConfigLite>,
+    pub(crate) tokenization: Vec<TokenizationConfigLite>,
+}
+
+/// Technique keys of the tabular config that no per-document flow applies,
+/// with what to use instead. Listing a path under one of these used to be
+/// ignored without a word, leaving the path to `default_action` — which with
+/// `keep` released the value in clear.
+const UNSUPPORTED_TECHNIQUES: [(&str, &str); 2] = [
+    (
+        "hashing_without_salt",
+        "an unsalted hash of a phone number or id is reversed by hashing every candidate — use hashing_with_salt",
+    ),
+    ("fpe", "use encrypt with {\"<pattern>\": {\"format_preserving\": true}}"),
+];
+
 /// Reads the technique buckets every per-document flow shares — `keep`,
-/// `suppress`, `hashing_with_salt`, `free_text`, `masking`, `size` and
-/// `qi_constraints` — into one rule set. The FHIR bundle flow reads its policy
-/// through this too, so a pattern means the same thing in either flow.
-pub(crate) fn parse_policy_rules(
-    section: &Value,
-) -> Result<(Vec<Rule>, Vec<MaskingConfigLite>), PipelineError> {
+/// `suppress`, `hashing_with_salt`, `free_text`, `charcloak`, `masking`,
+/// `tokenization`, `encrypt`, `size` and `qi_constraints` — into one rule set.
+/// The FHIR bundle flow reads its policy through this too, so a pattern means
+/// the same thing in either flow.
+pub(crate) fn parse_policy_rules(section: &Value) -> Result<(Vec<Rule>, PolicySpecs), PipelineError> {
+    for (key, instead) in UNSUPPORTED_TECHNIQUES {
+        let listed = section.get(key).filter(|v| match v {
+            Value::Null => false,
+            Value::Array(a) => !a.is_empty(),
+            _ => true,
+        });
+        if let Some(listed) = listed {
+            return Err(validation(
+                "CONFIG_INVALID_VALUE",
+                &format!("'{key}' is not applied to nested documents"),
+                &format!("{key}: {listed} — {instead}"),
+            ));
+        }
+    }
+
     let mut rules = Vec::new();
     let mut masking = Vec::new();
     // Techniques that take a plain list of targets, as in the tabular config.
@@ -368,6 +436,7 @@ pub(crate) fn parse_policy_rules(
         ("suppress", Action::Suppress),
         ("hashing_with_salt", Action::Hash),
         ("free_text", Action::FreeText),
+        ("charcloak", Action::Charcloak),
     ] {
         for pattern in string_list(section.get(key), key)? {
             rules.push(Rule::new(&pattern, action.clone()));
@@ -402,6 +471,20 @@ pub(crate) fn parse_policy_rules(
             rules.push(Rule::new(&spec.column.clone(), Action::Masking { spec: masking.len() }));
             masking.push(spec);
         }
+    }
+
+    // `tokenization` and `encrypt`: the tabular entry formats, unchanged —
+    // `{"column", "prefix", "digits"}` and `"pattern"` or
+    // `{"pattern": {"format_preserving": bool}}` — with a path glob as the column.
+    let mut tokenization = Vec::new();
+    for entry in object_list(section.get("tokenization"), "tokenization")? {
+        let spec = parse_tokenization_config(entry)?;
+        rules.push(Rule::new(&spec.column, Action::Tokenize { spec: tokenization.len() }));
+        tokenization.push(spec);
+    }
+    for entry in object_list(section.get("encrypt"), "encrypt")? {
+        let spec = parse_encrypt_config(entry)?;
+        rules.push(Rule::new(&spec.column, Action::Encrypt { format_preserving: spec.format_preserving }));
     }
 
     // `size`: the generalization bin width per target, as in the tabular config.
@@ -439,7 +522,17 @@ pub(crate) fn parse_policy_rules(
         }
     }
 
-    Ok((rules, masking))
+    Ok((rules, PolicySpecs { masking, tokenization }))
+}
+
+/// A technique bucket holding a list of entries in the tabular format.
+fn object_list<'a>(v: Option<&'a Value>, key: &str) -> Result<&'a [Value], PipelineError> {
+    match v {
+        None => Ok(&[]),
+        Some(v) => v.as_array().map(Vec::as_slice).ok_or_else(|| {
+            validation("CONFIG_INVALID_VALUE", &format!("{key} must be an array"), &v.to_string())
+        }),
+    }
 }
 
 /// A technique bucket holding a list of path globs.
@@ -569,25 +662,50 @@ fn four_digit_year(s: &str) -> Option<i64> {
 }
 
 /// Applies one action to one leaf. `None` means "remove this key".
-fn apply(action: &Action, value: &Value, cfg: &NestedJsonConfig, salt: &str) -> Option<Value> {
-    apply_action(action, value, &cfg.masking, salt)
+///
+/// `matched_by` is the pattern that chose `action`; the reversible techniques
+/// keep their vault entry and key under it.
+fn apply(
+    action: &Action,
+    value: &Value,
+    matched_by: &str,
+    cfg: &NestedJsonConfig,
+    keys: &mut KeyStore,
+) -> Option<Value> {
+    let text = match leaf_text(value) {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => return apply_action(action, value, &cfg.masking, &keys.salt),
+    };
+    match action {
+        Action::Tokenize { spec } => Some(Value::String(keys.token(cfg.tokenization.get(*spec)?, &text))),
+        Action::Encrypt { format_preserving } => {
+            Some(Value::String(keys.encrypt(matched_by, *format_preserving, &text)))
+        }
+        other => apply_action(other, value, &cfg.masking, &keys.salt),
+    }
 }
 
-/// [`apply`] against a bare list of masking specs, for flows that hold their
-/// policy in a config type of their own.
+/// A scalar as the text the techniques operate on; `None` for a container.
+fn leaf_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => Some(String::new()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// [`apply`] for the techniques that need no key material, against a bare
+/// list of masking specs, for flows that hold their policy in a config type of
+/// their own.
 pub(crate) fn apply_action(
     action: &Action,
     value: &Value,
     masking: &[MaskingConfigLite],
     salt: &str,
 ) -> Option<Value> {
-    let as_text = match value {
-        Value::Null => String::new(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
-        _ => return Some(value.clone()),
-    };
+    let Some(as_text) = leaf_text(value) else { return Some(value.clone()) };
     let empty = as_text.trim().is_empty();
     // A value that will not parse for its generalization is suppressed, never
     // passed through: an unparsed date is still a date. Not configurable —
@@ -605,6 +723,10 @@ pub(crate) fn apply_action(
             Some(Value::String(apply_masking_value(&as_text, spec, &randomize_preserving_class)))
         }
         _ if empty => Some(value.clone()),
+        // These need the run's vault and keys, which only [`apply`] holds.
+        // Reaching here with a value means a caller bypassed it, so fail
+        // closed rather than release the value.
+        Action::Tokenize { .. } | Action::Encrypt { .. } => None,
         Action::Hash => Some(Value::String(hash_token(salt, as_text.trim()))),
         Action::GeneralizeSize { size } => {
             generalize_size(&as_text, *size).map(Value::String).or_else(fallback)
@@ -612,6 +734,141 @@ pub(crate) fn apply_action(
         Action::GeneralizeDate { month } => {
             date_precision(&as_text, *month).map(Value::String).or_else(fallback)
         }
+        Action::Charcloak => Some(Value::String(randomize_preserving_class(&as_text))),
+    }
+}
+
+// ── Key material ─────────────────────────────────────────────────────────────
+
+/// Token vault file, beside the salt. Same shape as the tabular
+/// `token_vault.json` — `{pattern: {forward, reverse}}` — but a file of its
+/// own, because the tabular flow rewrites its vault with only its own columns.
+const TOKEN_VAULT_FILE: &str = "nested_json_token_vault.json";
+/// `{pattern: hex key}` for `encrypt` entries.
+const SYMMETRIC_KEYS_FILE: &str = "nested_json_symmetric_keys.json";
+/// `{pattern: hex key}` for `encrypt` entries with `format_preserving: true`.
+const FPE_KEYS_FILE: &str = "nested_json_fpe_encrypt_keys.json";
+
+#[derive(Debug, Default)]
+struct TokenVault {
+    forward: BTreeMap<String, String>,
+    reverse: BTreeMap<String, String>,
+}
+
+/// The key material one run transforms values under: the hash salt, the token
+/// vaults and the encryption keys, each keyed by the pattern that selected the
+/// value. Loaded from and persisted to the run's key material directory, so a
+/// value gets the same token and ciphertext in every run and every document.
+#[derive(Debug, Default)]
+pub struct KeyStore {
+    salt: String,
+    vaults: BTreeMap<String, TokenVault>,
+    symmetric: BTreeMap<String, String>,
+    fpe: BTreeMap<String, String>,
+}
+
+impl KeyStore {
+    /// A store holding only a salt, with empty vaults and no keys yet.
+    pub fn with_salt(salt: &str) -> KeyStore {
+        KeyStore { salt: salt.to_string(), ..Default::default() }
+    }
+
+    /// Reads whatever vault and keys earlier runs left in `dir`.
+    fn load(dir: &Path, salt: &str) -> Result<KeyStore, PipelineError> {
+        let mut store = KeyStore::with_salt(salt);
+        store.symmetric = read_json_map_string(&dir.join(SYMMETRIC_KEYS_FILE))?;
+        store.fpe = read_json_map_string(&dir.join(FPE_KEYS_FILE))?;
+        let vault_path = dir.join(TOKEN_VAULT_FILE);
+        if vault_path.is_file() {
+            let raw = fs::read_to_string(&vault_path)
+                .map_err(|e| io_err("read nested_json token vault", &vault_path.display().to_string(), e))?;
+            let v: Value = serde_json::from_str(&raw)?;
+            let map = |entry: &Value, side: &str| -> BTreeMap<String, String> {
+                entry
+                    .get(side)
+                    .and_then(Value::as_object)
+                    .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+                    .unwrap_or_default()
+            };
+            for (pattern, entry) in v.as_object().into_iter().flatten() {
+                store.vaults.insert(
+                    pattern.clone(),
+                    TokenVault { forward: map(entry, "forward"), reverse: map(entry, "reverse") },
+                );
+            }
+        }
+        Ok(store)
+    }
+
+    /// Generates a key for every `encrypt` pattern that lacks one. Done before
+    /// any document is written, so ciphertext never exists without its key
+    /// already on disk.
+    fn ensure_encrypt_keys(&mut self, rules: &[Rule]) {
+        for rule in rules {
+            if let Action::Encrypt { format_preserving } = rule.action {
+                let keys = if format_preserving { &mut self.fpe } else { &mut self.symmetric };
+                keys.entry(rule.pattern.clone()).or_insert_with(generate_random_key_hex);
+            }
+        }
+    }
+
+    /// The vault token for `value`, issuing the next one on first sight.
+    fn token(&mut self, spec: &TokenizationConfigLite, value: &str) -> String {
+        let vault = self.vaults.entry(spec.column.clone()).or_default();
+        if let Some(t) = vault.forward.get(value) {
+            return t.clone();
+        }
+        let mut n = vault.reverse.len() + 1;
+        let token = loop {
+            // A vault edited by hand, or tokens issued under another prefix,
+            // can leave the next number taken; never hand one out twice.
+            let t = format!("{}{:0width$}", spec.prefix, n, width = spec.digits);
+            if !vault.reverse.contains_key(&t) {
+                break t;
+            }
+            n += 1;
+        };
+        vault.forward.insert(value.to_string(), token.clone());
+        vault.reverse.insert(token.clone(), value.to_string());
+        token
+    }
+
+    /// `value` encrypted under `pattern`'s key — the tabular primitives, with
+    /// the pattern in place of the column name in key derivation.
+    fn encrypt(&mut self, pattern: &str, format_preserving: bool, value: &str) -> String {
+        let keys = if format_preserving { &mut self.fpe } else { &mut self.symmetric };
+        let key = keys.entry(pattern.to_string()).or_insert_with(generate_random_key_hex);
+        if format_preserving {
+            format_preserving_encrypt_general(value, key, pattern)
+        } else {
+            pseudo_encrypt(value, key, pattern)
+        }
+    }
+
+    /// Writes every non-empty store to `dir` and returns the files written.
+    fn persist(&self, dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
+        let mut written = Vec::new();
+        let as_object = |m: &BTreeMap<String, String>| {
+            Value::Object(m.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect())
+        };
+        for (file, keys) in [(SYMMETRIC_KEYS_FILE, &self.symmetric), (FPE_KEYS_FILE, &self.fpe)] {
+            if !keys.is_empty() {
+                write_json_pretty(&dir.join(file), &as_object(keys))?;
+                written.push(dir.join(file));
+            }
+        }
+        if !self.vaults.is_empty() {
+            let vault: Map<String, Value> = self
+                .vaults
+                .iter()
+                .map(|(p, v)| {
+                    (p.clone(), serde_json::json!({ "forward": as_object(&v.forward), "reverse": as_object(&v.reverse) }))
+                })
+                .collect();
+            write_json_pretty(&dir.join(TOKEN_VAULT_FILE), &Value::Object(vault))?;
+            written.push(dir.join(TOKEN_VAULT_FILE));
+        }
+        Ok(written)
     }
 }
 
@@ -819,7 +1076,7 @@ fn walk(
     value: &Value,
     path: &mut Vec<String>,
     cfg: &NestedJsonConfig,
-    salt: &str,
+    keys: &mut KeyStore,
     census: &mut Census,
 ) -> Option<Value> {
     match value {
@@ -827,7 +1084,7 @@ fn walk(
             let mut out = Map::new();
             for (k, v) in map {
                 path.push(k.to_ascii_lowercase());
-                let kept = walk(v, path, cfg, salt, census);
+                let kept = walk(v, path, cfg, keys, census);
                 path.pop();
                 if let Some(kept) = kept {
                     out.insert(k.clone(), kept);
@@ -839,7 +1096,7 @@ fn walk(
             let mut out = Vec::with_capacity(items.len());
             for v in items {
                 path.push("[]".to_string());
-                let kept = walk(v, path, cfg, salt, census);
+                let kept = walk(v, path, cfg, keys, census);
                 path.pop();
                 match kept {
                     Some(kept) => out.push(kept),
@@ -858,15 +1115,15 @@ fn walk(
         leaf => {
             let (action, matched_by) = decide(cfg, path);
             census.record(&display_path(path), leaf, action, matched_by);
-            apply(action, leaf, cfg, salt)
+            apply(action, leaf, matched_by, cfg, keys)
         }
     }
 }
 
 /// Anonymizes one document. Exposed for tests and for callers holding a parsed
 /// document already.
-pub fn anonymize_document(doc: &Value, cfg: &NestedJsonConfig, salt: &str, census: &mut Census) -> Value {
-    walk(doc, &mut Vec::new(), cfg, salt, census).unwrap_or(Value::Null)
+pub fn anonymize_document(doc: &Value, cfg: &NestedJsonConfig, keys: &mut KeyStore, census: &mut Census) -> Value {
+    walk(doc, &mut Vec::new(), cfg, keys, census).unwrap_or(Value::Null)
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────────
@@ -890,6 +1147,9 @@ pub struct RunReport {
     pub salt_created: bool,
     /// Where the salt lives, so the log can say what to back up.
     pub salt_path: PathBuf,
+    /// Token vault and encryption key files this run wrote. Whoever holds them
+    /// can reverse `tokenization` and `encrypt`, so the log names them.
+    pub key_files: Vec<PathBuf>,
     /// True when the run only reported and wrote no anonymized documents.
     pub dry_run: bool,
 }
@@ -988,12 +1248,16 @@ pub fn run(cfg: &NestedJsonConfig, root: &Path) -> Result<RunReport, PipelineErr
         ));
     }
 
-    let (salt, salt_created, salt_path) = load_or_create_salt(&resolve(&cfg.key_material_dir))?;
+    let key_dir = resolve(&cfg.key_material_dir);
+    let (salt, salt_created, salt_path) = load_or_create_salt(&key_dir)?;
+    let mut keys = KeyStore::load(&key_dir, &salt)?;
+    keys.ensure_encrypt_keys(&cfg.rules);
 
     if !cfg.dry_run {
         fs::create_dir_all(&output_dir).map_err(|e| {
             io_err("create nested_json output directory", &output_dir.display().to_string(), e)
         })?;
+        keys.persist(&key_dir)?;
     }
 
     let mut census = Census::default();
@@ -1023,7 +1287,7 @@ pub fn run(cfg: &NestedJsonConfig, root: &Path) -> Result<RunReport, PipelineErr
             }
         };
 
-        let anon = anonymize_document(&doc, cfg, &salt, &mut census);
+        let anon = anonymize_document(&doc, cfg, &mut keys, &mut census);
 
         // The census is built either way — a dry run's whole purpose is to
         // produce it — but only a real run writes a document.
@@ -1051,6 +1315,12 @@ pub fn run(cfg: &NestedJsonConfig, root: &Path) -> Result<RunReport, PipelineErr
         ));
     }
 
+    // Tokens issued during the run are only on disk once this lands; a run
+    // that fails before here leaves documents whose new tokens cannot be
+    // reversed, so its output is not to be released.
+    if !cfg.dry_run {
+        report.key_files = keys.persist(&key_dir)?;
+    }
     write_census(&census, &census_path)?;
     report.paths_seen = census.rows().len();
     report.paths_kept = census.kept_paths().len();
@@ -1197,7 +1467,7 @@ mod tests {
     fn empty_values_survive_transforms_unchanged() {
         let cfg = NestedJsonConfig::default();
         for action in [Action::Hash, Action::GeneralizeSize { size: 5 }, Action::GeneralizeDate { month: true }] {
-            let got = apply(&action, &json!(""), &cfg, SALT);
+            let got = apply(&action, &json!(""), "", &cfg, &mut KeyStore::with_salt(SALT));
             assert_eq!(got, Some(json!("")), "{action:?} should leave an empty value alone");
         }
     }
@@ -1209,7 +1479,7 @@ mod tests {
             Action::GeneralizeDate { month: true },
             Action::GeneralizeSize { size: 5 },
         ] {
-            let got = apply(&action, &json!("illegible"), &cfg, SALT);
+            let got = apply(&action, &json!("illegible"), "", &cfg, &mut KeyStore::with_salt(SALT));
             assert_eq!(got, None, "{action:?} must drop a value it cannot generalize");
         }
     }
@@ -1290,7 +1560,7 @@ mod tests {
 
     fn anon(doc: &Value) -> (Value, Census) {
         let mut census = Census::default();
-        let out = anonymize_document(doc, &nha_cfg(), SALT, &mut census);
+        let out = anonymize_document(doc, &nha_cfg(), &mut KeyStore::with_salt(SALT), &mut census);
         (out, census)
     }
 
@@ -1635,5 +1905,191 @@ mod tests {
         assert!(!cfg.enabled);
     }
 
+    // ── Reversible and randomising techniques ──────────────────────────────
 
+    fn complaints_cfg() -> NestedJsonConfig {
+        parse_nested_json(&json!({
+            "nested_json": true,
+            "input_path": "in",
+            "default_action": "suppress",
+            "keep": ["[].status"],
+            "charcloak": ["[].vehicle_no"],
+            "tokenization": [{ "column": "[].citizen.phone", "prefix": "PH-", "digits": 4 }],
+            "encrypt": [
+                "[].citizen.name",
+                { "[].citizen.aadhaar": { "format_preserving": true } }
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn complaints() -> Value {
+        json!([
+            { "status": "Open", "vehicle_no": "HR-26-AB-1234",
+              "citizen": { "phone": "9813548000", "name": "suresh kumar", "aadhaar": "1234 5678 9012" } },
+            { "status": "Closed", "vehicle_no": "",
+              "citizen": { "phone": "9813548000", "name": "suresh kumar", "aadhaar": null } },
+            { "status": "Open", "vehicle_no": null,
+              "citizen": { "phone": "", "name": null, "aadhaar": "" } },
+            { "status": "Closed", "vehicle_no": "DL-01-C-7",
+              "citizen": { "phone": "8930033444", "name": "Ram", "aadhaar": "2222 3333 4444" } }
+        ])
+    }
+
+    /// Inverts `pseudo_encrypt`: XOR with the same HMAC keystream.
+    fn pseudo_decrypt(hex_text: &str, key: &str, pattern: &str) -> String {
+        use crate::pipeline::preprocess::crypto::derive_key;
+        let bytes = hex::decode(hex_text).unwrap();
+        let mut stream = Vec::new();
+        let mut block = 0u64;
+        while stream.len() < bytes.len() {
+            stream.extend_from_slice(&derive_key(key, &format!("{pattern}:{block}")));
+            block += 1;
+        }
+        String::from_utf8(bytes.iter().zip(&stream).map(|(b, k)| b ^ k).collect()).unwrap()
+    }
+
+    #[test]
+    fn charcloak_replaces_each_character_within_its_class() {
+        let cfg = complaints_cfg();
+        let out = anonymize_document(&complaints(), &cfg, &mut KeyStore::with_salt(SALT), &mut Census::default());
+        let cloaked = out[0]["vehicle_no"].as_str().unwrap();
+        assert_ne!(cloaked, "HR-26-AB-1234");
+        assert_eq!(cloaked.len(), "HR-26-AB-1234".len());
+        for (a, b) in "HR-26-AB-1234".chars().zip(cloaked.chars()) {
+            assert_eq!(a.is_ascii_uppercase(), b.is_ascii_uppercase(), "{cloaked}");
+            assert_eq!(a.is_ascii_digit(), b.is_ascii_digit(), "{cloaked}");
+            if !a.is_ascii_alphanumeric() {
+                assert_eq!(a, b, "punctuation is kept");
+            }
+        }
+        assert_eq!(out[1].get("vehicle_no"), Some(&json!("")), "an empty value stays empty");
+    }
+
+    #[test]
+    fn tokenization_is_stable_and_the_vault_reverses_it() {
+        let cfg = complaints_cfg();
+        let mut keys = KeyStore::with_salt(SALT);
+        let out = anonymize_document(&complaints(), &cfg, &mut keys, &mut Census::default());
+        let (a, b, c) = (&out[0]["citizen"]["phone"], &out[1]["citizen"]["phone"], &out[3]["citizen"]["phone"]);
+        assert_eq!(a, &json!("PH-0001"));
+        assert_eq!(a, b, "the same phone gets the same token in every record");
+        assert_eq!(c, &json!("PH-0002"));
+        assert_eq!(out[2]["citizen"].get("phone"), Some(&json!("")), "an empty value is not tokenized");
+        let vault = &keys.vaults["[].citizen.phone"];
+        assert_eq!(vault.reverse["PH-0001"], "9813548000");
+        assert_eq!(vault.reverse["PH-0002"], "8930033444");
+    }
+
+    #[test]
+    fn encryption_is_deterministic_and_decrypts_back() {
+        let cfg = complaints_cfg();
+        let mut keys = KeyStore::with_salt(SALT);
+        let out = anonymize_document(&complaints(), &cfg, &mut keys, &mut Census::default());
+
+        let name = out[0]["citizen"]["name"].as_str().unwrap();
+        assert_ne!(name, "suresh kumar");
+        assert_eq!(out[1]["citizen"]["name"], json!(name), "deterministic, so records still join");
+        let key = &keys.symmetric["[].citizen.name"];
+        assert_eq!(pseudo_decrypt(name, key, "[].citizen.name"), "suresh kumar");
+
+        let aadhaar = out[0]["citizen"]["aadhaar"].as_str().unwrap();
+        assert_ne!(aadhaar, "1234 5678 9012");
+        assert!(
+            aadhaar.len() == 14 && aadhaar.split(' ').all(|g| g.len() == 4 && g.bytes().all(|b| b.is_ascii_digit())),
+            "format-preserving keeps the digit groups: {aadhaar}"
+        );
+        let key = &keys.fpe["[].citizen.aadhaar"];
+        let derived = crate::pipeline::preprocess::crypto::derive_key(key, "[].citizen.aadhaar:digit:4");
+        let plain: Vec<String> = aadhaar
+            .split(' ')
+            .map(|g| crate::pipeline::pyffx_compat::fpe_decrypt(&derived, g, "0123456789"))
+            .collect();
+        assert_eq!(plain.join(" "), "1234 5678 9012");
+        // Indexing a missing key also yields Null, so check the key survived.
+        assert_eq!(out[1]["citizen"].get("aadhaar"), Some(&Value::Null), "null passes through");
+        assert_eq!(out[2]["citizen"].get("name"), Some(&Value::Null), "null passes through");
+        assert_eq!(out[2]["citizen"].get("aadhaar"), Some(&json!("")), "empty passes through");
+    }
+
+    #[test]
+    fn census_labels_the_new_techniques() {
+        let mut census = Census::default();
+        anonymize_document(&complaints(), &complaints_cfg(), &mut KeyStore::with_salt(SALT), &mut census);
+        let action = |p: &str| census.rows().into_iter().find(|(path, _)| path == p).unwrap().1.action;
+        assert_eq!(action("[].vehicle_no"), "charcloak");
+        assert_eq!(action("[].citizen.phone"), "tokenization");
+        assert_eq!(action("[].citizen.name"), "encrypt");
+        assert_eq!(action("[].citizen.aadhaar"), "encrypt(format_preserving)");
+    }
+
+    #[test]
+    fn run_persists_key_material_and_later_runs_reuse_it() {
+        let root = tmpdir("keys");
+        fs::create_dir_all(root.join("in")).unwrap();
+        fs::write(root.join("in/c.json"), complaints().to_string()).unwrap();
+        let cfg = NestedJsonConfig { output_subdir: "out".into(), key_material_dir: PathBuf::from("."), ..complaints_cfg() };
+
+        let first = run(&cfg, &root).unwrap();
+        let mut files: Vec<_> = first.key_files.iter().map(|p| p.file_name().unwrap().to_owned()).collect();
+        files.sort();
+        assert_eq!(files, [FPE_KEYS_FILE, SYMMETRIC_KEYS_FILE, TOKEN_VAULT_FILE]);
+        let before = fs::read_to_string(root.join("out/c.json")).unwrap();
+
+        run(&cfg, &root).unwrap();
+        let after = fs::read_to_string(root.join("out/c.json")).unwrap();
+        let reversible = |doc: &str| {
+            let v: Value = serde_json::from_str(doc).unwrap();
+            v.as_array().unwrap().iter().map(|r| r["citizen"].clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(reversible(&before), reversible(&after), "tokens and ciphertext match across runs");
+    }
+
+    #[test]
+    fn a_dry_run_writes_no_key_material() {
+        let root = tmpdir("keys_dry");
+        fs::create_dir_all(root.join("in")).unwrap();
+        fs::write(root.join("in/c.json"), complaints().to_string()).unwrap();
+        let cfg = NestedJsonConfig {
+            output_subdir: "out".into(),
+            key_material_dir: PathBuf::from("."),
+            dry_run: true,
+            ..complaints_cfg()
+        };
+        let report = run(&cfg, &root).unwrap();
+        assert!(report.key_files.is_empty());
+        for f in [TOKEN_VAULT_FILE, SYMMETRIC_KEYS_FILE, FPE_KEYS_FILE] {
+            assert!(!root.join(f).exists(), "{f}");
+        }
+    }
+
+    #[test]
+    fn techniques_no_nested_flow_applies_are_refused_not_ignored() {
+        for key in ["hashing_without_salt", "fpe"] {
+            let err = parse_nested_json(&json!({
+                "nested_json": true, "input_path": "in", "keep": ["a"], key: ["[].citizen.phone"]
+            }))
+            .unwrap_err();
+            assert!(format!("{err:?}").contains(key), "{err:?}");
+        }
+        // Empty buckets, as every shipped config carries them, are fine.
+        parse_nested_json(&json!({
+            "nested_json": true, "input_path": "in", "keep": ["a"], "hashing_without_salt": [], "fpe": []
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn fhir_bundles_refuse_the_reversible_techniques() {
+        for (key, entry) in [
+            ("tokenization", json!([{ "column": "**.telecom[].value" }])),
+            ("encrypt", json!(["**.telecom[].value"])),
+        ] {
+            let err = crate::pipeline::fhir_bundle::parse_fhir_bundle(&json!({
+                "fhir_bundle": true, "input_path": "in", "keep": ["a"], key: entry
+            }))
+            .unwrap_err();
+            assert!(format!("{err:?}").contains("not supported by fhir_bundle"), "{err:?}");
+        }
+    }
 }
