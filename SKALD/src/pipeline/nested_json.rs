@@ -77,14 +77,6 @@ pub enum Action {
     /// the same token everywhere. This is what keeps a case linkable across its
     /// own pages without carrying the resolvable id.
     Hash,
-    /// Generalization with a fixed bin width, the `size` of the tabular
-    /// config: `"49Y"` with size 5 → `"45-49"`. Bins are fixed rather than
-    /// searched because a single-subject document has no lattice to search.
-    GeneralizeSize { size: u32 },
-    /// Generalization of a date or timestamp to year, or year-month. The one
-    /// technique with no tabular counterpart — the tabular flow generalizes
-    /// numbers and categorical hierarchies, and never parses a date.
-    GeneralizeDate { month: bool },
     /// `free_text`: released unchanged because the NER pipeline has already
     /// anonymized it upstream, before the document reached SKALD. Behaves like
     /// `Keep`, but is labelled apart in the census so a reviewer can tell
@@ -115,10 +107,6 @@ impl Action {
             Action::Suppress => "suppress".into(),
             Action::Masking { .. } => "masking".into(),
             Action::Hash => "hashing_with_salt".into(),
-            Action::GeneralizeSize { size } => format!("generalization(size={size})"),
-            Action::GeneralizeDate { month } => {
-                format!("generalization({})", if *month { "month" } else { "year" })
-            }
             Action::Charcloak => "charcloak".into(),
             Action::Tokenize { .. } => "tokenization".into(),
             Action::Encrypt { format_preserving: true } => "encrypt(format_preserving)".into(),
@@ -183,7 +171,6 @@ pub(crate) fn privacy_rank(a: &Action) -> u8 {
         // reveals its length (and its format, when format-preserving).
         Action::Tokenize { .. } => 4,
         Action::Encrypt { .. } => 3,
-        Action::GeneralizeSize { .. } | Action::GeneralizeDate { .. } => 2,
         Action::Keep | Action::FreeText => 1,
     }
 }
@@ -487,38 +474,24 @@ pub(crate) fn parse_policy_rules(section: &Value) -> Result<(Vec<Rule>, PolicySp
         rules.push(Rule::new(&spec.column, Action::Encrypt { format_preserving: spec.format_preserving }));
     }
 
-    // `size`: the generalization bin width per target, as in the tabular config.
-    if let Some(obj) = section.get("size").and_then(Value::as_object) {
-        for (pattern, v) in obj {
-            let size = v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-                validation(
-                    "CONFIG_INVALID_VALUE",
-                    "size values must be a positive bin width",
-                    &format!("{pattern}: {v}"),
-                )
-            })?;
-            rules.push(Rule::new(pattern, Action::GeneralizeSize { size: size as u32 }));
-        }
+    // Ages and dates are coarsened with `masking` (`characters_to_mask` over
+    // the digits to drop). A config still carrying the retired `size` banding
+    // or `qi_constraints` `precision` form is refused: ignored, its paths would
+    // fall to `default_action` — released in clear under `keep`.
+    if let Some((pattern, _)) = section.get("size").and_then(Value::as_object).and_then(|o| o.iter().next()) {
+        return Err(validation(
+            "CONFIG_INVALID_VALUE",
+            "size is not supported for nested documents",
+            &format!("{pattern}: mask the value with a 'masking' entry and 'characters_to_mask' instead"),
+        ));
     }
-
-    // `qi_constraints`: how a given QI is allowed to generalize. The tabular
-    // flow reads `intervals` here and ignores anything else, so date precision
-    // rides along in the same block instead of needing a key of its own.
     if let Some(obj) = section.get("qi_constraints").and_then(Value::as_object) {
-        for (pattern, constraint) in obj {
-            let Some(p) = constraint.get("precision") else { continue };
-            let month = match p.as_str().map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-                Some("month") => true,
-                Some("year") => false,
-                _ => {
-                    return Err(validation(
-                        "CONFIG_INVALID_VALUE",
-                        "qi_constraints precision must be \"month\" or \"year\"",
-                        &format!("{pattern}: {p}"),
-                    ))
-                }
-            };
-            rules.push(Rule::new(pattern, Action::GeneralizeDate { month }));
+        if let Some((pattern, _)) = obj.iter().find(|(_, c)| c.get("precision").is_some()) {
+            return Err(validation(
+                "CONFIG_INVALID_VALUE",
+                "qi_constraints precision is not supported",
+                &format!("{pattern}: mask the date with a 'masking' entry and 'characters_to_mask' instead"),
+            ));
         }
     }
 
@@ -570,97 +543,6 @@ pub(crate) fn hash_token(salt: &str, value: &str) -> String {
     hex::encode(h.finalize())[..16].to_string()
 }
 
-/// Pulls the first run of ASCII digits out of a string. Ages in this corpus
-/// arrive as `"49Y"`, `"18 Years"`, `"24 Yrs./Male"`, `"2 वर्ष"`, `"25YRS/MALE"`.
-fn first_number(s: &str) -> Option<i64> {
-    let mut digits = String::new();
-    for c in s.chars() {
-        if c.is_ascii_digit() {
-            digits.push(c);
-        } else if !digits.is_empty() {
-            break;
-        }
-    }
-    digits.parse().ok()
-}
-
-/// `49` with size 5 → `"45-49"`. Values at or above 90 collapse into a single
-/// top band: for an age, the 90+ tail is thin enough that a five-year band
-/// there comes close to naming the person.
-fn generalize_size(value: &str, width: u32) -> Option<String> {
-    let age = first_number(value)?;
-    if age < 0 {
-        return None;
-    }
-    if age >= 90 {
-        return Some("90+".to_string());
-    }
-    let w = width as i64;
-    let lo = (age / w) * w;
-    Some(format!("{}-{}", lo, lo + w - 1))
-}
-
-const MONTHS: [&str; 12] =
-    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-
-/// Coarsens the date formats this corpus actually contains:
-/// `27/10/2024`, `25-4-2025`, `2025-04-21 2:24 pm`, `21-Apr-2025 03:11 PM`,
-/// `Oct 29, 2024, 04:57 p.m.`, `21/4/25`.
-///
-/// Ambiguity is resolved the way Indian health records are written —
-/// day-first — except when the first component is unambiguously a 4-digit
-/// year. Returns `None` when nothing date-shaped is found, which the caller
-/// turns into a redaction rather than a pass-through.
-fn date_precision(value: &str, month: bool) -> Option<String> {
-    let lower = value.to_ascii_lowercase();
-
-    // Named month anywhere: "21-apr-2025", "oct 29, 2024".
-    if let Some((mi, _)) = MONTHS.iter().enumerate().find(|(_, m)| lower.contains(*m)) {
-        let year = four_digit_year(&lower)?;
-        return Some(if month { format!("{year}-{:02}", mi + 1) } else { year.to_string() });
-    }
-
-    // Numeric separators.
-    let parts: Vec<&str> = lower
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|p| !p.is_empty())
-        .collect();
-    if parts.len() < 3 {
-        // A bare year on its own is still usable.
-        return four_digit_year(&lower).map(|y| y.to_string());
-    }
-
-    let (y, m) = if parts[0].len() == 4 {
-        (parts[0].parse::<i64>().ok()?, parts[1].parse::<i64>().ok()?)
-    } else {
-        let raw_y = parts[2].parse::<i64>().ok()?;
-        let y = if parts[2].len() <= 2 {
-            // Two-digit years in this corpus are all 20xx.
-            2000 + raw_y
-        } else {
-            raw_y
-        };
-        (y, parts[1].parse::<i64>().ok()?)
-    };
-    if !(1900..=2100).contains(&y) || !(1..=12).contains(&m) {
-        return None;
-    }
-    Some(if month { format!("{y}-{m:02}") } else { y.to_string() })
-}
-
-fn four_digit_year(s: &str) -> Option<i64> {
-    let bytes: Vec<char> = s.chars().collect();
-    for w in bytes.windows(4) {
-        if w.iter().all(|c| c.is_ascii_digit()) {
-            let y: i64 = w.iter().collect::<String>().parse().ok()?;
-            if (1900..=2100).contains(&y) {
-                return Some(y);
-            }
-        }
-    }
-    None
-}
-
 /// Applies one action to one leaf. `None` means "remove this key".
 ///
 /// `matched_by` is the pattern that chose `action`; the reversible techniques
@@ -707,10 +589,6 @@ pub(crate) fn apply_action(
 ) -> Option<Value> {
     let Some(as_text) = leaf_text(value) else { return Some(value.clone()) };
     let empty = as_text.trim().is_empty();
-    // A value that will not parse for its generalization is suppressed, never
-    // passed through: an unparsed date is still a date. Not configurable —
-    // there is no safe reading of "release the value I could not generalize".
-    let fallback = || None;
 
     match action {
         Action::Keep | Action::FreeText => Some(value.clone()),
@@ -728,12 +606,6 @@ pub(crate) fn apply_action(
         // closed rather than release the value.
         Action::Tokenize { .. } | Action::Encrypt { .. } => None,
         Action::Hash => Some(Value::String(hash_token(salt, as_text.trim()))),
-        Action::GeneralizeSize { size } => {
-            generalize_size(&as_text, *size).map(Value::String).or_else(fallback)
-        }
-        Action::GeneralizeDate { month } => {
-            date_precision(&as_text, *month).map(Value::String).or_else(fallback)
-        }
         Action::Charcloak => Some(Value::String(randomize_preserving_class(&as_text))),
     }
 }
@@ -1389,8 +1261,7 @@ mod tests {
                 Rule::new("case_id", Action::Hash),
                 Rule::new("total_pages", Action::Keep),
                 Rule::new("pages.[].page_number", Action::Keep),
-                Rule::new("**.patient_age", Action::GeneralizeSize { size: 5 }),
-                Rule::new("**.timestamp", Action::GeneralizeDate { month: true }),
+                Rule::new("**.patient_age", Action::Masking { spec: 0 }),
                 Rule::new("**.status_at_time_of_discharge", Action::Keep),
             ],
             ..Default::default()
@@ -1399,8 +1270,7 @@ mod tests {
             ("case_id", Action::Hash),
             ("total_pages", Action::Keep),
             ("pages.[].page_number", Action::Keep),
-            ("pages.[].extracted_data.patient_age", Action::GeneralizeSize { size: 5 }),
-            ("pages.[].extracted_data.timestamp", Action::GeneralizeDate { month: true }),
+            ("pages.[].extracted_data.patient_age", Action::Masking { spec: 0 }),
             ("pages.[].extracted_data.status_at_time_of_discharge", Action::Keep),
         ] {
             assert_eq!(decide(&cfg, &path(p)).0, &want, "{p}");
@@ -1430,33 +1300,6 @@ mod tests {
     // ── Value transforms ────────────────────────────────────────────────────
 
     #[test]
-    fn generalize_size_parses_the_age_formats_this_corpus_uses() {
-        assert_eq!(generalize_size("49Y", 5).unwrap(), "45-49");
-        assert_eq!(generalize_size("18 Years", 5).unwrap(), "15-19");
-        assert_eq!(generalize_size("24 Yrs./Male", 5).unwrap(), "20-24");
-        assert_eq!(generalize_size("25YRS/MALE", 10).unwrap(), "20-29");
-        assert_eq!(generalize_size("2 वर्ष", 5).unwrap(), "0-4");
-        assert_eq!(generalize_size("94 Years", 5).unwrap(), "90+");
-        assert_eq!(generalize_size("illegible", 5), None);
-    }
-
-    #[test]
-    fn dates_coarsen_across_the_formats_this_corpus_uses() {
-        for (input, month, want) in [
-            ("27/10/2024", true, "2024-10"),
-            ("25/4/2025", true, "2025-04"),
-            ("2025-04-21 2:24 pm", true, "2025-04"),
-            ("21-Apr-2025 03:11 PM", true, "2025-04"),
-            ("Oct 29, 2024, 04:57 p.m.", true, "2024-10"),
-            ("21/4/25", true, "2025-04"),
-            ("27/10/2024", false, "2024"),
-        ] {
-            assert_eq!(date_precision(input, month).as_deref(), Some(want), "input {input}");
-        }
-        assert_eq!(date_precision("illegible", true), None);
-    }
-
-    #[test]
     fn hashing_is_stable_and_salt_dependent() {
         assert_eq!(hash_token(SALT, "BOCW/UP/1"), hash_token(SALT, "BOCW/UP/1"));
         assert_ne!(hash_token(SALT, "BOCW/UP/1"), hash_token("other", "BOCW/UP/1"));
@@ -1466,21 +1309,9 @@ mod tests {
     #[test]
     fn empty_values_survive_transforms_unchanged() {
         let cfg = NestedJsonConfig::default();
-        for action in [Action::Hash, Action::GeneralizeSize { size: 5 }, Action::GeneralizeDate { month: true }] {
+        for action in [Action::Hash, Action::Charcloak] {
             let got = apply(&action, &json!(""), "", &cfg, &mut KeyStore::with_salt(SALT));
             assert_eq!(got, Some(json!("")), "{action:?} should leave an empty value alone");
-        }
-    }
-
-    #[test]
-    fn unparseable_values_are_suppressed_not_passed_through() {
-        let cfg = NestedJsonConfig::default();
-        for action in [
-            Action::GeneralizeDate { month: true },
-            Action::GeneralizeSize { size: 5 },
-        ] {
-            let got = apply(&action, &json!("illegible"), "", &cfg, &mut KeyStore::with_salt(SALT));
-            assert_eq!(got, None, "{action:?} must drop a value it cannot generalize");
         }
     }
 
@@ -1543,8 +1374,8 @@ mod tests {
                 Rule::new("**.link", Action::Suppress),
                 Rule::new("case_id", Action::Hash),
                 Rule::new("**.patient_uhid", Action::Hash),
-                Rule::new("**.patient_age", Action::GeneralizeSize { size: 5 }),
-                Rule::new("**.date_of_admission", Action::GeneralizeDate { month: true }),
+                Rule::new("**.patient_age", Action::Masking { spec: 1 }),
+                Rule::new("**.date_of_admission", Action::Masking { spec: 0 }),
                 Rule::new("total_documents", Action::Keep),
                 Rule::new("total_pages", Action::Keep),
                 Rule::new("**.document", Action::Keep),
@@ -1553,6 +1384,22 @@ mod tests {
                 Rule::new("**.patient_gender", Action::Keep),
                 Rule::new("**.final_diagnosis", Action::Keep),
                 Rule::new("**.lab_*", Action::Keep),
+            ],
+            // `21/04/2025` → `**/04/2025`: the day goes, month and year stay.
+            // `49Y` → `4*Y`: the age goes, its decade stays.
+            masking: vec![
+                parse_masking_config(&json!({
+                    "column": "**.date_of_admission",
+                    "apply_order": ["characters"],
+                    "characters_to_mask": [1, 2]
+                }))
+                .unwrap(),
+                parse_masking_config(&json!({
+                    "column": "**.patient_age",
+                    "apply_order": ["characters"],
+                    "characters_to_mask": [2]
+                }))
+                .unwrap(),
             ],
             ..Default::default()
         }
@@ -1609,8 +1456,8 @@ mod tests {
         let doc = nha_doc("BOCW/MP/1", "SURESH MEENA", "49Y");
         let (out, _) = anon(&doc);
         let ed = &out["pages"][0]["extracted_data"];
-        assert_eq!(ed["patient_age"], json!("45-49"));
-        assert_eq!(ed["date_of_admission"], json!("2025-04"));
+        assert_eq!(ed["patient_age"], json!("4*Y"));
+        assert_eq!(ed["date_of_admission"], json!("**/04/2025"));
         assert_eq!(ed["patient_gender"], json!("Male"), "kept for utility");
         assert_eq!(ed["final_diagnosis"], json!("CAD"));
     }
@@ -1840,8 +1687,8 @@ mod tests {
         for (cfg, want) in [
             (base(json!({"keep": "**.a"})), "keep"),
             (base(json!({"masking": [{"masking_char": "*"}]})), "column"),
-            (base(json!({"size": {"**.a": 0}})), "positive"),
-            (base(json!({"qi_constraints": {"**.d": {"precision": "day"}}})), "month"),
+            (base(json!({"size": {"**.a": 5}})), "size is not supported"),
+            (base(json!({"qi_constraints": {"**.d": {"precision": "month"}}})), "characters_to_mask"),
         ] {
             let err = parse_nested_json(&cfg).unwrap_err();
             assert!(format!("{err:?}").contains(want), "expected {want} in {err:?}");
@@ -1871,11 +1718,9 @@ mod tests {
             "charcloak": [],
             "tokenization": [],
             "fpe": [],
-            "size": {"**.patient_age": 10},
             "qi_constraints": {
-                "**.*date*": {"precision": "year"},
                 // An intervals-only entry is the tabular flow's business, and
-                // must not be mistaken for a date rule here.
+                // must not be mistaken for a rule here.
                 "**.something": {"intervals": [{"from": 1, "to": 10}]}
             }
         }))
@@ -1889,8 +1734,6 @@ mod tests {
             ("pages.[].extracted_data.patient_name", Action::Suppress),
             ("pages.[].extracted_data.doctor_signature", Action::Masking { spec: 0 }),
             ("case_id", Action::Hash),
-            ("pages.[].extracted_data.patient_age", Action::GeneralizeSize { size: 10 }),
-            ("pages.[].extracted_data.issue_date", Action::GeneralizeDate { month: false }),
             ("pages.[].something", Action::Suppress),
         ] {
             assert_eq!(decide(&cfg, &path(path_str)).0, &want, "{path_str}");

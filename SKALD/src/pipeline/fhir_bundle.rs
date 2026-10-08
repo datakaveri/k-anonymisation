@@ -138,20 +138,6 @@ pub fn parse_fhir_bundle(section: &Value) -> Result<FhirBundleConfig, PipelineEr
         })?;
     }
 
-    // Dates are coarsened with `masking` here, not generalization: FHIR dates
-    // are fixed-position ISO 8601, so masking the day and time characters is
-    // exact. Refuse the nested-JSON `precision` form rather than silently
-    // running a second date technique beside it.
-    if let Some(obj) = section.get("qi_constraints").and_then(Value::as_object) {
-        if let Some((path, _)) = obj.iter().find(|(_, c)| c.get("precision").is_some()) {
-            return Err(validation(
-                "CONFIG_INVALID_VALUE",
-                "qi_constraints precision is not used by fhir_bundle",
-                &format!("{path}: mask FHIR dates with a 'masking' entry and 'characters_to_mask' instead"),
-            ));
-        }
-    }
-
     let (rules, specs) = parse_policy_rules(section)?;
     // Bundles are walked without a token vault or key store, so a reversible
     // technique here would have nowhere to keep its mapping. Refuse it rather

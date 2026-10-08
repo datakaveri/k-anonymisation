@@ -50,13 +50,76 @@
       "[].citizen_details.id",
       "**.complaint"
     ],
-    "qi_constraints": {
-      "[].*_on": { "precision": "month" },
-      "[].target_date": { "precision": "month" },
-      "**.created": { "precision": "month" },
-      "**.modified": { "precision": "month" }
-    },
-    "masking": [],
+    "masking": [
+      {
+        "column": "[].*_on",
+        "masking_char": "*",
+        "apply_order": [
+          "characters"
+        ],
+        "characters_to_mask": [
+          1,
+          2,
+          13,
+          14,
+          16,
+          17,
+          19,
+          20
+        ]
+      },
+      {
+        "column": "[].target_date",
+        "masking_char": "*",
+        "apply_order": [
+          "characters"
+        ],
+        "characters_to_mask": [
+          1,
+          2,
+          13,
+          14,
+          16,
+          17,
+          19,
+          20
+        ]
+      },
+      {
+        "column": "**.created",
+        "masking_char": "*",
+        "apply_order": [
+          "characters"
+        ],
+        "characters_to_mask": [
+          1,
+          2,
+          13,
+          14,
+          16,
+          17,
+          19,
+          20
+        ]
+      },
+      {
+        "column": "**.modified",
+        "masking_char": "*",
+        "apply_order": [
+          "characters"
+        ],
+        "characters_to_mask": [
+          1,
+          2,
+          13,
+          14,
+          16,
+          17,
+          19,
+          20
+        ]
+      }
+    ],
     "encrypt": [],
     "charcloak": [],
     "tokenization": [],

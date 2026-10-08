@@ -94,19 +94,17 @@ tabular technique keys, with globs in place of column names.
 | `charcloak` | Each letter/digit replaced by a random one of its class, punctuation kept — not stable across values or runs |
 | `tokenization` | `{"column", "prefix", "digits"}` → `PH-000001`; same value, same token; reversible through the vault |
 | `encrypt` | `"pattern"` → hex ciphertext, or `{"pattern": {"format_preserving": true}}` → same length and character classes; deterministic, reversible with the key |
-| `size` | `{"pattern": N}`: `"49Y"` → `"45-49"`; `90+` collapses to one band |
-| `qi_constraints` | `{"pattern": {"precision": "month"\|"year"}}`: `"21-Apr-2025 03:11 PM"` → `"2025-04"` / `"2025"` |
 | `free_text` | Passed through, labelled as cleared by an upstream NER pass |
 
 `hashing_without_salt` and `fpe` are refused when non-empty: an unsalted hash
 of a phone number is reversed by hashing every candidate, and `fpe` is
-`encrypt` with `format_preserving`. Null and empty values pass through every
+`encrypt` with `format_preserving`. Dates and ages are coarsened with
+`masking` — `characters_to_mask` over the positions to drop, e.g.
+`31/12/2025, 12:40 PM` → `**/12/2025, **:** **`, `49Y` → `4*Y` — so the
+retired `size` banding and `qi_constraints` `precision` entries are refused.
+Positions only line up when every value of a path shares one layout; where
+the layouts vary, suppress the path. Null and empty values pass through every
 technique unchanged.
-
-Messy real values are handled: ages arrive as `49Y`, `18 Years`,
-`24 Yrs./Male`, `2 वर्ष`; dates as `27/10/2024`, `21/4/25`,
-`2025-04-21 2:24 pm`, `Oct 29, 2024, 04:57 p.m.`. A value that will not parse
-is **suppressed, never passed through**.
 
 Structure is always preserved: containers are walked rather than matched, so no
 pattern can suppress a whole subtree; an object whose every leaf is suppressed
@@ -123,7 +121,7 @@ shifting every later index and making page numbers lie.
 - **The most specific pattern wins**, wherever it sits: fewer `**`, then fewer
   `*`, then more literal characters. On an exact tie the more protective
   action wins (suppress > masking > charcloak > hash > tokenization > encrypt >
-  generalization > keep), so an accidental overlap fails closed.
+  keep), so an accidental overlap fails closed.
 
 ## Rule order is load-bearing
 
@@ -179,9 +177,6 @@ free text.
 **Redacted** — signatures and stamps, keeping the fact without the identity.
 
 **Hashed** — `case_id`.
-
-**Coarsened** — `patient_age` → 5-year bands; all dates and timestamps →
-year-month.
 
 **Kept** — diagnoses, procedures, lab values, vitals, examinations,
 treatments, medications, `document_type`, gender, `district`/`state`,
