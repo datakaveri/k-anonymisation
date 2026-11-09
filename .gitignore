@@ -22,9 +22,15 @@ coverage.txt
 target/
 SKALD/target/
 
+# Real datasets live in folders under data/ and must never be committed: one
+# file can be one person's record.
+data/*/
+
 # Runtime generated folders/files
 chunks/
 output/
+# Key material: token vaults, encryption keys, hash salts. Never commit.
+keys/
 SKALD/output/
 SKALD/debug/
 encodings/
@@ -35,18 +41,38 @@ log.txt
 .env
 SKALD/.env
 
-# Archives and scratch
+# Archives and scratch (release bundles belong on a GitHub Release)
 *.zip
+*.tar.gz
+*.tgz
 temp/
 SKALD/temp/
 legacy_archive/
 
 # Data files — large or pipeline-generated
 data/*.csv
+data/*.json
+data/*.xlsx
+data/*.xls
 data/*.enc
 data/secret.key
+*.pem
+*.key
+*.p12
 data/*.py
 data/pipeline-config-*.json
+
+# Dataset-specific configs and tooling stay local; only the generic examples
+# in config/ are tracked
+config/*
+!config/config.json
+!config/config_pass1.json
+!config/config_pass2.json
+scripts/build_nha_fhir_code_rules.py
+
+# SKALD local dev data and test configs (not for repo)
+SKALD/data/
+SKALD/config/
 
 # Benchmarking
 benchmark/
@@ -56,13 +82,25 @@ SKALD_main.py
 SKALD_server.py
 server_config.cfg
 
-# Generated docs and release artefacts
+# Internal documents (review reports, design notes, test reports) stay local
 docs/
 RELEASE_NOTES.md
+dist/
 
 # Error code scratch files
 error_codes.txt
 
 .codex
 
-tests/
+# Legacy Python tests at the repo root (SKALD/tests/ holds the Rust
+# integration tests and is tracked)
+/tests/
+
+fhir_anonymizer/
+/dp/
+/pipeline/
+/synthetic/
+
+*.coverage
+
+run_supp0/

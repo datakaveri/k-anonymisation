@@ -1,0 +1,9 @@
+# Default owners for everything in the repository.
+*                                       @Kailash-Reddy @novoneel-iudx
+
+# Privacy-critical code: changes here alter what gets released.
+/SKALD/src/pipeline/anonymization/      @Kailash-Reddy @novoneel-iudx
+/SKALD/src/pipeline/preprocess/         @Kailash-Reddy @novoneel-iudx
+/SKALD/src/pipeline/bootstrap.rs        @Kailash-Reddy @novoneel-iudx
+/SKALD/tests/                           @Kailash-Reddy @novoneel-iudx
+/.github/                               @Kailash-Reddy

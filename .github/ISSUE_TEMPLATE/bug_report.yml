@@ -1,0 +1,33 @@
+name: Bug report
+description: Something SKALD does wrong (not a security or privacy vulnerability — see SECURITY.md)
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste real records, keys, salts or token vaults.** Use synthetic data that reproduces the problem.
+  - type: input
+    id: version
+    attributes:
+      label: SKALD version
+      description: Output of `skald_pipeline --version`
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Config (redacted)
+      description: The data_type section, with credentials removed
+      render: json
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce, with synthetic data
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual (include status.json's error block, if any)
+    validations:
+      required: true

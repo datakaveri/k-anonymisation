@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest a new technique, input format or option
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy considerations
+      description: Could this change what gets released, or how much can be inferred from it?
