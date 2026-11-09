@@ -1,0 +1,7 @@
+# Pinned so local builds, CI and the release binary use one compiler.
+# Bump deliberately, in its own PR, together with the Dockerfile's rust image.
+[toolchain]
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl"]
+profile = "minimal"

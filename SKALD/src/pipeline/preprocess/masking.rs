@@ -10,7 +10,7 @@
 //! All public items in this module are `pub(super)` — they are accessed only
 //! through the parent `preprocess` module.
 
-use crate::pipeline::bootstrap::{validation, PipelineError};
+use crate::pipeline::bootstrap::{PipelineError, validation};
 use regex::Regex;
 use serde_json::Value;
 
@@ -20,14 +20,14 @@ use serde_json::Value;
 ///
 /// Tokenization replaces original values with opaque sequential tokens of the
 /// form `<prefix><zero-padded-id>`, preserving a reversible vault mapping.
-#[derive(Debug)]
-pub(super) struct TokenizationConfigLite {
+#[derive(Debug, Clone)]
+pub(crate) struct TokenizationConfigLite {
     /// Target CSV column name.
-    pub(super) column: String,
+    pub(crate) column: String,
     /// Token prefix string (default: `"TK-"`).
-    pub(super) prefix: String,
+    pub(crate) prefix: String,
     /// Number of zero-padded digits in the token suffix (default: `6`).
-    pub(super) digits: usize,
+    pub(crate) digits: usize,
 }
 
 /// Parses a single tokenization config entry from the pipeline JSON.
@@ -38,10 +38,10 @@ pub(super) struct TokenizationConfigLite {
 /// # Errors
 /// Returns [`PipelineError`] with code `PREPROCESS_CONFIG_INVALID` if the
 /// entry is not an object, `"column"` is missing, or `"digits"` is ≤ 0.
-pub(super) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationConfigLite, PipelineError> {
-    let obj = entry
-        .as_object()
-        .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "Each tokenization entry must be an object", "tokenization"))?;
+pub(crate) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationConfigLite, PipelineError> {
+    let obj = entry.as_object().ok_or_else(|| {
+        validation("PREPROCESS_CONFIG_INVALID", "Each tokenization entry must be an object", "tokenization")
+    })?;
     let column = obj
         .get("column")
         .and_then(Value::as_str)
@@ -55,43 +55,6 @@ pub(super) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationCon
     Ok(TokenizationConfigLite { column, prefix, digits: digits as usize })
 }
 
-// ── FPE (format-preserving encryption) ───────────────────────────────────────
-
-/// Lightweight FPE configuration parsed from a pipeline config entry.
-///
-/// FPE encrypts a value while preserving its structural format (e.g. PAN, digits).
-#[derive(Debug)]
-pub(super) struct FpeConfigLite {
-    /// Target CSV column name.
-    pub(super) column: String,
-    /// Format type: `"pan"` (Indian PAN) or `"digits"` (digit-only strings).
-    pub(super) format: String,
-}
-
-/// Parses a single FPE config entry from the pipeline JSON.
-///
-/// # Arguments
-/// * `entry` — a JSON object with keys `"column"` (required) and `"format"`.
-///
-/// # Errors
-/// Returns [`PipelineError`] with code `PREPROCESS_CONFIG_INVALID` if the
-/// entry is malformed or `"format"` is not `"pan"` or `"digits"`.
-pub(super) fn parse_fpe_config(entry: &Value) -> Result<FpeConfigLite, PipelineError> {
-    let obj = entry
-        .as_object()
-        .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "Each FPE entry must be an object", "fpe"))?;
-    let column = obj
-        .get("column")
-        .and_then(Value::as_str)
-        .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "FPE config missing 'column'", "fpe"))?
-        .to_string();
-    let format = obj.get("format").and_then(Value::as_str).unwrap_or("pan").to_string();
-    if format != "pan" && format != "digits" {
-        return Err(validation("PREPROCESS_CONFIG_INVALID", "FPE format must be 'pan' or 'digits'", &column));
-    }
-    Ok(FpeConfigLite { column, format })
-}
-
 // ── Symmetric / format-preserving encryption config ──────────────────────────
 
 /// Lightweight encryption configuration parsed from a pipeline config entry.
@@ -99,12 +62,13 @@ pub(super) fn parse_fpe_config(entry: &Value) -> Result<FpeConfigLite, PipelineE
 /// Supports both pseudo-encryption (XOR keystream, `format_preserving: false`)
 /// and format-preserving general encryption (`format_preserving: true`).
 #[derive(Debug)]
-pub(super) struct EncryptConfigLite {
+pub(crate) struct EncryptConfigLite {
     /// Target CSV column name.
-    pub(super) column: String,
-    /// `true` → use [`format_preserving_encrypt_general`]; `false` → use
-    /// [`pseudo_encrypt`] (XOR keystream, hex output with `"ENC$"` prefix).
-    pub(super) format_preserving: bool,
+    pub(crate) column: String,
+    /// `true` → NIST FF1 format-preserving encryption
+    /// ([`super::crypto::format_preserving_encrypt`]); `false` → AES-SIV with
+    /// `"ENC1$"` + hex output ([`super::crypto::encrypt_value`]).
+    pub(crate) format_preserving: bool,
 }
 
 /// Parses a single encrypt config entry from the pipeline JSON.
@@ -116,7 +80,7 @@ pub(super) struct EncryptConfigLite {
 /// # Errors
 /// Returns [`PipelineError`] with code `PREPROCESS_CONFIG_INVALID` for
 /// malformed entries.
-pub(super) fn parse_encrypt_config(entry: &Value) -> Result<EncryptConfigLite, PipelineError> {
+pub(crate) fn parse_encrypt_config(entry: &Value) -> Result<EncryptConfigLite, PipelineError> {
     if let Some(col) = entry.as_str() {
         return Ok(EncryptConfigLite { column: col.to_string(), format_preserving: false });
     }
@@ -124,14 +88,15 @@ pub(super) fn parse_encrypt_config(entry: &Value) -> Result<EncryptConfigLite, P
         .as_object()
         .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "Encrypt entry must be string or object", "encrypt"))?;
     if obj.len() != 1 {
-        return Err(validation("PREPROCESS_CONFIG_INVALID", "Encrypt object entry must contain one column key", "encrypt"));
+        return Err(validation(
+            "PREPROCESS_CONFIG_INVALID",
+            "Encrypt object entry must contain one column key",
+            "encrypt",
+        ));
     }
     let (column, opts) = obj.iter().next().expect("checked len=1");
-    let format_preserving = opts
-        .as_object()
-        .and_then(|m| m.get("format_preserving"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let format_preserving =
+        opts.as_object().and_then(|m| m.get("format_preserving")).and_then(Value::as_bool).unwrap_or(false);
     Ok(EncryptConfigLite { column: column.clone(), format_preserving })
 }
 
@@ -140,42 +105,37 @@ pub(super) fn parse_encrypt_config(entry: &Value) -> Result<EncryptConfigLite, P
 /// Describes how a regex pattern is specified — either as a literal regex string
 /// or as a semantic descriptor that is converted to a regex at apply time.
 #[derive(Debug, Clone)]
-pub(super) enum RegexPatternKind {
+pub(crate) enum RegexPatternKind {
     /// A literal regex string provided directly in the config.
     Literal(String),
     /// A semantic descriptor: `type` is one of `"before"`, `"after"`,
     /// `"in_between"`; `delimiter`/`start`/`end` define anchors.
-    Derived {
-        pattern_type: String,
-        delimiter: Option<String>,
-        start: Option<String>,
-        end: Option<String>,
-    },
+    Derived { pattern_type: String, delimiter: Option<String>, start: Option<String>, end: Option<String> },
 }
 
 /// Per-pattern masking configuration within a column's `regex_patterns` list.
 #[derive(Debug, Clone)]
-pub(super) struct RegexPatternConfig {
+pub(crate) struct RegexPatternConfig {
     /// How the pattern is specified.
-    pub(super) kind: RegexPatternKind,
+    pub(crate) kind: RegexPatternKind,
     /// Character used to replace matched text (may override the column default).
-    pub(super) masking_char: char,
+    pub(crate) masking_char: char,
     /// Optional character count for delimiter-length masking
     /// (`type=before`/`after` + `length` key).
-    pub(super) length: Option<usize>,
+    pub(crate) length: Option<usize>,
     /// Optional group-level masking: pairs of `(capture_group_index, "full"|"partial")`.
-    pub(super) mask_groups: Vec<(usize, String)>,
+    pub(crate) mask_groups: Vec<(usize, String)>,
     /// Semantic type (`"before"`, `"after"`, `"in_between"`) — stored regardless
     /// of whether a literal `regex` field is also present, so delimiter-length
     /// masking fires even when the kind is `Literal`.
-    pub(super) pattern_type: Option<String>,
+    pub(crate) pattern_type: Option<String>,
     /// Delimiter string for `"before"` / `"after"` length masking — stored
     /// alongside `kind` for the same reason.
-    pub(super) delimiter: Option<String>,
+    pub(crate) delimiter: Option<String>,
     /// Start anchor for `"in_between"` patterns (used in derived fallback).
-    pub(super) start: Option<String>,
+    pub(crate) start: Option<String>,
     /// End anchor for `"in_between"` patterns (used in derived fallback).
-    pub(super) end: Option<String>,
+    pub(crate) end: Option<String>,
 }
 
 /// Full masking configuration for one CSV column.
@@ -186,24 +146,24 @@ pub(super) struct RegexPatternConfig {
 /// 2. **regex** — apply one or more regex patterns.
 /// 3. **class** — replace each character with a fixed or random character of
 ///    the same class.
-#[derive(Debug)]
-pub(super) struct MaskingConfigLite {
+#[derive(Debug, Clone)]
+pub(crate) struct MaskingConfigLite {
     /// Target CSV column name.
-    pub(super) column: String,
+    pub(crate) column: String,
     /// Default masking character for this column (e.g. `'*'`).
-    pub(super) masking_char: char,
+    pub(crate) masking_char: char,
     /// 1-based character positions to mask (applied in the `"characters"` step).
-    pub(super) characters_to_mask: Vec<usize>,
+    pub(crate) characters_to_mask: Vec<usize>,
     /// Regex patterns applied in the `"regex"` step.
-    pub(super) regex_patterns: Vec<RegexPatternConfig>,
+    pub(crate) regex_patterns: Vec<RegexPatternConfig>,
     /// Ordered list of steps to apply: `"characters"`, `"regex"`, `"class"`.
-    pub(super) apply_order: Vec<String>,
+    pub(crate) apply_order: Vec<String>,
     /// Class masking mode: `"random_class"` or `"fixed_class"`, or `None`.
-    pub(super) class_masking_mode: Option<String>,
+    pub(crate) class_masking_mode: Option<String>,
     /// Character used to replace letters in `"fixed_class"` mode (default `'X'`).
-    pub(super) class_letter: char,
+    pub(crate) class_letter: char,
     /// Character used to replace digits in `"fixed_class"` mode (default `'0'`).
-    pub(super) class_digit: char,
+    pub(crate) class_digit: char,
 }
 
 /// Parses a single masking config entry from the pipeline JSON.
@@ -217,7 +177,7 @@ pub(super) struct MaskingConfigLite {
 /// # Errors
 /// Returns [`PipelineError`] with code `PREPROCESS_CONFIG_INVALID` for
 /// malformed entries.
-pub(super) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, PipelineError> {
+pub(crate) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, PipelineError> {
     let obj = entry
         .as_object()
         .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "Each masking entry must be an object", "masking"))?;
@@ -227,11 +187,8 @@ pub(super) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, P
         .ok_or_else(|| validation("PREPROCESS_CONFIG_INVALID", "Masking config missing 'column'", "masking"))?
         .to_string();
 
-    let masking_char_s = obj
-        .get("masking_char")
-        .or_else(|| obj.get("masking_character"))
-        .and_then(Value::as_str)
-        .unwrap_or("*");
+    let masking_char_s =
+        obj.get("masking_char").or_else(|| obj.get("masking_character")).and_then(Value::as_str).unwrap_or("*");
     let masking_char = masking_char_s
         .chars()
         .next()
@@ -279,9 +236,9 @@ pub(super) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, P
             // Extract semantic info unconditionally — needed for length masking and
             // derived fallback even when a literal "regex" field is also present.
             let pattern_type_val = pobj.get("type").and_then(Value::as_str).map(|s| s.to_lowercase());
-            let delimiter_val    = pobj.get("delimiter").and_then(Value::as_str).map(|s| s.to_string());
-            let start_val        = pobj.get("start").and_then(Value::as_str).map(|s| s.to_string());
-            let end_val          = pobj.get("end").and_then(Value::as_str).map(|s| s.to_string());
+            let delimiter_val = pobj.get("delimiter").and_then(Value::as_str).map(|s| s.to_string());
+            let start_val = pobj.get("start").and_then(Value::as_str).map(|s| s.to_string());
+            let end_val = pobj.get("end").and_then(Value::as_str).map(|s| s.to_string());
 
             let kind = if let Some(r) = pobj.get("regex").and_then(Value::as_str) {
                 RegexPatternKind::Literal(r.to_string())
@@ -315,12 +272,95 @@ pub(super) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, P
         .unwrap_or_else(|| vec!["characters".to_string(), "regex".to_string(), "class".to_string()]);
 
     let class_masking_mode = obj.get("class_masking_mode").and_then(Value::as_str).map(|s| s.to_string());
-    let class_letter = obj.get("class_mask_letter").and_then(Value::as_str)
-        .unwrap_or("X").chars().next().unwrap_or('X');
-    let class_digit  = obj.get("class_mask_digit").and_then(Value::as_str)
-        .unwrap_or("0").chars().next().unwrap_or('0');
+    let class_letter =
+        obj.get("class_mask_letter").and_then(Value::as_str).unwrap_or("X").chars().next().unwrap_or('X');
+    let class_digit = obj.get("class_mask_digit").and_then(Value::as_str).unwrap_or("0").chars().next().unwrap_or('0');
 
-    Ok(MaskingConfigLite { column, masking_char, characters_to_mask, regex_patterns, apply_order, class_masking_mode, class_letter, class_digit })
+    let cfg = MaskingConfigLite {
+        column,
+        masking_char,
+        characters_to_mask,
+        regex_patterns,
+        apply_order,
+        class_masking_mode,
+        class_letter,
+        class_digit,
+    };
+    validate_masking_config(&cfg)?;
+    Ok(cfg)
+}
+
+/// Refuses a masking entry that would leave some or all values unmasked.
+///
+/// Masking used to fail open: a regex the `regex` crate cannot compile (e.g.
+/// one with a lookbehind) left the value untouched, as did an entry with no
+/// step, an unknown class mode, or a step left out of `apply_order`. Each of
+/// those published the column in clear while the run reported success.
+fn validate_masking_config(cfg: &MaskingConfigLite) -> Result<(), PipelineError> {
+    let invalid =
+        |msg: &str, detail: String| validation("PREPROCESS_CONFIG_INVALID", msg, &format!("{}: {detail}", cfg.column));
+    for step in &cfg.apply_order {
+        if !["characters", "regex", "class"].contains(&step.as_str()) {
+            return Err(invalid("Unknown masking step in apply_order", step.clone()));
+        }
+    }
+    let ordered = |step: &str| cfg.apply_order.iter().any(|s| s == step);
+    let configured = [
+        ("characters", !cfg.characters_to_mask.is_empty()),
+        ("regex", !cfg.regex_patterns.is_empty()),
+        ("class", cfg.class_masking_mode.is_some()),
+    ];
+    if !configured.iter().any(|(_, on)| *on) {
+        return Err(invalid(
+            "Masking entry specifies no masking step, so it would mask nothing",
+            "give it 'characters_to_mask', 'regex_patterns', or 'class_masking_mode' \
+             (\"fixed_class\" masks the whole value)"
+                .to_string(),
+        ));
+    }
+    for (step, on) in configured {
+        if on && !ordered(step) {
+            return Err(invalid("Masking step is configured but missing from apply_order", step.to_string()));
+        }
+    }
+    if let Some(mode) = &cfg.class_masking_mode
+        && mode != "random_class"
+        && mode != "fixed_class"
+    {
+        return Err(invalid("class_masking_mode must be \"random_class\" or \"fixed_class\"", mode.clone()));
+    }
+    for pat in &cfg.regex_patterns {
+        let derived = || {
+            derive_regex(
+                pat.pattern_type.as_deref().unwrap_or(""),
+                pat.delimiter.as_deref(),
+                pat.start.as_deref(),
+                pat.end.as_deref(),
+            )
+        };
+        let ok = match &pat.kind {
+            RegexPatternKind::Literal(r) => {
+                Regex::new(r).is_ok() || {
+                    let d = derived();
+                    !d.is_empty() && Regex::new(&d).is_ok()
+                }
+            }
+            RegexPatternKind::Derived { .. } => {
+                let d = derived();
+                !d.is_empty() && Regex::new(&d).is_ok()
+            }
+        };
+        if !ok {
+            let what = match &pat.kind {
+                RegexPatternKind::Literal(r) => format!("regex {r:?} does not compile (lookaround is not supported)"),
+                RegexPatternKind::Derived { .. } => {
+                    "the type/delimiter/start/end do not describe a pattern".to_string()
+                }
+            };
+            return Err(invalid("Masking regex pattern cannot be used, so values would go out unmasked", what));
+        }
+    }
+    Ok(())
 }
 
 // ── Regex helpers ─────────────────────────────────────────────────────────────
@@ -340,7 +380,12 @@ pub(super) fn parse_masking_config(entry: &Value) -> Result<MaskingConfigLite, P
 /// * `delimiter` — delimiter character/string (used for `"before"` / `"after"`).
 /// * `start` — start anchor (used for `"in_between"`).
 /// * `end` — end anchor (used for `"in_between"`; `"$"` means end-of-string).
-pub(super) fn derive_regex(pattern_type: &str, delimiter: Option<&str>, start: Option<&str>, end: Option<&str>) -> String {
+pub(super) fn derive_regex(
+    pattern_type: &str,
+    delimiter: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> String {
     // All patterns use capturing group 1 for the text to mask — avoids lookbehind
     // assertions that the Rust `regex` crate does not support.
     match pattern_type {
@@ -382,7 +427,13 @@ pub(super) fn derive_regex(pattern_type: &str, delimiter: Option<&str>, start: O
 ///
 /// # Returns
 /// `(masked_text, changed)` where `changed` is `true` if any masking occurred.
-pub(super) fn apply_delimiter_length_mask(text: &str, pattern_type: &str, delimiter: &str, length: usize, mask_char: char) -> (String, bool) {
+pub(super) fn apply_delimiter_length_mask(
+    text: &str,
+    pattern_type: &str,
+    delimiter: &str,
+    length: usize,
+    mask_char: char,
+) -> (String, bool) {
     if delimiter.is_empty() || length == 0 {
         return (text.to_string(), false);
     }
@@ -391,9 +442,8 @@ pub(super) fn apply_delimiter_length_mask(text: &str, pattern_type: &str, delimi
     let mut changed = false;
     let mut search_start = 0usize;
 
-    loop {
-        // find delimiter byte offset from search_start
-        let Some(byte_idx) = text_str[search_start..].find(delimiter) else { break };
+    // find delimiter byte offset from search_start
+    while let Some(byte_idx) = text_str[search_start..].find(delimiter) {
         let abs_byte = search_start + byte_idx;
 
         // convert byte offset to char offset
@@ -409,13 +459,15 @@ pub(super) fn apply_delimiter_length_mask(text: &str, pattern_type: &str, delimi
             (e.saturating_sub(length), e)
         };
 
-        for i in start_ci..end_ci {
-            chars[i] = mask_char;
+        for c in &mut chars[start_ci..end_ci] {
+            *c = mask_char;
             changed = true;
         }
 
         search_start = abs_byte + delimiter.len();
-        if search_start >= text_str.len() { break; }
+        if search_start >= text_str.len() {
+            break;
+        }
     }
 
     (chars.into_iter().collect(), changed)
@@ -443,7 +495,7 @@ pub(super) fn apply_regex_pattern(value: &str, pat: &RegexPatternConfig, _column
     // 1. Delimiter-length masking (fires regardless of kind, uses stored semantic fields)
     if let Some(length) = pat.length {
         let pattern_type = pat.pattern_type.as_deref().unwrap_or("");
-        let delimiter    = pat.delimiter.as_deref().unwrap_or("");
+        let delimiter = pat.delimiter.as_deref().unwrap_or("");
         if !delimiter.is_empty() && (pattern_type == "before" || pattern_type == "after") {
             let (result, changed) = apply_delimiter_length_mask(value, pattern_type, delimiter, length, mask_char);
             if changed {
@@ -469,13 +521,16 @@ pub(super) fn apply_regex_pattern(value: &str, pat: &RegexPatternConfig, _column
     let compiled = match Regex::new(&regex_str) {
         Ok(r) => r,
         Err(_) => {
-            let pt      = pat.pattern_type.as_deref().unwrap_or("");
+            let pt = pat.pattern_type.as_deref().unwrap_or("");
             let derived = derive_regex(pt, pat.delimiter.as_deref(), pat.start.as_deref(), pat.end.as_deref());
             if derived.is_empty() {
                 return value.to_string();
             }
             match Regex::new(&derived) {
-                Ok(r) => { is_derived = true; r }
+                Ok(r) => {
+                    is_derived = true;
+                    r
+                }
                 Err(_) => return value.to_string(),
             }
         }
@@ -513,7 +568,12 @@ pub(super) fn apply_regex_pattern(value: &str, pat: &RegexPatternConfig, _column
 /// * `re` — pre-compiled regular expression.
 /// * `mask_groups` — list of `(capture_group_index, mode)` pairs.
 /// * `default_mask` — the masking character.
-pub(super) fn apply_regex_group_mask(value: &str, re: &Regex, mask_groups: &[(usize, String)], default_mask: char) -> String {
+pub(super) fn apply_regex_group_mask(
+    value: &str,
+    re: &Regex,
+    mask_groups: &[(usize, String)],
+    default_mask: char,
+) -> String {
     re.replace_all(value, |caps: &regex::Captures| {
         let full_match = caps.get(0).map(|m| m.as_str()).unwrap_or("");
         let mut rebuilt = full_match.to_string();
@@ -538,7 +598,8 @@ pub(super) fn apply_regex_group_mask(value: &str, re: &Regex, mask_groups: &[(us
             }
         }
         rebuilt
-    }).to_string()
+    })
+    .to_string()
 }
 
 /// Applies all masking steps configured in `cfg` to `value` in the order
@@ -558,11 +619,11 @@ pub(super) fn apply_regex_group_mask(value: &str, re: &Regex, mask_groups: &[(us
 /// * `cfg` — the parsed masking configuration for this column.
 /// * `randomize_fn` — callback that implements class-preserving randomization
 ///   (typically [`super::crypto::randomize_preserving_class`]).
-pub(super) fn apply_masking_value(
+pub(crate) fn apply_masking_value(
     value: &str,
     cfg: &MaskingConfigLite,
-    randomize_fn: &dyn Fn(&str) -> String,
-) -> String {
+    randomize_fn: &dyn Fn(&str) -> Result<String, PipelineError>,
+) -> Result<String, PipelineError> {
     let mut masked = value.to_string();
 
     for step in &cfg.apply_order {
@@ -584,13 +645,19 @@ pub(super) fn apply_masking_value(
             }
             "class" => {
                 masked = match cfg.class_masking_mode.as_deref() {
-                    Some("random_class") => randomize_fn(&masked),
+                    Some("random_class") => randomize_fn(&masked)?,
                     Some("fixed_class") => {
+                        // Letters and digits in any script, not just ASCII:
+                        // a Devanagari name must not pass through unmasked.
                         let mut out = String::with_capacity(masked.len());
                         for c in masked.chars() {
-                            if c.is_ascii_digit() { out.push(cfg.class_digit); }
-                            else if c.is_ascii_alphabetic() { out.push(cfg.class_letter); }
-                            else { out.push(c); }
+                            if c.is_numeric() {
+                                out.push(cfg.class_digit);
+                            } else if c.is_alphabetic() {
+                                out.push(cfg.class_letter);
+                            } else {
+                                out.push(c);
+                            }
                         }
                         out
                     }
@@ -601,5 +668,5 @@ pub(super) fn apply_masking_value(
         }
     }
 
-    masked
+    Ok(masked)
 }

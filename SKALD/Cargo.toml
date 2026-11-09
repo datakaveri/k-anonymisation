@@ -1,16 +1,52 @@
 [package]
 name = "skald_ola2"
-version = "0.1.0"
+version = "4.0.0"
 edition = "2024"
+rust-version = "1.92"
+description = "SKALD: chunk-wise k-anonymity (OLA) with l-diversity and column de-identification for tabular, nested-JSON and FHIR data"
+license = "Apache-2.0"
+repository = "https://github.com/datakaveri/k-anonymisation"
+readme = "../README.md"
+keywords = ["anonymization", "k-anonymity", "privacy", "l-diversity", "de-identification"]
+categories = ["command-line-utilities", "science", "cryptography"]
+publish = false
 
 [dependencies]
 aes = "0.8"
-cipher = "0.4"
+calamine = "0.38"
 hex = "0.4"
 hmac = "0.12"
-ndarray = "0.15"
 regex = "1.11"
+rust_xlsxwriter = "0.101"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha1 = "0.10"
+serde_json = { version = "1.0", features = ["preserve_order"] }
+unicode-normalization = "0.1"
 sha2 = "0.10"
+
+# ── PostgreSQL connector ─────────────────────────────────────────────────────
+# `postgres` is the synchronous client and is pure Rust — no libpq, so it links
+# into the static musl binary like everything else here. TLS is rustls rather
+# than native-tls for the same reason: OpenSSL would need dynamic linking and
+# would put a system library back into a bundle whose whole point is not having
+# one. `ring` is the crypto provider — it builds against musl with the same
+# toolchain the rest of the image already installs.
+postgres = "0.19"
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+aes-siv = "0.7"
+fpe = "0.6"
+num-bigint = "0.4"
+getrandom = "0.2"
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "ola"
+harness = false
+
+[profile.release]
+# Integer overflow in bin and lattice arithmetic must stop the run, not wrap.
+overflow-checks = true
