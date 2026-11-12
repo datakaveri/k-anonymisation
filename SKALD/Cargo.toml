@@ -37,7 +37,7 @@ webpki-roots = "1"
 aes-siv = "0.8"
 fpe = "0.6"
 num-bigint = "0.4"
-getrandom = "0.2"
+getrandom = "0.4"
 
 [dev-dependencies]
 proptest = "1"
