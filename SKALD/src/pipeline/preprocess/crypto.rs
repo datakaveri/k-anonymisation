@@ -34,7 +34,7 @@ use std::path::Path;
 /// fallback: a predictable key or salt is worse than no run at all.
 fn random_hex(n: usize) -> Result<String, PipelineError> {
     let mut buf = vec![0u8; n];
-    getrandom::getrandom(&mut buf).map_err(|e| {
+    getrandom::fill(&mut buf).map_err(|e| {
         validation("RNG_UNAVAILABLE", "The operating system's random number generator failed", &e.to_string())
     })?;
     Ok(hex::encode(buf))
@@ -425,7 +425,7 @@ pub fn format_preserving_decrypt(value: &str, master_key: &str, column: &str) ->
 pub(crate) fn randomize_preserving_class(value: &str) -> Result<String, PipelineError> {
     let chars: Vec<char> = value.chars().collect();
     let mut random_bytes = vec![0u8; chars.len() * 4];
-    getrandom::getrandom(&mut random_bytes).map_err(|e| {
+    getrandom::fill(&mut random_bytes).map_err(|e| {
         validation("RNG_UNAVAILABLE", "The operating system's random number generator failed", &e.to_string())
     })?;
     let mut out = String::with_capacity(value.len());

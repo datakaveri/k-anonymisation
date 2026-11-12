@@ -66,7 +66,7 @@ impl TokenVault {
         }
         loop {
             let mut b = [0u8; 8];
-            getrandom::getrandom(&mut b).map_err(|e| {
+            getrandom::fill(&mut b).map_err(|e| {
                 validation("RNG_UNAVAILABLE", "The operating system's random number generator failed", &e.to_string())
             })?;
             let token = format!("{}{:0width$}", cfg.prefix, u64::from_le_bytes(b) % space, width = cfg.digits);

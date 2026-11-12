@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "science", "cryptography"]
 publish = false
 
 [dependencies]
-aes = "0.8"
+aes = "0.9"
 calamine = "0.38"
 hex = "0.4"
 hmac = "0.12"
@@ -35,9 +35,9 @@ tokio-postgres-rustls = { version = "0.14", default-features = false, features =
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
 aes-siv = "0.8"
-fpe = "0.6"
+fpe = "0.7"
 num-bigint = "0.4"
-getrandom = "0.2"
+getrandom = "0.4"
 
 [dev-dependencies]
 proptest = "1"
