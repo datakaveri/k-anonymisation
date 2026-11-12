@@ -738,7 +738,7 @@ impl KeyStore {
         }
         let token = loop {
             let mut b = [0u8; 8];
-            getrandom::getrandom(&mut b).ok()?;
+            getrandom::fill(&mut b).ok()?;
             // Never hand a token out twice, whatever an edited vault holds.
             let t = format!("{}{:0width$}", spec.prefix, u64::from_le_bytes(b) % space, width = spec.digits);
             if !vault.reverse.contains_key(&t) {
