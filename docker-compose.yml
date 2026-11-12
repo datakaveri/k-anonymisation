@@ -1,35 +1,51 @@
-version: "3.8"
-
 # SKALD — Rust anonymization pipeline
 #
 # Usage:
 #   docker compose up --build      # build image and run pipeline once
 #   docker compose up              # run with previously built image
 #
-# Place your input CSV in ./data/ and config JSON in ./config/ before running.
-# Results are written to ./output/ on the host.
+# Place your input in ./data/ and config JSON in ./config/ before running.
+# Results are written to ./output/ — that directory is the release.
+# Key material (token vaults, encryption keys, hash salts) is written to
+# ./keys/ — back it up, keep it apart from the release, never ship it.
+#
+# The container runs as a non-root user. Create the host directories it writes
+# to and give them to that user first:
+#   mkdir -p output keys && sudo chown 65532:65532 output keys
+# or run as yourself: SKALD_UID=$(id -u) SKALD_GID=$(id -g) docker compose up
 
 services:
   skald:
-    image: ghcr.io/kailash-reddy/skald:skald_v3
+    image: ghcr.io/datakaveri/skald:v4.0.0
     build:
       context: .
       dockerfile: Dockerfile
     container_name: skald_pipeline
+    user: "${SKALD_UID:-65532}:${SKALD_GID:-65532}"
     # Pipeline is a one-shot batch process — no auto-restart
     restart: "no"
+    # With no arguments the first config in ./config is used and ./data is
+    # scanned for the single input file. Name a specific config instead when
+    # ./config holds several:
+    #   command: ["--config", "config/my_dataset.json"]
+    # environment:
+    #   # Credentials for a postgres input/output_sink stay out of the config
+    #   # file — the config names the variable ("password_env"), the
+    #   # deployment supplies it. PGPASSWORD is not read implicitly.
+    #   SKALD_PG_PASSWORD: "${SKALD_PG_PASSWORD:-}"
     volumes:
       # Config JSON read by pipeline  (host → container, read-only)
       - ./config:/app/config:ro
-      # Input CSV(s)                  (host → container, read-only)
+      # Input data                    (host → container, read-only)
       - ./data:/app/data:ro
-      # Pipeline outputs              (container → host, read-write)
+      # The release                   (container → host, read-write)
       - ./output:/app/output
-      # Scratch space for CSV chunks  (ephemeral, not exposed to host)
-      - skald_chunks:/app/chunks
+      # Key material — never inside ./output, never shipped
+      - ./keys:/app/keys
+    # Scratch for raw and preprocessed rows during a run. A tmpfs lives in
+    # memory and disappears with the container; a named volume would persist
+    # un-anonymized data on disk until `docker compose down -v`.
+    tmpfs:
+      - /app/chunks:uid=65532,gid=65532,mode=0700
     # Exit code mirrors pipeline status: 0 = success, 1 = error
     # Check ./output/status.json for structured result and ./output/pipeline.log for trace.
-
-volumes:
-  # Named volume for intermediate chunk files — discarded when container is removed
-  skald_chunks:

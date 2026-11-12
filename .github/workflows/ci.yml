@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: SKALD
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The toolchain comes from SKALD/rust-toolchain.toml; rustup installs it on
+# first use. Only GitHub-owned actions are used: the repository's action
+# allow-list blocks unverified publishers. Each is pinned to a full commit SHA.
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            SKALD/target
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('SKALD/Cargo.lock', 'SKALD/rust-toolchain.toml') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            SKALD/target
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('SKALD/Cargo.lock', 'SKALD/rust-toolchain.toml') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-
+      - run: cargo test --all-targets
+      # A known-defect test is marked #[ignore] until its fix lands. None may
+      # be left behind silently: list them so the job log shows any.
+      - run: cargo test --all-targets -- --ignored --list
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-0.22.2-${{ runner.os }}-${{ hashFiles('SKALD/rust-toolchain.toml') }}
+      - run: command -v cargo-audit || cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit
+
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            SKALD/target
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('SKALD/Cargo.lock', 'SKALD/rust-toolchain.toml') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

@@ -1,0 +1,5 @@
+# The codebase is written in a wide style; these settings keep `cargo fmt`
+# from reflowing it more than necessary.
+edition = "2024"
+max_width = 120
+use_small_heuristics = "Max"

@@ -13,124 +13,75 @@
 //! Public types and scan helpers are defined here in `mod.rs` and re-exported so callers can use
 //! a flat `pipeline::anonymization::*` import surface.
 
-mod ola;
 mod generalization;
+mod ola;
 
-pub use ola::{
-    build_interval_hierarchy,
-    find_ola1_initial_ri,
-    build_sparse_histogram,
-    find_ola2_best_rf,
-    find_ola2_best_rf_detailed,
-    equivalence_class_stats,
-    compute_parameter_grid,
-    compute_k_optimal,
-    GridEntry,
-    IntervalHierarchy,
-    Ola2NodeScore,
-    Ola2SearchResult,
-    QuasiIdentifierLite,
-    SparseHist,
+pub use generalization::{
+    GeneralizationSummary, LDiversity, generalize_and_write_outputs, generalize_and_write_outputs_with,
 };
-pub use generalization::generalize_and_write_outputs;
+pub use ola::{
+    CategoricalLevels, GRID_K_VALUES, GRID_SUPPRESSION_LIMITS, GridEntry, INVALID_BIN, IntervalHierarchy,
+    MAX_LATTICE_NODES, MAX_NUMERIC_QI_MAGNITUDE, NodeTrace, Ola2NodeScore, Ola2SearchResult, ParameterGrid,
+    QuasiIdentifierLite, SensitiveSets, SparseHist, ZHist, allowed_suppressions, attach_categorical_levels,
+    build_categorical_levels, build_direct_histogram, build_fixed_interval_hierarchy, build_interval_hierarchy,
+    build_sensitive_sets, build_sparse_histogram, build_z_histogram, categorical_ladder_len, compute_equivalence_space,
+    compute_k_optimal, compute_parameter_grid, compute_parameter_grid_for, compute_parameter_grid_z, compute_z_weights,
+    equivalence_class_stats, find_ola1_initial_ri, find_ola2_best_rf, find_ola2_best_rf_detailed,
+    find_ola2_best_rf_z_detailed, find_ola2_with, l_aware_class_sizes, merge_histogram, merge_z_histogram,
+    normalize_categorical, parse_numeric_qi, resolve_qi_columns, scan_chunks_for_flow, within_suppression_limit,
+    z_hist_to_sparse,
+};
 
-use crate::pipeline::bootstrap::{split_csv_line_basic, validation, PipelineError, RuntimeConfig};
+use crate::pipeline::bootstrap::{PipelineError, RuntimeConfig, open_csv, validation};
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 // ── Shared utility functions ─────────────────────────────────────────────────
 
-/// Strips encoding/scaling suffixes from an internal column name to recover
-/// the original human-readable name used in the pipeline configuration.
-///
-/// Recognized suffixes (checked in priority order):
-/// - `_scaled_encoded`
-/// - `_encoded`
-/// - `_scaled`
-///
-/// # Arguments
-/// * `col` — the potentially-suffixed column name.
-///
-/// # Returns
-/// The base column name with no suffix, or `col` unchanged if none matched.
-pub fn base_col_name(col: &str) -> String {
-    if let Some(v) = col.strip_suffix("_scaled_encoded") {
-        v.to_string()
-    } else if let Some(v) = col.strip_suffix("_encoded") {
-        v.to_string()
-    } else if let Some(v) = col.strip_suffix("_scaled") {
-        v.to_string()
-    } else {
-        col.to_string()
-    }
-}
-
 /// Scans all chunk CSV files and computes the global (min, max) for each
 /// numerical column in a single streaming pass.
 ///
-/// The result is used to populate `QuasiIdentifierLite::min_value` /
-/// `max_value` before entering the OLA phases.
-///
-/// # Arguments
-/// * `chunk_paths` — paths to the pre-processed chunk CSV files.
-/// * `numerical_columns` — column names to aggregate (must be numeric-valued).
+/// Values are read with [`parse_numeric_qi`], exactly as the histogram and the
+/// output step read them, so an unparseable or out-of-range cell (`NA`, `inf`,
+/// `-1e18`) cannot stretch the range and blur every other bin.
 ///
 /// # Returns
 /// A map from column name to `(global_min, global_max)`. Columns with no
 /// parseable values yield `(0.0, 0.0)`.
 ///
 /// # Errors
-/// Returns [`PipelineError`] if any chunk file cannot be opened or its header
-/// is malformed.
+/// Returns [`PipelineError`] if a chunk cannot be read, lacks a column, or has
+/// a row whose width differs from its header.
 pub fn compute_numerical_min_max(
     chunk_paths: &[PathBuf],
     numerical_columns: &[String],
 ) -> Result<BTreeMap<String, (f64, f64)>, PipelineError> {
-    // (min, max) accumulators — one entry per column, updated in a single pass per chunk
-    let mut acc: BTreeMap<String, (Option<f64>, Option<f64>)> =
-        numerical_columns.iter().map(|c| (c.clone(), (None, None))).collect();
-
+    let mut acc: Vec<Option<(i64, i64)>> = vec![None; numerical_columns.len()];
     for chunk_path in chunk_paths {
-        let f = fs::File::open(chunk_path)?;
-        let r = BufReader::new(f);
-        let mut lines = r.lines();
-        let header = lines
-            .next()
-            .ok_or_else(|| validation("ENCODING_FAILED", "Chunk missing header", &chunk_path.display().to_string()))?
-            .map_err(|e| validation("ENCODING_FAILED", "Failed reading header", &e.to_string()))?;
-        let headers = split_csv_line_basic(&header);
-
-        // Resolve column indices once per chunk (same schema across all chunks)
-        let col_indices: Vec<Option<usize>> = numerical_columns
+        let (headers, mut records) = open_csv(chunk_path)?;
+        let col_indices: Vec<usize> = numerical_columns
             .iter()
-            .map(|col| headers.iter().position(|h| h == col))
-            .collect();
-
-        for line in lines {
-            let line = line.map_err(|e| validation("GENERALIZATION_FAILED", "Failed reading row", &e.to_string()))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let fields = split_csv_line_basic(&line);
-            for (col_name, col_idx_opt) in numerical_columns.iter().zip(col_indices.iter()) {
-                let Some(col_idx) = col_idx_opt else { continue };
-                if *col_idx >= fields.len() {
-                    continue;
-                }
-                if let Ok(v) = fields[*col_idx].trim().parse::<f64>() {
-                    let entry = acc.get_mut(col_name).unwrap();
-                    entry.0 = Some(entry.0.map_or(v, |m: f64| m.min(v)));
-                    entry.1 = Some(entry.1.map_or(v, |m: f64| m.max(v)));
+            .map(|col| {
+                headers.iter().position(|h| h == col).ok_or_else(|| {
+                    validation("DATA_COLUMN_MISSING", "Quasi-identifier column not found in CSV header", col)
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        while let Some(fields) = records.next_record_of_width(headers.len())? {
+            for (slot, &idx) in acc.iter_mut().zip(&col_indices) {
+                if let Some(v) = parse_numeric_qi(&fields[idx]) {
+                    *slot = Some(slot.map_or((v, v), |(mn, mx)| (mn.min(v), mx.max(v))));
                 }
             }
         }
     }
-
-    Ok(acc
-        .into_iter()
-        .map(|(k, (mn, mx))| (k, (mn.unwrap_or(0.0), mx.unwrap_or(0.0))))
+    Ok(numerical_columns
+        .iter()
+        .zip(acc)
+        .map(|(c, mm)| {
+            let (mn, mx) = mm.unwrap_or((0, 0));
+            (c.clone(), (mn as f64, mx as f64))
+        })
         .collect())
 }
 
@@ -138,13 +89,10 @@ pub fn compute_numerical_min_max(
 /// pipeline configuration and the previously computed min/max map.
 ///
 /// Numerical QIs come first (in config order), followed by categorical QIs.
-///
-/// # Arguments
-/// * `cfg` — the validated runtime pipeline configuration.
-/// * `dynamic_min_max` — output of [`compute_numerical_min_max`].
-///
-/// # Returns
-/// A non-empty `Vec<QuasiIdentifierLite>`.
+/// A numerical QI's generalisation comes from, in order of precedence:
+/// `fixed_bins` (one fixed level, excluded from the lattice search),
+/// `qi_constraints` intervals (a multi-level hierarchy), or uniform bins
+/// widened by its `size` factor.
 ///
 /// # Errors
 /// Returns [`PipelineError`] with code `CONFIG_INVALID` when no QIs are
@@ -157,11 +105,13 @@ pub fn build_quasi_identifiers(
 
     for qi in &cfg.numerical_qis {
         let (mn, mx) = dynamic_min_max.get(&qi.column).copied().unwrap_or((0.0, 0.0));
-        let interval_hierarchy = if let Some(iv) = cfg.qi_interval_constraints.get(&qi.column) {
-            let split = cfg.size_factors.get(&qi.column).copied().unwrap_or(2) as usize;
-            Some(build_interval_hierarchy(iv.clone(), split))
+        let interval_hierarchy = if let Some(bins) = cfg.fixed_bins.get(&qi.column) {
+            Some(build_fixed_interval_hierarchy(bins.clone()))
         } else {
-            None
+            cfg.qi_interval_constraints.get(&qi.column).map(|iv| {
+                let split = cfg.size_factors.get(&qi.column).copied().unwrap_or(2).max(2) as usize;
+                build_interval_hierarchy(iv.clone(), split)
+            })
         };
         out.push(QuasiIdentifierLite {
             column_name: qi.column.clone(),
@@ -169,6 +119,7 @@ pub fn build_quasi_identifiers(
             min_value: Some(mn),
             max_value: Some(mx),
             interval_hierarchy,
+            categorical_levels: None,
         });
     }
 
@@ -179,6 +130,7 @@ pub fn build_quasi_identifiers(
             min_value: None,
             max_value: None,
             interval_hierarchy: None,
+            categorical_levels: None,
         });
     }
 

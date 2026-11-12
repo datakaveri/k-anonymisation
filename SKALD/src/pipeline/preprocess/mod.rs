@@ -8,60 +8,83 @@
 //! | Operation | Config key | Description |
 //! |---|---|---|
 //! | Column suppression | `suppress` | Drop columns entirely from output |
-//! | Salted hashing | `hashing_with_salt` | SHA-256 with a per-run random salt |
-//! | Unsalted hashing | `hashing_without_salt` | Deterministic SHA-256 |
+//! | Salted hashing | `hashing_with_salt` | HMAC-SHA256 keyed by a per-run random salt, or a per-column salt kept in the key directory (`shared_hash_salts`) |
 //! | Masking | `masking` | Position / regex / class-based character masking |
 //! | CharCloak | `charcloak` | Class-preserving random character replacement |
-//! | Tokenization | `tokenization` | Sequential opaque tokens with vault persistence |
-//! | FPE | `fpe` | Format-preserving encryption (PAN / digits) |
-//! | Encryption | `encrypt` | Pseudo-encryption or format-preserving encryption |
+//! | Tokenization | `tokenization` | Random opaque tokens with vault persistence |
+//! | Encryption | `encrypt` | AES-SIV, or NIST FF1 format-preserving encryption |
+//!
+//! Identifier values are normalised (trimmed, Unicode NFC) before hashing,
+//! tokenisation and encryption, so spacing variants get one pseudonym.
 //!
 //! The `crypto` submodule contains the cryptographic primitives and the
 //! `masking` submodule contains configuration parsing and masking logic.
 
-mod crypto;
-mod masking;
+pub mod crypto;
+pub(crate) mod masking;
 
-use crate::pipeline::bootstrap::{split_csv_line_basic, validation, PipelineError, RuntimeConfig};
+use crate::pipeline::bootstrap::{PipelineError, RuntimeConfig, csv_row_to_line, open_csv, validation};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crypto::{
-    fpe_digits_encrypt,
-    fpe_pan_encrypt,
-    format_preserving_encrypt_general,
-    generate_random_key_hex,
-    generate_random_salt_hex,
-    hash_hex,
-    pseudo_encrypt,
-    randomize_preserving_class,
-    read_json_map_string,
-    should_skip_value,
+    encrypt_value, ensure_private_dir, format_preserving_encrypt, generate_random_salt_hex, hash_key, key_for,
+    keyed_hash, normalize_identifier, randomize_preserving_class, read_json_map_string, should_skip_value,
     write_json_pretty,
 };
 
 use masking::{
-    apply_masking_value,
-    parse_encrypt_config,
-    parse_fpe_config,
-    parse_masking_config,
-    parse_tokenization_config,
-    EncryptConfigLite,
-    FpeConfigLite,
-    MaskingConfigLite,
-    TokenizationConfigLite,
+    EncryptConfigLite, MaskingConfigLite, TokenizationConfigLite, apply_masking_value, parse_encrypt_config,
+    parse_masking_config, parse_tokenization_config,
 };
+
+/// Per-column `hashing_with_salt` salts, in the key directory, when `shared_hash_salts` is on.
+pub(crate) const HASH_SALTS_FILE: &str = "tabular_hash_salts.json";
+
+/// One column's token mappings, both directions.
+struct TokenVault {
+    forward: BTreeMap<String, String>,
+    reverse: BTreeMap<String, String>,
+}
+
+impl TokenVault {
+    /// The token for `value`, issuing a new one if it has none.
+    ///
+    /// New tokens are random rather than sequential — a counter numbers values
+    /// in first-seen order, which leaks the input's order (and its sort key) —
+    /// and are checked against every token already issued.
+    fn token_for(&mut self, value: &str, cfg: &TokenizationConfigLite) -> Result<String, PipelineError> {
+        if let Some(t) = self.forward.get(value) {
+            return Ok(t.clone());
+        }
+        let space = 10u64.saturating_pow(cfg.digits.min(18) as u32);
+        if self.reverse.len() as u64 >= space / 10 * 9 {
+            return Err(validation("TOKEN_SPACE_EXHAUSTED", "Token vault is nearly full", &cfg.column));
+        }
+        loop {
+            let mut b = [0u8; 8];
+            getrandom::getrandom(&mut b).map_err(|e| {
+                validation("RNG_UNAVAILABLE", "The operating system's random number generator failed", &e.to_string())
+            })?;
+            let token = format!("{}{:0width$}", cfg.prefix, u64::from_le_bytes(b) % space, width = cfg.digits);
+            if !self.reverse.contains_key(&token) {
+                self.forward.insert(value.to_string(), token.clone());
+                self.reverse.insert(token.clone(), value.to_string());
+                return Ok(token);
+            }
+        }
+    }
+}
 
 /// Applies all configured pre-processing transformations to each input chunk
 /// and writes the result back in-place (atomic rename via a `.csv.tmp` file).
 ///
-/// A token vault (`token_vault.json`), FPE key store (`fpe_keys.json`),
-/// symmetric key store (`symmetric_keys.json`), and FPE-encrypt key store
-/// (`fpe_encrypt_keys.json`) are maintained in `output_directory` so that
-/// mappings are consistent across pipeline re-runs.
+/// A token vault (`token_vault.json`), symmetric key store (`symmetric_keys.json`),
+/// and FPE-encrypt key store (`fpe_encrypt_keys.json`) are maintained in
+/// `output_directory` so that mappings are consistent across pipeline re-runs.
 ///
 /// # Arguments
 /// * `chunks` — paths to the CSV chunk files to transform (modified in-place).
@@ -74,19 +97,13 @@ use masking::{
 /// # Errors
 /// Returns [`PipelineError`] if any chunk file cannot be opened/written,
 /// a required column is missing, or a config entry is malformed.
-pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), PipelineError> {
-    let masking_cfgs: Vec<MaskingConfigLite> = cfg
-        .masking
-        .iter()
-        .map(parse_masking_config)
-        .collect::<Result<Vec<_>, _>>()?;
-    let token_cfgs: Vec<TokenizationConfigLite> = cfg
-        .tokenization
-        .iter()
-        .map(parse_tokenization_config)
-        .collect::<Result<Vec<_>, _>>()?;
-    let fpe_cfgs: Vec<FpeConfigLite> = cfg.fpe.iter().map(parse_fpe_config).collect::<Result<Vec<_>, _>>()?;
-    let encrypt_cfgs: Vec<EncryptConfigLite> = cfg.encrypt.iter().map(parse_encrypt_config).collect::<Result<Vec<_>, _>>()?;
+pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<PreprocessStats, PipelineError> {
+    let masking_cfgs: Vec<MaskingConfigLite> =
+        cfg.masking.iter().map(parse_masking_config).collect::<Result<Vec<_>, _>>()?;
+    let token_cfgs: Vec<TokenizationConfigLite> =
+        cfg.tokenization.iter().map(parse_tokenization_config).collect::<Result<Vec<_>, _>>()?;
+    let encrypt_cfgs: Vec<EncryptConfigLite> =
+        cfg.encrypt.iter().map(parse_encrypt_config).collect::<Result<Vec<_>, _>>()?;
 
     let out_dir_buf = if Path::new(&cfg.output_directory).is_absolute() {
         PathBuf::from(&cfg.output_directory)
@@ -104,48 +121,42 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
         PathBuf::from(&cfg.output_directory)
     };
     let out_dir = out_dir_buf.as_path();
-    fs::create_dir_all(out_dir)?;
+    ensure_private_dir(out_dir)?;
 
-    // --- In-memory token vault (replaces JSON-Value traversal per row) ---
-    // Keyed by column name → (forward: value→token, reverse: token→value, next sequential id)
-    struct InMemVault {
-        forward: BTreeMap<String, String>,
-        reverse: BTreeMap<String, String>,
-        next_id: u64,
-    }
-
+    // Token vaults: every column ever tokenised, so a run that tokenises fewer
+    // columns does not drop earlier mappings when it saves the file back.
     let token_vault_path = out_dir.join("token_vault.json");
-    let mut in_mem_vaults: BTreeMap<String, InMemVault> = BTreeMap::new();
-    if !token_cfgs.is_empty() {
-        let existing: Value = if token_vault_path.exists() {
-            serde_json::from_str(&fs::read_to_string(&token_vault_path)?)?
-        } else {
-            serde_json::json!({})
-        };
-        for tcfg in &token_cfgs {
-            let fwd: BTreeMap<String, String> = existing
-                .get(&tcfg.column)
-                .and_then(|c| c.get("forward"))
-                .and_then(Value::as_object)
-                .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
-                .unwrap_or_default();
-            let rev: BTreeMap<String, String> = existing
-                .get(&tcfg.column)
-                .and_then(|c| c.get("reverse"))
-                .and_then(Value::as_object)
-                .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
-                .unwrap_or_default();
-            let next_id = rev.len() as u64 + 1;
-            in_mem_vaults.insert(tcfg.column.clone(), InMemVault { forward: fwd, reverse: rev, next_id });
-        }
+    let mut vault_json: serde_json::Map<String, Value> = if token_vault_path.exists() {
+        serde_json::from_str::<Value>(&fs::read_to_string(&token_vault_path)?)?.as_object().cloned().unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    let read_map = |v: Option<&Value>| -> BTreeMap<String, String> {
+        v.and_then(Value::as_object)
+            .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+            .unwrap_or_default()
+    };
+    let mut vaults: BTreeMap<String, TokenVault> = BTreeMap::new();
+    for tcfg in &token_cfgs {
+        let existing = vault_json.get(&tcfg.column);
+        vaults.insert(
+            tcfg.column.clone(),
+            TokenVault {
+                forward: read_map(existing.and_then(|c| c.get("forward"))),
+                reverse: read_map(existing.and_then(|c| c.get("reverse"))),
+            },
+        );
     }
 
-    // Per-column random salts for salted hashing — generated fresh each run (matches Python behavior).
-    // Not persisted to disk; consistent within a run across all chunks for the same column.
-    let mut hash_salts: BTreeMap<String, String> = BTreeMap::new();
-
-    let fpe_keys_path = out_dir.join("fpe_keys.json");
-    let mut fpe_keys = read_json_map_string(&fpe_keys_path)?;
+    // Per-column random salts for salted hashing, consistent within a run across
+    // all chunks for the same column. By default generated fresh each run and
+    // never written (matches Python behavior). With `shared_hash_salts` they are
+    // read from and saved to the key directory, keyed by column name, so tables
+    // run one at a time against the same key directory hash a column alike.
+    let hash_salts_path = out_dir.join(HASH_SALTS_FILE);
+    let mut hash_salts: BTreeMap<String, String> =
+        if cfg.shared_hash_salts { read_json_map_string(&hash_salts_path)? } else { BTreeMap::new() };
+    let hash_salts_loaded = hash_salts.len();
 
     let symmetric_keys_path = out_dir.join("symmetric_keys.json");
     let mut symmetric_keys = read_json_map_string(&symmetric_keys_path)?;
@@ -153,246 +164,141 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
     let fpe_encrypt_keys_path = out_dir.join("fpe_encrypt_keys.json");
     let mut fpe_encrypt_keys = read_json_map_string(&fpe_encrypt_keys_path)?;
 
+    let mut stats = PreprocessStats::new();
     for chunk_path in chunks {
-        let file = fs::File::open(chunk_path)?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        let header_line = lines
-            .next()
-            .ok_or_else(|| validation("DATA_EMPTY", "Chunk is empty", &chunk_path.display().to_string()))?
-            .map_err(|e| validation("IO_READ_FAILED", "Failed reading header", &e.to_string()))?;
-        let mut headers = split_csv_line_basic(&header_line);
+        // Records, not lines, and every row as wide as the header: a short row
+        // would otherwise skip every technique below and go out in clear.
+        let (mut headers, mut records) = open_csv(chunk_path)?;
         let mut rows: Vec<Vec<String>> = Vec::new();
-        for line in lines {
-            let line = line.map_err(|e| validation("IO_READ_FAILED", "Failed reading row", &e.to_string()))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            rows.push(split_csv_line_basic(&line));
+        while let Some(fields) = records.next_record_of_width(headers.len())? {
+            rows.push(fields);
         }
+        let column = |headers: &[String], col: &str, what: &str| -> Result<usize, PipelineError> {
+            headers.iter().position(|h| h == col).ok_or_else(|| {
+                validation("PREPROCESS_COLUMN_MISSING", &format!("Column not found in CSV header for {what}"), col)
+            })
+        };
+        // Applies `f` to every non-missing value of column `idx`, naming the
+        // column and row (never the value) if it fails.
+        let apply = |rows: &mut Vec<Vec<String>>,
+                     idx: usize,
+                     col: &str,
+                     f: &mut dyn FnMut(&str) -> Result<String, PipelineError>|
+         -> Result<u64, PipelineError> {
+            let mut changed = 0u64;
+            for (n, row) in rows.iter_mut().enumerate() {
+                if should_skip_value(&row[idx]) {
+                    continue;
+                }
+                changed += 1;
+                row[idx] = f(&row[idx]).map_err(|e| match e {
+                    PipelineError::Validation { code, message, details } => PipelineError::Validation {
+                        code,
+                        message,
+                        details: format!("{details} (column {col}, data row {} of {})", n + 1, chunk_path.display()),
+                    },
+                    other => other,
+                })?;
+            }
+            Ok(changed)
+        };
+        let mut count = |technique: &str, col: &str, n: u64| {
+            *stats.entry(format!("{technique}:{col}")).or_insert(0) += n;
+        };
 
         if !cfg.suppress.is_empty() {
             let mut drop_idx = Vec::new();
             for col in &cfg.suppress {
-                if let Some(i) = headers.iter().position(|h| h == col) {
-                    drop_idx.push(i);
-                } else {
-                    return Err(validation("PREPROCESS_COLUMN_MISSING", "Suppression column not found in CSV header", col));
-                }
+                drop_idx.push(column(&headers, col, "suppression")?);
+                count("suppress", col, rows.len() as u64);
             }
             drop_idx.sort_unstable();
             drop_idx.dedup();
-            headers = headers
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| !drop_idx.contains(i))
-                .map(|(_, h)| h)
-                .collect();
+            let keep = |i: &usize| !drop_idx.contains(i);
+            headers = headers.into_iter().enumerate().filter(|(i, _)| keep(i)).map(|(_, h)| h).collect();
             for row in &mut rows {
-                *row = row
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !drop_idx.contains(i))
-                    .map(|(_, v)| v.clone())
-                    .collect();
+                *row = std::mem::take(row).into_iter().enumerate().filter(|(i, _)| keep(i)).map(|(_, v)| v).collect();
             }
         }
 
         for col in &cfg.hashing_with_salt {
-            let idx = headers
-                .iter()
-                .position(|h| h == col)
-                .ok_or_else(|| validation("PREPROCESS_COLUMN_MISSING", "Column not found in CSV header for salted hashing", col))?;
-            let salt = hash_salts
-                .entry(col.clone())
-                .or_insert_with(generate_random_salt_hex)
-                .clone();
-            for row in &mut rows {
-                if idx >= row.len() {
-                    continue;
-                }
-                let v = row[idx].clone();
-                if should_skip_value(&v) {
-                    continue;
-                }
-                row[idx] = hash_hex(&format!("{}{}", salt, v));
+            let idx = column(&headers, col, "salted hashing")?;
+            if !hash_salts.contains_key(col) {
+                hash_salts.insert(col.clone(), generate_random_salt_hex()?);
             }
-        }
-
-        for col in &cfg.hashing_without_salt {
-            let idx = headers
-                .iter()
-                .position(|h| h == col)
-                .ok_or_else(|| validation("PREPROCESS_COLUMN_MISSING", "Column not found in CSV header for hashing", col))?;
-            for row in &mut rows {
-                if idx >= row.len() {
-                    continue;
-                }
-                let v = row[idx].clone();
-                if should_skip_value(&v) {
-                    continue;
-                }
-                row[idx] = hash_hex(&v);
-            }
+            let key = hash_key(&hash_salts[col], &format!("{HASH_SALTS_FILE}: {col}"))?;
+            let n = apply(&mut rows, idx, col, &mut |v| Ok(keyed_hash(&key, normalize_identifier(v).as_bytes())))?;
+            count("hashing_with_salt", col, n);
         }
 
         for m in &masking_cfgs {
-            let idx = headers
-                .iter()
-                .position(|h| h == &m.column)
-                .ok_or_else(|| validation("PREPROCESS_COLUMN_MISSING", "Column not found in CSV header for masking", &m.column))?;
-            for row in rows.iter_mut() {
-                if idx >= row.len() {
-                    continue;
-                }
-                let v = row[idx].clone();
-                if should_skip_value(&v) {
-                    continue;
-                }
-                row[idx] = apply_masking_value(&v, m, &randomize_preserving_class);
-            }
+            let idx = column(&headers, &m.column, "masking")?;
+            let n = apply(&mut rows, idx, &m.column, &mut |v| apply_masking_value(v, m, &randomize_preserving_class))?;
+            count("masking", &m.column, n);
         }
 
         for col in &cfg.charcloak {
-            let idx = headers
-                .iter()
-                .position(|h| h == col)
-                .ok_or_else(|| validation("PREPROCESS_COLUMN_MISSING", "Column not found in CSV header for charcloak", col))?;
-            for row in rows.iter_mut() {
-                if idx >= row.len() {
-                    continue;
-                }
-                let v = row[idx].clone();
-                if should_skip_value(&v) {
-                    continue;
-                }
-                row[idx] = randomize_preserving_class(&v);
-            }
+            let idx = column(&headers, col, "charcloak")?;
+            let n = apply(&mut rows, idx, col, &mut |v| randomize_preserving_class(v))?;
+            count("charcloak", col, n);
         }
 
         for tcfg in &token_cfgs {
-            let idx = headers
-                .iter()
-                .position(|h| h == &tcfg.column)
-                .ok_or_else(|| validation("PREPROCESS_COLUMN_MISSING", "Column not found in CSV header for tokenization", &tcfg.column))?;
-            let vault = in_mem_vaults
+            let idx = column(&headers, &tcfg.column, "tokenization")?;
+            let vault = vaults
                 .get_mut(&tcfg.column)
                 .ok_or_else(|| validation("INTERNAL_ERROR", "Token vault missing for column", &tcfg.column))?;
-
-            for row in &mut rows {
-                if idx >= row.len() {
-                    continue;
-                }
-                let v = row[idx].clone();
-                if should_skip_value(&v) {
-                    continue;
-                }
-                // O(1) lookup in BTreeMap instead of traversing JSON Value tree
-                if let Some(tok) = vault.forward.get(&v) {
-                    row[idx] = tok.clone();
-                } else {
-                    // next_id is a simple counter — no collision loop needed
-                    let token = format!("{}{:0width$}", tcfg.prefix, vault.next_id, width = tcfg.digits);
-                    vault.forward.insert(v.clone(), token.clone());
-                    vault.reverse.insert(token.clone(), v);
-                    vault.next_id += 1;
-                    row[idx] = token;
-                }
-            }
-        }
-
-        for fcfg in &fpe_cfgs {
-            let idx = headers
-                .iter()
-                .position(|h| h == &fcfg.column)
-                .ok_or_else(|| validation("PREPROCESS_COLUMN_MISSING", "Column not found in CSV header for FPE encryption", &fcfg.column))?;
-            let key = fpe_keys
-                .entry(fcfg.column.clone())
-                .or_insert_with(generate_random_key_hex)
-                .clone();
-
-            for row in &mut rows {
-                if idx >= row.len() {
-                    continue;
-                }
-                let v = row[idx].clone();
-                if should_skip_value(&v) {
-                    continue;
-                }
-                row[idx] = if fcfg.format == "pan" {
-                    fpe_pan_encrypt(&v, &key)
-                } else {
-                    fpe_digits_encrypt(&v, &key)
-                };
-            }
+            let n = apply(&mut rows, idx, &tcfg.column, &mut |v| vault.token_for(&normalize_identifier(v), tcfg))?;
+            count("tokenization", &tcfg.column, n);
         }
 
         for ecfg in &encrypt_cfgs {
-            let idx = headers
-                .iter()
-                .position(|h| h == &ecfg.column)
-                .ok_or_else(|| validation("PREPROCESS_COLUMN_MISSING", "Column not found in CSV header for encryption", &ecfg.column))?;
-
+            let idx = column(&headers, &ecfg.column, "encryption")?;
             if ecfg.format_preserving {
-                let key = fpe_encrypt_keys
-                    .entry(ecfg.column.clone())
-                    .or_insert_with(generate_random_key_hex)
-                    .clone();
-                for row in &mut rows {
-                    if idx >= row.len() {
-                        continue;
-                    }
-                    let v = row[idx].clone();
-                    if should_skip_value(&v) {
-                        continue;
-                    }
-                    row[idx] = format_preserving_encrypt_general(&v, &key, &ecfg.column);
-                }
+                let key = key_for(&mut fpe_encrypt_keys, &ecfg.column)?;
+                let n = apply(&mut rows, idx, &ecfg.column, &mut |v| {
+                    format_preserving_encrypt(&normalize_identifier(v), &key, &ecfg.column)
+                })?;
+                count("encrypt_fpe", &ecfg.column, n);
             } else {
-                let key = symmetric_keys
-                    .entry(ecfg.column.clone())
-                    .or_insert_with(generate_random_key_hex)
-                    .clone();
-                for row in &mut rows {
-                    if idx >= row.len() {
-                        continue;
-                    }
-                    let v = row[idx].clone();
-                    if should_skip_value(&v) {
-                        continue;
-                    }
-                    row[idx] = pseudo_encrypt(&v, &key, &ecfg.column);
-                }
+                let key = key_for(&mut symmetric_keys, &ecfg.column)?;
+                let n = apply(&mut rows, idx, &ecfg.column, &mut |v| {
+                    encrypt_value(&normalize_identifier(v), &key, &ecfg.column)
+                })?;
+                count("encrypt", &ecfg.column, n);
             }
         }
 
         let tmp_path = chunk_path.with_extension("csv.tmp");
         let mut w = BufWriter::new(fs::File::create(&tmp_path)?);
-        w.write_all(headers.join(",").as_bytes())?;
+        w.write_all(csv_row_to_line(&headers).as_bytes())?;
         w.write_all(b"\n")?;
         for row in rows {
-            w.write_all(row.join(",").as_bytes())?;
+            w.write_all(csv_row_to_line(&row).as_bytes())?;
             w.write_all(b"\n")?;
         }
         w.flush()?;
         fs::rename(tmp_path, chunk_path)?;
     }
 
-    // Serialize in-memory vaults back to the JSON format expected by callers
-    if !in_mem_vaults.is_empty() {
-        let mut vault_json = serde_json::json!({});
-        for (col, vault) in &in_mem_vaults {
-            vault_json[col] = serde_json::json!({
-                "forward": vault.forward.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect::<serde_json::Map<_, _>>(),
-                "reverse": vault.reverse.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect::<serde_json::Map<_, _>>(),
-            });
+    if !vaults.is_empty() {
+        for (col, vault) in &vaults {
+            let as_obj = |m: &BTreeMap<String, String>| {
+                m.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect::<serde_json::Map<_, _>>()
+            };
+            vault_json.insert(
+                col.clone(),
+                serde_json::json!({ "forward": as_obj(&vault.forward), "reverse": as_obj(&vault.reverse) }),
+            );
         }
-        write_json_pretty(&token_vault_path, &vault_json)?;
+        write_json_pretty(&token_vault_path, &Value::Object(vault_json))?;
     }
-    write_json_pretty(
-        &fpe_keys_path,
-        &Value::Object(fpe_keys.into_iter().map(|(k, v)| (k, Value::String(v))).collect()),
-    )?;
+    if cfg.shared_hash_salts && hash_salts.len() > hash_salts_loaded {
+        write_json_pretty(
+            &hash_salts_path,
+            &Value::Object(hash_salts.into_iter().map(|(k, v)| (k, Value::String(v))).collect()),
+        )?;
+    }
     write_json_pretty(
         &symmetric_keys_path,
         &Value::Object(symmetric_keys.into_iter().map(|(k, v)| (k, Value::String(v))).collect()),
@@ -402,5 +308,9 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<(), 
         &Value::Object(fpe_encrypt_keys.into_iter().map(|(k, v)| (k, Value::String(v))).collect()),
     )?;
 
-    Ok(())
+    Ok(stats)
 }
+
+/// Values each technique transformed, keyed `"<technique>:<column>"`
+/// (`suppress` counts the rows whose cell was dropped). Counts only — never values.
+pub type PreprocessStats = BTreeMap<String, u64>;
