@@ -5,6 +5,47 @@ All notable changes to SKALD are recorded here. The format follows
 [Semantic Versioning](https://semver.org/). The version in `SKALD/Cargo.toml`
 is the release version; tags are `v<version>`.
 
+## [4.1.0] — unreleased
+
+### Added
+
+- **Block deployment for an orchestrator.** Three separately built and
+  attested workers — `skald_preprocess` (suppress, masking, charcloak,
+  tokenization), `skald_crypto` (`hashing_with_salt`, `encrypt`) and
+  `skald_kanon` (k-anonymity as `scan` → `solve` → `apply`) — plus
+  `skald_ao`, the orchestrator's toolkit (`plan`, `stage`, `keygen`,
+  `project`, `split`, `stitch`, `solve`, `grid`, `manifest`, `chunks`), and
+  per-block images in `docker/`. `skald_pipeline` is unchanged.
+  - A job run as blocks releases what the monolith releases from the same
+    data and config, checked byte for byte by the tests (both flows,
+    l-diversity, removal of a `*` class smaller than k). Every block calls the
+    monolith's own code for each technique; `solve` makes the monolith's class
+    decision over the merged histogram and enforces `suppression_limit` before
+    any row is written.
+  - Key material: `skald_ao keygen --keys <dir>` mints keys into the key
+    directory, in the monolith's files (`block_hash_salts.json` holds a job's
+    salts when `shared_hash_salts` is off). It prints column names only. A
+    block never creates a key (`BLOCK_KEY_MISSING`), and refuses a key
+    directory or token vault inside its artifacts directory
+    (`KEY_MATERIAL_IN_OUTPUT`).
+  - `kanon apply` returns only the row id and the QI columns and lists the rows
+    it removed; `stitch --removed` drops them from every column, and a row
+    missing a processed column fails the stitch (`BLOCK_SHARD_INCOMPLETE`)
+    instead of falling back to its staged value.
+  - The block manifest is strict: unknown fields are refused.
+- **`cleaning`** config section (missing-value tokens, whitespace, required and
+  numeric columns, `max_dropped_fraction`), applied by `skald_ao stage`.
+  Parsed strictly like the rest of the config; `skald_pipeline` ignores it and
+  logs a warning.
+- **Regex masking `"length": "all"`:** a `before` / `after` pattern masks
+  everything on that side of the first occurrence of its delimiter.
+
+### Changed
+
+- A regex masking `length` that is zero, negative, or neither a whole number
+  nor `"all"` is a config error. It used to be clamped to 0, which masked
+  nothing.
+
 ## [4.0.0] — unreleased
 
 This release fixes privacy and security defects found in an internal review in

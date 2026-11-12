@@ -573,6 +573,9 @@ SKALD/
   Cargo.toml               Rust crate manifest
   src/
     bin/skald_pipeline.rs  Binary entry point
+    bin/skald_ao.rs        Orchestrator toolkit for the block deployment
+    bin/skald_preprocess.rs, skald_crypto.rs, skald_kanon.rs
+                           Block workers (see "Block deployment")
     pipeline/
       bootstrap.rs         Config parsing, Logger, error types, CSV utilities
       cli.rs               Flags, SKALD_* variables, path resolution
@@ -583,9 +586,11 @@ SKALD/
       connectors/          PostgreSQL input and output (COPY, rustls TLS)
       anonymization/       OLA-1, OLA-2, Z-histogram, generalization, l-diversity
       preprocess/          Suppress, hash, mask, encrypt, tokenize
+      blocks/              Block runtime: plan, stage, keygen, shards, the three blocks
       entry.rs             Error mapping → structured status.json
   tests/                   Integration and property tests
   benches/                 Criterion benchmarks
+docker/                    Per-block images and the orchestrator toolkit image
 scripts/
   e2e_matrix.py            End-to-end matrix over every input shape
   package_rhel7.sh         Builds the standalone RHEL 7 bundle
@@ -600,7 +605,7 @@ scripts/
 |---|---|---|
 | Column suppression | `suppress` | Drops column entirely from output |
 | Salted hashing | `hashing_with_salt` | HMAC-SHA256(key = salt's 32 bytes, value), 64 hex chars; a fresh 32-byte random salt per column per run (not stored). With `"shared_hash_salts": true` the salt is kept per column name in `<key dir>/tabular_hash_salts.json` and reused, so tables run separately against one key directory hash a column alike (joinable); that file then reverses nothing on its own but lets its holder test guesses, so keep it with the other key material |
-| Masking | `masking` | Position / regex / character-class masking. Every regex must compile when the config is read (lookaround is not supported) — an entry that could leave values unmasked is refused |
+| Masking | `masking` | Position / regex / character-class masking. Every regex must compile when the config is read (lookaround is not supported) — an entry that could leave values unmasked is refused. A `before` / `after` pattern's `length` masks that many characters next to every occurrence of its `delimiter`, or, as `"all"`, everything on that side of the first occurrence (`{"type": "before", "delimiter": "@", "length": "all"}` turns `name@example.org` into `****@example.org`) |
 | Encryption | `encrypt` | AES-SIV (deterministic, authenticated), `ENC1$` + hex |
 | Format-preserving encrypt | `encrypt` + `format_preserving: true` | NIST FF1 over the whole value; digits stay digits, letters keep case, punctuation stays put. Values with fewer than 10⁶ possible values of their shape, or with non-ASCII letters, are refused |
 | Character cloaking | `charcloak` | Random letter/digit of the same class, any script → ASCII |
@@ -720,6 +725,49 @@ The OLA-2 search can run in two modes, controlled by `flow_mode`:
 > **Categorical ladders must nest:** values that share a label at one level must
 > share one at every coarser level. OLA-2's pruning relies on it, so a ladder
 > that does not nest is refused (`CONFIG_INVALID_VALUE`).
+
+---
+
+## Block deployment (orchestrator)
+
+The same pipeline is also available as three separately built and attested
+blocks, for an orchestrator (AO) that column-shards a dataset and hands each
+shard only to the container that needs it. `skald_pipeline` is unchanged.
+
+| Block | Binary | Does | Secret state |
+|---|---|---|---|
+| preprocess | `skald_preprocess` | suppress, masking, charcloak, tokenization | token vault, in the key directory |
+| crypto | `skald_crypto` | `hashing_with_salt`, `encrypt` | reads keys; never creates one |
+| kanon | `skald_kanon` | k-anonymity as `scan` → `solve` → `apply` | none |
+
+`skald_ao` is the orchestrator's toolkit: `plan` (which columns each block
+needs, in what order), `stage` (cleaning, suppression, row ids), `keygen`,
+`project` / `split` / `stitch`, `solve` and `grid`. Each block runs as
+`skald_<block> --manifest <job>/manifest.json` and reports in
+`<artifacts_dir>/<shard_id>.status.json`. Build the images with
+`docker/build-blocks.sh`.
+
+A job run as blocks releases exactly what `skald_pipeline` releases from the
+same data and config — the tests check this byte for byte. Each block calls the
+monolith's own code for every technique, and `solve` makes the monolith's class
+decision (k, l, removing a `*` class smaller than k, `suppression_limit`) over
+the merged histogram before any row is written.
+
+- **Keys:** `skald_ao keygen --config <cfg> --keys <key dir>` writes the salts
+  and keys into the key directory, in the monolith's files, and prints column
+  names only. Blocks read them through `key_directory` in their manifest. A key
+  directory or vault inside a block's `artifacts_dir` is refused.
+- **Removed rows:** `kanon apply` writes only the row id and the QI columns,
+  and lists the rows it removed in `<shard_id>.removed_rids.json`. Pass every
+  such list to `skald_ao stitch --removed`, which drops those rows from every
+  column. A row missing a processed column fails the stitch rather than taking
+  the staged value.
+- **Kept on the orchestrator:** `histogram.json` and the scan artifacts hold
+  un-generalised quasi-identifier tuples. They are written owner-only and are
+  never released.
+- **Cleaning:** the optional `cleaning` section (missing-value tokens,
+  whitespace, required and numeric columns, `max_dropped_fraction`) is applied
+  by `skald_ao stage` only; `skald_pipeline` ignores it with a warning.
 
 ---
 
