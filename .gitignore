@@ -100,6 +100,7 @@ fhir_anonymizer/
 /dp/
 /pipeline/
 /synthetic/
+example_spider_config.json
 
 *.coverage
 
