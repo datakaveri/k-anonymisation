@@ -81,7 +81,10 @@ pub(super) fn generalize_categorical_label(
 
 /// The written form of one QI cell at `level`. Cells with no bin — an
 /// unusable number, a value outside every interval — are written as `*`.
-fn generalize_cell(qi: &QuasiIdentifierLite, raw: &str, level: i64, hierarchies: &HierarchyMap) -> String {
+///
+/// The one definition of a published QI label: the monolith's output step and
+/// the k-anonymity block's solve and apply stages all write through it.
+pub(crate) fn generalize_cell(qi: &QuasiIdentifierLite, raw: &str, level: i64, hierarchies: &HierarchyMap) -> String {
     if let Some(h) = &qi.interval_hierarchy {
         let level = (level as usize).clamp(1, h.num_levels);
         return parse_numeric_qi(raw)
@@ -131,7 +134,7 @@ pub struct GeneralizationSummary {
 /// One class while counting: its size, and up to `l` distinct values of each
 /// sensitive attribute.
 #[derive(Default)]
-struct ClassTally {
+pub(crate) struct ClassTally {
     size: i64,
     sensitive: Vec<Vec<String>>,
 }
@@ -142,6 +145,20 @@ impl ClassTally {
         self.size += 1;
         for (a, v) in values.iter().enumerate() {
             self.note(a, v, l);
+        }
+    }
+
+    /// Counts `count` records that between them hold these distinct values of
+    /// each sensitive attribute (one list per attribute, already normalised).
+    pub(crate) fn add_group(&mut self, count: i64, values: &[Vec<String>], l: usize) {
+        self.size += count;
+        for (a, vals) in values.iter().enumerate() {
+            if self.sensitive.len() <= a {
+                self.sensitive.resize(a + 1, Vec::new());
+            }
+            for v in vals {
+                self.note(a, v, l);
+            }
         }
     }
 
@@ -165,12 +182,54 @@ impl ClassTally {
         }
     }
 
-    fn passes(&self, k: i64, l: Option<&LDiversity>) -> bool {
+    pub(crate) fn passes(&self, k: i64, l: Option<&LDiversity>) -> bool {
         self.size >= k
             && l.is_none_or(|l| {
                 self.sensitive.len() == l.sensitive_attributes.len() && self.sensitive.iter().all(|s| s.len() >= l.l)
             })
     }
+}
+
+/// Decides every class's fate once all records have been counted.
+///
+/// A class that passes k (and l) is published. Every failing class goes into
+/// the `*` class of suppressed records, which is published only if it would
+/// itself pass; otherwise its records are removed. Returns the summary of what
+/// that release holds and whether the suppressed records are published.
+///
+/// The monolith's output step and the k-anonymity block's solve stage both
+/// decide through this function, so the two cannot disagree on what is safe.
+pub(crate) fn decide_classes(
+    classes: &BTreeMap<Vec<String>, ClassTally>,
+    total_records: i64,
+    k: i64,
+    l: Option<&LDiversity>,
+) -> (GeneralizationSummary, bool) {
+    let l_cap = l.map_or(0, |l| l.l);
+    let mut star = ClassTally::default();
+    let mut summary = GeneralizationSummary { total_records, ..Default::default() };
+    for tally in classes.values() {
+        if tally.passes(k, l) {
+            summary.num_equivalence_classes += 1;
+            summary.dm_star = summary.dm_star.saturating_add(tally.size.saturating_mul(tally.size));
+            *summary.class_size_counts.entry(tally.size).or_insert(0) += 1;
+        } else {
+            if tally.size < k {
+                summary.classes_failing_k += 1;
+            } else {
+                summary.classes_failing_l += 1;
+            }
+            summary.suppressed_records += tally.size;
+            star.absorb(tally, l_cap);
+        }
+    }
+    let publish_suppressed = star.size == 0 || star.passes(k, l);
+    if publish_suppressed {
+        summary.published_suppressed_records = star.size;
+    } else {
+        summary.removed_records = star.size;
+    }
+    (summary, publish_suppressed)
 }
 
 /// Applies the chosen generalization factors to all chunks and writes the final
@@ -296,31 +355,7 @@ fn write_outputs(
     }
     let headers = headers.unwrap_or_default();
 
-    // Every failing class goes into the `*` class; publish it only if it would
-    // itself pass, otherwise its records are removed.
-    let mut star = ClassTally::default();
-    let mut summary = GeneralizationSummary { total_records, ..Default::default() };
-    for tally in classes.values() {
-        if tally.passes(k, l) {
-            summary.num_equivalence_classes += 1;
-            summary.dm_star = summary.dm_star.saturating_add(tally.size.saturating_mul(tally.size));
-            *summary.class_size_counts.entry(tally.size).or_insert(0) += 1;
-        } else {
-            if tally.size < k {
-                summary.classes_failing_k += 1;
-            } else {
-                summary.classes_failing_l += 1;
-            }
-            summary.suppressed_records += tally.size;
-            star.absorb(tally, l_cap);
-        }
-    }
-    let publish_suppressed = star.size == 0 || star.passes(k, l);
-    if publish_suppressed {
-        summary.published_suppressed_records = star.size;
-    } else {
-        summary.removed_records = star.size;
-    }
+    let (summary, publish_suppressed) = decide_classes(&classes, total_records, k, l);
 
     // --- Pass 2: suppress or remove failing records, writing straight into the final file ---
     let final_path =

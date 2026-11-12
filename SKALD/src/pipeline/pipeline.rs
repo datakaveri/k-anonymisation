@@ -749,7 +749,7 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
 
 /// Maps pass2's `generalization_node` onto QI order, and checks that it names
 /// every QI, nothing else, and only levels each QI actually has.
-fn resolve_generalization_node(
+pub(crate) fn resolve_generalization_node(
     chosen: &BTreeMap<String, i64>,
     qis: &[QuasiIdentifierLite],
     cfg: &RuntimeConfig,
@@ -1273,6 +1273,7 @@ const KEY_MATERIAL_FILES: &[&str] = &[
     "fpe_keys.json",
     "token_vault.json",
     crate::pipeline::preprocess::HASH_SALTS_FILE,
+    crate::pipeline::preprocess::BLOCK_HASH_SALTS_FILE,
     "nested_json_salt.json",
     "nested_json_token_vault.json",
     "nested_json_symmetric_keys.json",
@@ -1393,7 +1394,7 @@ fn class_size_stats(counts: &BTreeMap<i64, i64>) -> Option<(i64, i64, f64, i64)>
     Some((*counts.keys().next()?, median, records as f64 / classes as f64, *counts.keys().next_back()?))
 }
 
-fn summary_json(cfg: &RuntimeConfig, s: &GeneralizationSummary) -> serde_json::Value {
+pub(crate) fn summary_json(cfg: &RuntimeConfig, s: &GeneralizationSummary) -> serde_json::Value {
     let stats = class_size_stats(&s.class_size_counts);
     json!({
         "k": cfg.k,

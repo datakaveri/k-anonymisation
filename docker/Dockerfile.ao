@@ -1,0 +1,63 @@
+# =============================================================================
+# SKALD orchestrator-side toolkit.
+#
+# The one image that runs inside the AO's TEE. It bundles two binaries because
+# they share that trust boundary:
+#
+#   /skald_ao         plan, stage, keygen, solve, grid, manifest, chunks,
+#                     stamp, project, split, stitch
+#   /skald_preprocess the preprocessing block
+#
+# Preprocessing lives here rather than in a dispatched worker because its token
+# vault is a reversible plaintext mapping — the one recoverable artifact the
+# system produces. Shipping it to a worker would put it outside the boundary
+# the user attested before sending their data.
+#
+#   docker build -f docker/Dockerfile.ao -t ghcr.io/datakaveri/skald-ao:dev .
+#   docker run --rm -v "$PWD/job:/job" -v "$PWD/keys:/keys" ghcr.io/datakaveri/skald-ao:dev \
+#       keygen --config /job/config/job.json --keys /keys
+#
+# Mount the key directory separately from the job directory: it holds the
+# salts, keys and token vault, and is never released. The process runs as
+# uid:gid 65532:65532; both mounts must be writable by that uid.
+# =============================================================================
+
+FROM rust:1.92-alpine@sha256:f6c22e0a256c05d44fca23bf530120b5d4a6249a393734884281ca80782329bc AS builder
+LABEL org.opencontainers.image.source=https://github.com/datakaveri/k-anonymisation
+LABEL org.opencontainers.image.licenses=Apache-2.0
+
+RUN apk add --no-cache musl-dev gcc \
+    && rustup target add x86_64-unknown-linux-musl
+
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+WORKDIR /build
+
+COPY SKALD/Cargo.toml SKALD/Cargo.lock ./
+COPY SKALD/benches ./benches
+RUN mkdir -p src/pipeline src/bin \
+    && echo 'pub mod pipeline { pub mod entry {} }' > src/lib.rs \
+    && echo 'fn main() {}' > src/bin/skald_ao.rs \
+    && echo 'fn main() {}' > src/bin/skald_preprocess.rs \
+    && cargo build --release --locked --target x86_64-unknown-linux-musl \
+                   --bin skald_ao --bin skald_preprocess 2>/dev/null || true \
+    && rm -rf src
+
+COPY SKALD/src ./src
+RUN touch src/lib.rs \
+    && cargo build --release --locked --target x86_64-unknown-linux-musl \
+                   --bin skald_ao --bin skald_preprocess \
+    && mkdir -p /rootfs/job /rootfs/keys \
+    && chmod 0700 /rootfs/keys
+
+FROM scratch AS runtime
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/skald_ao /skald_ao
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/skald_preprocess /skald_preprocess
+COPY --from=builder --chown=65532:65532 /rootfs/job /job
+COPY --from=builder --chown=65532:65532 /rootfs/keys /keys
+
+WORKDIR /job
+USER 65532:65532
+VOLUME ["/job", "/keys"]
+
+ENTRYPOINT ["/skald_ao"]

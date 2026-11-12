@@ -93,7 +93,7 @@ pub(crate) fn keyed_hash(key: &[u8; 32], value: &[u8]) -> String {
 /// Returns `true` when `v` should be left unchanged (empty or `"nan"`).
 ///
 /// Used before every transformation step to preserve missing-value markers.
-pub(super) fn should_skip_value(v: &str) -> bool {
+pub(crate) fn should_skip_value(v: &str) -> bool {
     let t = v.trim();
     t.is_empty() || t.eq_ignore_ascii_case("nan")
 }

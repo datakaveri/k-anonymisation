@@ -57,6 +57,58 @@ pub struct FreeTextAnonymizationConfig {
     pub staged_input_path: Option<PathBuf>,
 }
 
+/// Data cleaning, applied by the orchestrator's staging pass (`skald_ao
+/// stage`) before anything is chunked. The monolith does not clean.
+///
+/// This is not an anonymisation technique: it is the "is this data usable"
+/// pass — missing-value sentinels rewritten to one representation, whitespace
+/// settled, unusable rows dropped. A missing value that reaches k-anonymity as
+/// the literal string `"N/A"` becomes its own quasi-identifier value and splits
+/// classes that should have merged.
+///
+/// It runs on the orchestrator because dropping a row changes every row range
+/// downstream, so it has to settle before the dataset is sharded.
+#[derive(Debug, Clone)]
+pub struct CleaningConfig {
+    pub enabled: bool,
+    /// Values treated as missing, compared case-insensitively after trimming.
+    pub null_tokens: Vec<String>,
+    /// What a missing value is rewritten to. Empty by default, which is what
+    /// the rest of the pipeline already treats as absent.
+    pub null_replacement: String,
+    pub trim: bool,
+    /// Collapse runs of internal whitespace to a single space.
+    pub collapse_whitespace: bool,
+    /// Drop a row when every field is missing.
+    pub drop_all_empty_rows: bool,
+    /// Drop a row when any of these columns is missing.
+    pub required_columns: Vec<String>,
+    /// Columns that must parse as a number; non-numeric values become missing.
+    pub numeric_columns: Vec<String>,
+    /// Refuse the job when more than this fraction of rows would be dropped:
+    /// a cleaning step that discards half the dataset has changed the answer.
+    pub max_dropped_fraction: f64,
+}
+
+impl Default for CleaningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            null_tokens: ["", "na", "n/a", "n.a.", "null", "nil", "none", "nan", "-", "--", "?", "unknown"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            null_replacement: String::new(),
+            trim: true,
+            collapse_whitespace: true,
+            drop_all_empty_rows: true,
+            required_columns: Vec::new(),
+            numeric_columns: Vec::new(),
+            max_dropped_fraction: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub enable_k_anonymity: bool,
@@ -118,6 +170,9 @@ pub struct RuntimeConfig {
     pub restore_sheets: bool,
     /// Optional free-text anonymization handoff.
     pub free_text_anonymization: FreeTextAnonymizationConfig,
+    /// Orchestrator-side data cleaning, consumed by `skald_ao stage`. The
+    /// monolith has no staging step and ignores it (with a warning).
+    pub cleaning: CleaningConfig,
     /// Nested-JSON de-identification. When enabled this replaces the tabular
     /// flow outright rather than feeding it — see `nested_json`'s module docs.
     pub nested_json: crate::pipeline::nested_json::NestedJsonConfig,
@@ -680,6 +735,7 @@ const KNOWN_SECTION_KEYS: &[&str] = &[
     "sheet_joins",
     "restore_sheets",
     "free_text_anonymization",
+    "cleaning",
     "input",
     "output_sink",
     // nested JSON / FHIR flows
@@ -788,6 +844,79 @@ fn parse_l_diversity(
         }
     }
     Ok((l > 1).then_some(LDiversity { l, sensitive_attributes: attrs }))
+}
+
+/// Keys the `cleaning` section may contain.
+const KNOWN_CLEANING_KEYS: &[&str] = &[
+    "enabled",
+    "null_tokens",
+    "null_replacement",
+    "trim",
+    "collapse_whitespace",
+    "drop_all_empty_rows",
+    "required_columns",
+    "numeric_columns",
+    "max_dropped_fraction",
+];
+
+/// Parses the optional `cleaning` section. Absent means disabled: cleaning
+/// changes the row set, so it is never applied to a job that did not ask.
+/// Present means enabled unless `"enabled": false`. Unknown keys and values of
+/// the wrong type are errors, like everywhere else in the config.
+fn parse_cleaning_config(section: &Value) -> Result<CleaningConfig, PipelineError> {
+    let d = CleaningConfig::default();
+    let block = match section.get("cleaning") {
+        None | Some(Value::Null) => return Ok(d),
+        Some(b) => b,
+    };
+    let obj = block
+        .as_object()
+        .ok_or_else(|| validation("CONFIG_INVALID_VALUE", "cleaning must be an object", &block.to_string()))?;
+    for key in obj.keys() {
+        if !key.starts_with('_') && !KNOWN_CLEANING_KEYS.contains(&key.as_str()) {
+            return Err(validation("CONFIG_UNKNOWN_KEY", "Unknown cleaning key", &format!("cleaning.{key}")));
+        }
+    }
+    let flag = |key: &str, default: bool| -> Result<bool, PipelineError> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(default),
+            Some(v) => v.as_bool().ok_or_else(|| {
+                validation("CONFIG_INVALID_VALUE", "Expected true or false", &format!("cleaning.{key}: {v}"))
+            }),
+        }
+    };
+    let null_replacement = match obj.get("null_replacement") {
+        None | Some(Value::Null) => d.null_replacement.clone(),
+        Some(v) => v.as_str().map(str::to_string).ok_or_else(|| {
+            validation("CONFIG_INVALID_VALUE", "Expected a string", &format!("cleaning.null_replacement: {v}"))
+        })?,
+    };
+    let max_dropped_fraction = match obj.get("max_dropped_fraction") {
+        None | Some(Value::Null) => d.max_dropped_fraction,
+        Some(v) => v.as_f64().filter(|f| (0.0..=1.0).contains(f)).ok_or_else(|| {
+            validation(
+                "CONFIG_INVALID_VALUE",
+                "cleaning.max_dropped_fraction must be a number between 0 and 1",
+                &format!("got {v}"),
+            )
+        })?,
+    };
+    let null_tokens = if obj.contains_key("null_tokens") {
+        string_list(block, "null_tokens")?.into_iter().map(|t| t.trim().to_lowercase()).collect()
+    } else {
+        d.null_tokens.clone()
+    };
+    Ok(CleaningConfig {
+        enabled: flag("enabled", true)?,
+        null_tokens,
+        null_replacement,
+        trim: flag("trim", d.trim)?,
+        collapse_whitespace: flag("collapse_whitespace", d.collapse_whitespace)?,
+        drop_all_empty_rows: flag("drop_all_empty_rows", d.drop_all_empty_rows)?,
+        required_columns: string_list(block, "required_columns")?,
+        numeric_columns: string_list(block, "numeric_columns")?,
+        max_dropped_fraction,
+    })
 }
 
 pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, PipelineError> {
@@ -1081,6 +1210,13 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         ));
     }
     let clean_output = section.get("clean_output").and_then(Value::as_bool).unwrap_or(false);
+    let cleaning = parse_cleaning_config(section)?;
+    if cleaning.enabled {
+        warnings.push(
+            "cleaning is applied only by the orchestrator's staging pass (skald_ao stage); skald_pipeline ignores it"
+                .to_string(),
+        );
+    }
 
     let generalization_node = match section.get("generalization_node") {
         None | Some(Value::Null) => None,
@@ -1150,6 +1286,7 @@ pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, Pipelin
         sheet_joins,
         restore_sheets,
         free_text_anonymization,
+        cleaning,
         nested_json,
         fhir_bundle,
         clean_output,

@@ -16,6 +16,7 @@
 mod generalization;
 mod ola;
 
+pub(crate) use generalization::{ClassTally, decide_classes, generalize_cell};
 pub use generalization::{
     GeneralizationSummary, LDiversity, generalize_and_write_outputs, generalize_and_write_outputs_with,
 };
@@ -24,12 +25,12 @@ pub use ola::{
     MAX_LATTICE_NODES, MAX_NUMERIC_QI_MAGNITUDE, NodeTrace, Ola2NodeScore, Ola2SearchResult, ParameterGrid,
     QuasiIdentifierLite, SensitiveSets, SparseHist, ZHist, allowed_suppressions, attach_categorical_levels,
     build_categorical_levels, build_direct_histogram, build_fixed_interval_hierarchy, build_interval_hierarchy,
-    build_sensitive_sets, build_sparse_histogram, build_z_histogram, categorical_ladder_len, compute_equivalence_space,
-    compute_k_optimal, compute_parameter_grid, compute_parameter_grid_for, compute_parameter_grid_z, compute_z_weights,
-    equivalence_class_stats, find_ola1_initial_ri, find_ola2_best_rf, find_ola2_best_rf_detailed,
-    find_ola2_best_rf_z_detailed, find_ola2_with, l_aware_class_sizes, merge_histogram, merge_z_histogram,
-    normalize_categorical, parse_numeric_qi, resolve_qi_columns, scan_chunks_for_flow, within_suppression_limit,
-    z_hist_to_sparse,
+    build_sensitive_sets, build_sparse_histogram, build_tuple_histogram, build_tuple_sensitive_sets, build_z_histogram,
+    categorical_ladder_len, compute_equivalence_space, compute_k_optimal, compute_parameter_grid,
+    compute_parameter_grid_for, compute_parameter_grid_z, compute_z_weights, equivalence_class_stats,
+    find_ola1_initial_ri, find_ola2_best_rf, find_ola2_best_rf_detailed, find_ola2_best_rf_z_detailed, find_ola2_with,
+    l_aware_class_sizes, merge_histogram, merge_z_histogram, normalize_categorical, parse_numeric_qi,
+    resolve_qi_columns, scan_chunks_for_flow, within_suppression_limit, z_hist_to_sparse,
 };
 
 use crate::pipeline::bootstrap::{PipelineError, RuntimeConfig, open_csv, validation};

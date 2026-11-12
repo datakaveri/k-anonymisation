@@ -789,6 +789,41 @@ pub fn build_sparse_histogram(
     Ok((hist, total_records))
 }
 
+/// [`build_sparse_histogram`] over QI value tuples instead of chunk files.
+///
+/// Each item is one tuple of QI cells in QI order, with the number of records
+/// holding it. Every tuple goes through the same `base_key` as a chunk row,
+/// so a histogram aggregated elsewhere (the k-anonymity block merges per-shard
+/// scans) keys and counts exactly as the monolith's would over the same rows.
+pub fn build_tuple_histogram<'a>(
+    tuples: impl IntoIterator<Item = (&'a [String], i64)>,
+    qis: &[QuasiIdentifierLite],
+    initial_ri: &[i64],
+    categorical_domains: &[Vec<String>],
+) -> Result<(SparseHist, i64), PipelineError> {
+    if qis.len() != initial_ri.len() || categorical_domains.len() != qis.len() {
+        return Err(validation("GENERALIZATION_FAILED", "length mismatch", "build_tuple_histogram"));
+    }
+    let identity: Vec<usize> = (0..qis.len()).collect();
+    let mut hist: SparseHist = HashMap::new();
+    let mut total_records: i64 = 0;
+    for (tuple, count) in tuples {
+        if tuple.len() != qis.len() {
+            return Err(validation("GENERALIZATION_FAILED", "QI tuple has the wrong arity", "build_tuple_histogram"));
+        }
+        *hist.entry(base_key(qis, tuple, &identity, initial_ri, categorical_domains)?).or_insert(0) += count;
+        total_records += count;
+    }
+    if total_records == 0 {
+        return Err(validation(
+            "GENERALIZATION_FAILED",
+            "No records to anonymize",
+            "the input has a header but no rows",
+        ));
+    }
+    Ok((hist, total_records))
+}
+
 /// Builds a histogram at the finest possible granularity (`initial_ri = [1,…,1]`),
 /// bypassing OLA-1 entirely.
 pub fn build_direct_histogram(
@@ -1012,6 +1047,44 @@ pub fn build_sensitive_sets(
             for (a, &si) in s_idx.iter().enumerate() {
                 let next = interned[a].len() as u32;
                 let id = *interned[a].entry(normalize_categorical(&fields[si])).or_insert(next);
+                union_capped(&mut cell[a], &[id], l);
+            }
+        }
+    }
+    Ok(sets)
+}
+
+/// [`build_sensitive_sets`] over QI value tuples instead of chunk files.
+///
+/// Each item is a QI tuple (QI order) with, per sensitive attribute, the
+/// distinct normalised values its records hold. Capping a tuple's values at `l`
+/// before they reach here loses nothing: a cell only ever needs to know whether
+/// it has reached `l`.
+pub fn build_tuple_sensitive_sets<'a>(
+    tuples: impl IntoIterator<Item = (&'a [String], &'a [Vec<String>])>,
+    qis: &[QuasiIdentifierLite],
+    initial_ri: &[i64],
+    categorical_domains: &[Vec<String>],
+    attributes: usize,
+    l: usize,
+) -> Result<SensitiveSets, PipelineError> {
+    let identity: Vec<usize> = (0..qis.len()).collect();
+    let mut sets: SensitiveSets = HashMap::new();
+    let mut interned: Vec<HashMap<String, u32>> = vec![HashMap::new(); attributes];
+    for (tuple, values) in tuples {
+        if tuple.len() != qis.len() || values.len() != attributes {
+            return Err(validation(
+                "GENERALIZATION_FAILED",
+                "QI or sensitive tuple has the wrong arity",
+                "build_tuple_sensitive_sets",
+            ));
+        }
+        let key = base_key(qis, tuple, &identity, initial_ri, categorical_domains)?;
+        let cell = sets.entry(key).or_insert_with(|| vec![Vec::new(); attributes]);
+        for (a, vals) in values.iter().enumerate() {
+            for v in vals {
+                let next = interned[a].len() as u32;
+                let id = *interned[a].entry(normalize_categorical(v)).or_insert(next);
                 union_capped(&mut cell[a], &[id], l);
             }
         }

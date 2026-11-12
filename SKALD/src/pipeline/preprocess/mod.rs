@@ -43,11 +43,71 @@ use masking::{
 
 /// Per-column `hashing_with_salt` salts, in the key directory, when `shared_hash_salts` is on.
 pub(crate) const HASH_SALTS_FILE: &str = "tabular_hash_salts.json";
+/// Per-column token vaults, in the key directory.
+pub(crate) const TOKEN_VAULT_FILE: &str = "token_vault.json";
+/// Per-column `encrypt` keys, in the key directory.
+pub(crate) const SYMMETRIC_KEYS_FILE: &str = "symmetric_keys.json";
+/// Per-column format-preserving `encrypt` keys, in the key directory.
+pub(crate) const FPE_KEYS_FILE: &str = "fpe_encrypt_keys.json";
+/// Per-job `hashing_with_salt` salts minted by `skald_ao keygen` when
+/// `shared_hash_salts` is off: every row shard of a column must hash under one
+/// salt, so even a per-run salt has to be written down for the job's duration.
+pub(crate) const BLOCK_HASH_SALTS_FILE: &str = "block_hash_salts.json";
 
 /// One column's token mappings, both directions.
-struct TokenVault {
+pub(crate) struct TokenVault {
     forward: BTreeMap<String, String>,
     reverse: BTreeMap<String, String>,
+}
+
+/// Every column's vault, as read from `token_vault.json`: the parsed document
+/// (so columns this run does not tokenise are written back untouched) and a
+/// [`TokenVault`] for each column this run does tokenise.
+pub(crate) struct TokenVaults {
+    doc: serde_json::Map<String, Value>,
+    pub(crate) columns: BTreeMap<String, TokenVault>,
+}
+
+impl TokenVaults {
+    /// Reads `path` (absent means empty) and prepares a vault for each column.
+    pub(crate) fn load(path: &Path, columns: &[&str]) -> Result<Self, PipelineError> {
+        let doc: serde_json::Map<String, Value> = if path.exists() {
+            serde_json::from_str::<Value>(&fs::read_to_string(path)?)?.as_object().cloned().unwrap_or_default()
+        } else {
+            serde_json::Map::new()
+        };
+        let read_map = |v: Option<&Value>| -> BTreeMap<String, String> {
+            v.and_then(Value::as_object)
+                .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+                .unwrap_or_default()
+        };
+        let mut out = BTreeMap::new();
+        for col in columns {
+            let existing = doc.get(*col);
+            out.insert(
+                col.to_string(),
+                TokenVault {
+                    forward: read_map(existing.and_then(|c| c.get("forward"))),
+                    reverse: read_map(existing.and_then(|c| c.get("reverse"))),
+                },
+            );
+        }
+        Ok(Self { doc, columns: out })
+    }
+
+    /// Writes every column back to `path` as key material (owner-only).
+    pub(crate) fn save(mut self, path: &Path) -> Result<(), PipelineError> {
+        let as_obj = |m: &BTreeMap<String, String>| {
+            m.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect::<serde_json::Map<_, _>>()
+        };
+        for (col, vault) in &self.columns {
+            self.doc.insert(
+                col.clone(),
+                serde_json::json!({ "forward": as_obj(&vault.forward), "reverse": as_obj(&vault.reverse) }),
+            );
+        }
+        write_json_pretty(path, &Value::Object(self.doc))
+    }
 }
 
 impl TokenVault {
@@ -56,7 +116,7 @@ impl TokenVault {
     /// New tokens are random rather than sequential — a counter numbers values
     /// in first-seen order, which leaks the input's order (and its sort key) —
     /// and are checked against every token already issued.
-    fn token_for(&mut self, value: &str, cfg: &TokenizationConfigLite) -> Result<String, PipelineError> {
+    pub(crate) fn token_for(&mut self, value: &str, cfg: &TokenizationConfigLite) -> Result<String, PipelineError> {
         if let Some(t) = self.forward.get(value) {
             return Ok(t.clone());
         }
@@ -125,28 +185,9 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<Prep
 
     // Token vaults: every column ever tokenised, so a run that tokenises fewer
     // columns does not drop earlier mappings when it saves the file back.
-    let token_vault_path = out_dir.join("token_vault.json");
-    let mut vault_json: serde_json::Map<String, Value> = if token_vault_path.exists() {
-        serde_json::from_str::<Value>(&fs::read_to_string(&token_vault_path)?)?.as_object().cloned().unwrap_or_default()
-    } else {
-        serde_json::Map::new()
-    };
-    let read_map = |v: Option<&Value>| -> BTreeMap<String, String> {
-        v.and_then(Value::as_object)
-            .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
-            .unwrap_or_default()
-    };
-    let mut vaults: BTreeMap<String, TokenVault> = BTreeMap::new();
-    for tcfg in &token_cfgs {
-        let existing = vault_json.get(&tcfg.column);
-        vaults.insert(
-            tcfg.column.clone(),
-            TokenVault {
-                forward: read_map(existing.and_then(|c| c.get("forward"))),
-                reverse: read_map(existing.and_then(|c| c.get("reverse"))),
-            },
-        );
-    }
+    let token_vault_path = out_dir.join(TOKEN_VAULT_FILE);
+    let token_columns: Vec<&str> = token_cfgs.iter().map(|t| t.column.as_str()).collect();
+    let mut vaults = TokenVaults::load(&token_vault_path, &token_columns)?;
 
     // Per-column random salts for salted hashing, consistent within a run across
     // all chunks for the same column. By default generated fresh each run and
@@ -158,10 +199,10 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<Prep
         if cfg.shared_hash_salts { read_json_map_string(&hash_salts_path)? } else { BTreeMap::new() };
     let hash_salts_loaded = hash_salts.len();
 
-    let symmetric_keys_path = out_dir.join("symmetric_keys.json");
+    let symmetric_keys_path = out_dir.join(SYMMETRIC_KEYS_FILE);
     let mut symmetric_keys = read_json_map_string(&symmetric_keys_path)?;
 
-    let fpe_encrypt_keys_path = out_dir.join("fpe_encrypt_keys.json");
+    let fpe_encrypt_keys_path = out_dir.join(FPE_KEYS_FILE);
     let mut fpe_encrypt_keys = read_json_map_string(&fpe_encrypt_keys_path)?;
 
     let mut stats = PreprocessStats::new();
@@ -246,6 +287,7 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<Prep
         for tcfg in &token_cfgs {
             let idx = column(&headers, &tcfg.column, "tokenization")?;
             let vault = vaults
+                .columns
                 .get_mut(&tcfg.column)
                 .ok_or_else(|| validation("INTERNAL_ERROR", "Token vault missing for column", &tcfg.column))?;
             let n = apply(&mut rows, idx, &tcfg.column, &mut |v| vault.token_for(&normalize_identifier(v), tcfg))?;
@@ -281,17 +323,8 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<Prep
         fs::rename(tmp_path, chunk_path)?;
     }
 
-    if !vaults.is_empty() {
-        for (col, vault) in &vaults {
-            let as_obj = |m: &BTreeMap<String, String>| {
-                m.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect::<serde_json::Map<_, _>>()
-            };
-            vault_json.insert(
-                col.clone(),
-                serde_json::json!({ "forward": as_obj(&vault.forward), "reverse": as_obj(&vault.reverse) }),
-            );
-        }
-        write_json_pretty(&token_vault_path, &Value::Object(vault_json))?;
+    if !vaults.columns.is_empty() {
+        vaults.save(&token_vault_path)?;
     }
     if cfg.shared_hash_salts && hash_salts.len() > hash_salts_loaded {
         write_json_pretty(
