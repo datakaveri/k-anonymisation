@@ -34,7 +34,7 @@ postgres = "0.19"
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
-aes-siv = "0.7"
+aes-siv = "0.8"
 fpe = "0.6"
 num-bigint = "0.4"
 getrandom = "0.2"
