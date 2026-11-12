@@ -20,7 +20,8 @@ env:
   CARGO_TERM_COLOR: always
 
 # The toolchain comes from SKALD/rust-toolchain.toml; rustup installs it on
-# first use. Every third-party action is pinned to a full commit SHA.
+# first use. Only GitHub-owned actions are used: the repository's action
+# allow-list blocks unverified publishers. Each is pinned to a full commit SHA.
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -32,18 +33,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          workspaces: SKALD
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            SKALD/target
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('SKALD/Cargo.lock', 'SKALD/rust-toolchain.toml') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          workspaces: SKALD
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            SKALD/target
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('SKALD/Cargo.lock', 'SKALD/rust-toolchain.toml') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-
       - run: cargo test --all-targets
       # A known-defect test is marked #[ignore] until its fix lands. None may
       # be left behind silently: list them so the job log shows any.
@@ -53,18 +66,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          tool: cargo-audit
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-0.22.2-${{ runner.os }}-${{ hashFiles('SKALD/rust-toolchain.toml') }}
+      - run: command -v cargo-audit || cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo audit
 
   doc:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          workspaces: SKALD
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            SKALD/target
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('SKALD/Cargo.lock', 'SKALD/rust-toolchain.toml') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
