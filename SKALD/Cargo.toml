@@ -36,7 +36,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1"
 aes-siv = "0.8"
 fpe = "0.7"
-num-bigint = "0.4"
+num-bigint = "0.5"
 getrandom = "0.4"
 
 [dev-dependencies]

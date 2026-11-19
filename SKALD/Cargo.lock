@@ -632,7 +632,7 @@ dependencies = [
  "cbc",
  "cipher",
  "libm",
- "num-bigint 0.5.1",
+ "num-bigint",
  "num-integer",
  "num-traits",
 ]
@@ -893,16 +893,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
-]
-
-[[package]]
-name = "num-bigint"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
-dependencies = [
- "num-integer",
- "num-traits",
 ]
 
 [[package]]
@@ -1410,7 +1400,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hmac 0.12.1",
- "num-bigint 0.4.8",
+ "num-bigint",
  "postgres",
  "proptest",
  "regex",
