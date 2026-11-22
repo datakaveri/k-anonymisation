@@ -574,30 +574,33 @@ pub(super) fn apply_regex_group_mask(
     mask_groups: &[(usize, String)],
     default_mask: char,
 ) -> String {
+    // Each group is masked over its own span, located by the capture offsets.
+    // Searching the match for the group's text instead masked its first
+    // occurrence: `^(.{0,3})(.*)$` with group 2 on "560560" masked the leading
+    // "560" and released the tail. Nested groups compose position by position.
     re.replace_all(value, |caps: &regex::Captures| {
-        let full_match = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-        let mut rebuilt = full_match.to_string();
+        let Some(whole) = caps.get(0) else { return String::new() };
+        let base = whole.start();
+        let mut chars: Vec<(usize, char)> = whole.as_str().char_indices().map(|(i, c)| (base + i, c)).collect();
         for (group_idx, mode) in mask_groups {
-            if let Some(group_match) = caps.get(*group_idx) {
-                let original = group_match.as_str();
-                let replacement = match mode.as_str() {
-                    "full" => default_mask.to_string().repeat(original.chars().count()),
-                    "partial" => {
-                        if original.chars().count() <= 1 {
-                            original.to_string()
-                        } else {
-                            let mut chars = original.chars();
-                            let first = chars.next().unwrap().to_string();
-                            let rest = default_mask.to_string().repeat(original.chars().count() - 1);
-                            first + &rest
-                        }
-                    }
-                    _ => original.to_string(),
-                };
-                rebuilt = rebuilt.replacen(original, &replacement, 1);
+            let Some(group) = caps.get(*group_idx) else { continue };
+            let keep_first = match mode.as_str() {
+                "full" => false,
+                "partial" => true,
+                _ => continue,
+            };
+            let mut first = true;
+            for (offset, c) in chars.iter_mut() {
+                if *offset < group.start() || *offset >= group.end() {
+                    continue;
+                }
+                if !(keep_first && first) {
+                    *c = default_mask;
+                }
+                first = false;
             }
         }
-        rebuilt
+        chars.into_iter().map(|(_, c)| c).collect::<String>()
     })
     .to_string()
 }
@@ -669,4 +672,38 @@ pub(crate) fn apply_masking_value(
     }
 
     Ok(masked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn mask(entry: Value, value: &str) -> String {
+        let cfg = parse_masking_config(&entry).unwrap();
+        apply_masking_value(value, &cfg, &|s: &str| Ok(s.to_string())).unwrap()
+    }
+
+    /// The group's own span is masked, not the first place its text appears
+    /// in the match. "560560" used to come out as "***560".
+    #[test]
+    fn a_regex_group_is_masked_at_its_own_offsets() {
+        let entry = |groups: Value| {
+            json!({"column": "pin", "apply_order": ["regex"],
+                   "regex_patterns": [{"regex": "^(.{0,3})(.*)$", "mask_groups": groups}]})
+        };
+        assert_eq!(mask(entry(json!({"2": "full"})), "560560"), "560***");
+        assert_eq!(mask(entry(json!({"1": "full"})), "560560"), "***560");
+        assert_eq!(mask(entry(json!({"2": "partial"})), "560560"), "5605**");
+        assert_eq!(mask(entry(json!({"1": "full", "2": "full"})), "560560"), "******");
+        // Multi-byte text keeps its character count.
+        assert_eq!(mask(entry(json!({"2": "full"})), "ಬೆಂಗಳೂರು"), "ಬೆಂ*****");
+    }
+
+    #[test]
+    fn nested_and_repeated_groups_compose_by_position() {
+        let entry = json!({"column": "d", "apply_order": ["regex"],
+            "regex_patterns": [{"regex": "(\\d{4})-((\\d{2})-(\\d{2}))", "mask_groups": {"4": "full", "3": "partial"}}]});
+        assert_eq!(mask(entry, "2020-02-02 and 2020-02-02"), "2020-0*-** and 2020-0*-**");
+    }
 }

@@ -13,7 +13,7 @@ Implements the OLA-1 / OLA-2 lattice algorithms for optimal generalization with 
 4. Computes k-anonymous generalizations of the quasi-identifiers with the OLA-2 lattice search, optionally with distinct l-diversity on sensitive columns (t-closeness is not implemented)
 5. Writes the anonymized output, a run summary (equivalence classes, DM\*, suppressed records) and a structured `status.json` to `output/`
 
-Nested JSON documents and FHIR bundles go through a separate per-document flow: path rules decide what each field becomes, anything unmatched is removed, and k-anonymity does not apply.
+Nested JSON documents and FHIR bundles go through a separate per-document flow: path rules decide what each field becomes, anything unmatched is removed, and k-anonymity does not apply. See [FHIR bundles](#fhir-bundles).
 
 Key material (keys, salts, token vaults) is written to a separate key directory. Its holders can reverse tokenised and encrypted columns; see [Reverse operations](#reverse-operations-authorized-recovery).
 
@@ -610,6 +610,202 @@ Identifier values are trimmed and Unicode-NFC-normalised before hashing,
 tokenisation and encryption. `hashing_without_salt` (unsalted SHA-256 — reversible
 by enumerating phone or Aadhaar numbers) and the legacy `fpe` section were
 removed in 4.0.
+
+---
+
+## FHIR bundles
+
+With `"fhir_bundle": true` the section runs a per-bundle redaction pass in place
+of the k-anonymity flow. Each input `.json` is one FHIR R4 Bundle for one
+patient, and the output is one valid Bundle per input, plus
+`fhir_bundle_census.csv` listing every path seen and the rule that decided it.
+Resource ids are replaced by salted pseudonyms, and every `reference` and
+`fullUrl` is rewritten to match. Salts are kept in
+`<key dir>/fhir_bundle_salts.json`.
+
+### Path rules
+
+The technique buckets (`keep`, `suppress`, `hashing_with_salt`, `free_text`,
+`masking[].column`) take path globs over FHIR elements.
+
+- A path starts at the resource type and restarts at every nested resource
+  (`entry[].resource`, `contained[]`). Matching ignores case.
+- Every array is its own `[]` segment: write `Patient.identifier[].value`, or
+  use `**`.
+- `**` matches zero or more segments. `*` is a wildcard inside one segment.
+- Anything no rule covers takes `default_action` (`suppress` unless set).
+- When several rules match, the narrowest wins. A rule with more predicate
+  segments wins first (see below). Then fewer `**`, then fewer `*`, then more
+  literal characters, then more segments. Ties go to the more protective
+  technique.
+
+### Predicates: selecting an array element by its content
+
+Write a condition in place of `[]` to match only the array elements that
+satisfy it:
+
+```text
+Patient.identifier[system~"*naco*"].**
+Patient.identifier[type.coding.code="MR"].value
+Patient.extension[url="http://hl7.org/fhir/StructureDefinition/patient-cadavericDonor"].**
+Encounter.identifier[system~"*mlc*"].**
+```
+
+| Part | Syntax | Meaning |
+|---|---|---|
+| clause | `field op value` | `field` is a dot path inside the element (`system`, `type.coding.code`) |
+| `=` | `system="urn:x"` | exact, case-sensitive |
+| `~` | `system~"*naco*"` | `*` glob, case-insensitive |
+| alternatives | `code="DNA"\|"RNA"` | any one value may match |
+| conjunction | `[system~"*x*", use="official"]` | every clause must hold |
+| strings | `"…"` | double-quoted; `\"` and `\\` are the only escapes |
+
+- **Arrays:** a field is followed through nested arrays, so
+  `type.coding.code="MR"` holds when any coding has that code.
+- **Codings:** a field that ends on a Coding object compares as
+  `system|code`, e.g. `category.coding="http://terminology.hl7.org/CodeSystem/v2-0074|GE"`.
+- **References:** a field ending in `reference` also compares as the
+  `Type/id` it resolves to inside the bundle, so
+  `derivedFrom.reference~"MolecularSequence/*"` matches `urn:uuid:`
+  references too.
+- **Where they work:** predicates work in every bucket, in `masking[].column`
+  and in `propagation.from`. They also work in `nested_json`.
+- **Ordering:** a rule with a predicate outranks every rule without one,
+  whatever their `**` counts. So
+  `Patient.identifier[system~"*naco*"].**` (suppress) beats
+  `Patient.identifier[].value` (hash) on the ART number, and every other
+  identifier keeps its hash.
+- **Errors:** a malformed or unknown predicate is a config error
+  (`CONFIG_INVALID_VALUE`).
+
+### `drop_resources`
+
+`drop_resources` is a list of resource selectors. A matching resource is
+removed together with its entry and with every reference to it. Each drop is
+recorded in the census as `drop_resource`.
+
+```text
+MolecularSequence                                      by type
+DiagnosticReport[category.coding="http://terminology.hl7.org/CodeSystem/v2-0074|GE"]
+Specimen[type.coding.code="DNA"|"RNA"]
+Observation[derivedFrom.reference~"MolecularSequence/*"]
+*[meta.security="http://terminology.hl7.org/CodeSystem/v3-ActCode|GDIS"]
+```
+
+A selector is a type, or a type glob, optionally followed by one predicate
+that is tested against the resource itself. The Bundle cannot be dropped.
+
+### `code_rules`
+
+`code_rules` holds code lists read against a resource's `code`. A list entry
+is either a glob over the normalised `code.text` / `coding[].display`
+(`"GPS Latitude"` → `gps_latitude`), or an exact `system|code`.
+
+The value can take two forms:
+
+- **An object:** one block, applied to Observations, as before.
+- **A list of blocks:** each block can set `resources`, the resource types
+  whose `code` it reads. The default is `["Observation"]`.
+
+| Key | On an Observation | On other resources |
+|---|---|---|
+| `suppress` | drops the resource and its references | same |
+| `keep` | exempts the code (a `suppress` match still wins) | same |
+| `hashing_with_salt` | hashes `value[x]` | not allowed |
+| `free_text` | marks the code as cleared upstream | not allowed |
+| `masking` | masks `value[x]` | not allowed |
+
+- **Code masking entries:** a `masking` entry is a normal masking entry with
+  `code` in place of `column`, e.g.
+  `{"code": "*_dob", "characters_to_mask": [6, 7, 9, 10], "apply_order": ["characters"]}`.
+  It masks the string leaves of the Observation's `value[x]`. A number or
+  boolean under that code is removed instead, because masking produces text
+  that FHIR rejects there.
+- **Scoping:** `hashing_with_salt`, `free_text` and `masking` need a block
+  whose `resources` is `["Observation"]` only.
+
+### References
+
+A `reference` is pseudonymised unless an explicit rule suppresses it. The
+nearest explicit rule decides, either on the reference itself or on an
+ancestor: `Patient.link.**`, `Claim.facility`,
+`Encounter.location[].location.reference`. A rule on an ancestor such as
+`Claim.facility` therefore removes the whole Reference. A reference that no
+rule names, or whose nearest rule is not `suppress`, is pseudonymised as
+before. Ids and `fullUrl` are always pseudonymised.
+
+### `output_names`
+
+`output_names` decides how output files are named:
+
+- **`"input"`** (the default): `<input stem>_anonymised.fhir.json`. NHA stems
+  are case ids, so the released file names identify their cases.
+- **`"pseudonym"`**: `<hmac>_anonymised.fhir.json`, where `<hmac>` is the
+  first 32 hex characters of HMAC-SHA256 of the input stem. The HMAC key is
+  the `<output name>` salt in `fhir_bundle_salts.json`. Only the holder of the
+  key directory can map an output back to its input:
+  `hmac.new(bytes.fromhex(salt), stem.encode(), hashlib.sha256).hexdigest()[:32]`.
+
+### Example
+
+```json
+{
+  "data_type": "fhir",
+  "fhir": {
+    "fhir_bundle": true,
+    "input_path": "data/fhir",
+    "output_path": "fhir_out",
+    "default_action": "suppress",
+    "keep": [
+      "Bundle.type",
+      "**.status",
+      "**.code.text",
+      "**.coding[].system",
+      "**.coding[].code",
+      "**.coding[].display",
+      "Patient.gender",
+      "Patient.identifier[].system",
+      "Patient.identifier[].type.**",
+      "Patient.extension[url=\"http://hl7.org/fhir/StructureDefinition/patient-cadavericDonor\"].**",
+      "Observation.valueQuantity.*",
+      "Observation.valueString"
+    ],
+    "hashing_with_salt": ["Patient.identifier[].value", "Claim.identifier[].value"],
+    "suppress": [
+      "Patient.identifier[system~\"*naco*\"].**",
+      "Encounter.identifier[system~\"*mlc*\"].**",
+      "Patient.link.**",
+      "Claim.facility"
+    ],
+    "masking": [
+      {"column": "Patient.birthDate", "characters_to_mask": [6, 7, 9, 10], "apply_order": ["characters"]},
+      {"column": "Patient.identifier[type.coding.code=\"MR\"].value",
+       "regex_patterns": [{"regex": "^(.{0,3})(.*)$", "mask_groups": {"2": "full"}}], "apply_order": ["regex"]}
+    ],
+    "drop_resources": [
+      "MolecularSequence",
+      "Media",
+      "DiagnosticReport[category.coding=\"http://terminology.hl7.org/CodeSystem/v2-0074|GE\"]",
+      "Specimen[type.coding.code=\"DNA\"|\"RNA\"]",
+      "Observation[derivedFrom.reference~\"MolecularSequence/*\"]",
+      "*[meta.security=\"http://terminology.hl7.org/CodeSystem/v3-ActCode|GDIS\"|\"http://terminology.hl7.org/CodeSystem/v3-ActCode|SCA\"]"
+    ],
+    "code_rules": [
+      {
+        "suppress": ["gps_*", "*mobile*"],
+        "hashing_with_salt": ["*uhid*"],
+        "masking": [{"code": "*_dob", "characters_to_mask": [6, 7, 9, 10], "apply_order": ["characters"]}]
+      },
+      {
+        "resources": ["Condition", "ServiceRequest", "DiagnosticReport", "Observation"],
+        "suppress": ["*hiv*", "http://hl7.org/fhir/sid/icd-10|B20"]
+      }
+    ],
+    "propagation": {"from": ["Patient.name.**", "Patient.identifier[].value"], "min_length": 6},
+    "output_names": "pseudonym"
+  }
+}
+```
 
 ---
 
