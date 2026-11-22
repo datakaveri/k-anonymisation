@@ -77,3 +77,4 @@ jobs:
           tags: |
             ghcr.io/datakaveri/skald:${{ needs.version.outputs.version }}
             ghcr.io/datakaveri/skald:v${{ needs.version.outputs.version }}
+            ghcr.io/datakaveri/skald:latest

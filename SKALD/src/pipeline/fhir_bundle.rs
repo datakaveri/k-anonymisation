@@ -36,13 +36,13 @@
 
 use crate::pipeline::bootstrap::{PipelineError, io_err, validation};
 use crate::pipeline::nested_json::{
-    Action, Census, Rule, apply_action, decide_in, display_path, json_files, parse_action, parse_policy_rules,
-    privacy_rank, write_census,
+    Action, Census, Predicate, Resolver, Rule, apply_action, decide_at, decide_in, display_path, json_files,
+    parse_action, parse_policy_rules, privacy_rank, wildcard_match, write_census,
 };
 use crate::pipeline::preprocess::crypto::{generate_random_salt_hex, hash_key, keyed_hash, write_secret_file};
-use crate::pipeline::preprocess::masking::MaskingConfigLite;
+use crate::pipeline::preprocess::masking::{MaskingConfigLite, parse_masking_config};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -55,6 +55,9 @@ const SALT_FILE: &str = "fhir_bundle_salts.json";
 
 /// The salt column resource ids are pseudonymised under.
 const ID_COLUMN: &str = "<resource id>";
+
+/// The salt column pseudonymous output file names are keyed under.
+const OUTPUT_NAME_COLUMN: &str = "<output name>";
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -70,12 +73,15 @@ pub struct FhirBundleConfig {
     pub default_action: Action,
     /// Path rules over `ResourceType.element…`, shared engine with `nested_json`.
     pub rules: Vec<Rule>,
+    /// Path masking specs, then the `code_rules` masking specs.
     pub(crate) masking: Vec<MaskingConfigLite>,
-    /// Section key `code_rules`: single-segment globs over the normalised
-    /// `Observation.code.text` / `coding[].display`.
-    pub code_rules: Vec<Rule>,
-    /// Entries of `code_rules` written as `system|code`, matched exactly.
-    pub coding_rules: Vec<(String, Action)>,
+    /// Section key `code_rules`: code lists, each scoped to resource types.
+    pub code_scopes: Vec<CodeScope>,
+    /// Section key `drop_resources`: resources removed whole, with every
+    /// reference to them.
+    pub drop_resources: Vec<ResourceSelector>,
+    /// Section key `output_names`.
+    pub output_names: OutputNames,
     /// Section key `propagation.from`: paths whose values become needles.
     pub propagate_from: Vec<Rule>,
     pub propagation_enabled: bool,
@@ -100,8 +106,9 @@ impl Default for FhirBundleConfig {
             default_action: Action::Suppress,
             rules: Vec::new(),
             masking: Vec::new(),
-            code_rules: Vec::new(),
-            coding_rules: Vec::new(),
+            code_scopes: Vec::new(),
+            drop_resources: Vec::new(),
+            output_names: OutputNames::Input,
             propagate_from: Vec::new(),
             propagation_enabled: true,
             propagation_min_length: 6,
@@ -110,6 +117,94 @@ impl Default for FhirBundleConfig {
             key_material_dir: PathBuf::from("keys"),
             output_root: PathBuf::from("output"),
         }
+    }
+}
+
+impl FhirBundleConfig {
+    /// Code rules across every scope, for the log.
+    pub fn code_rule_count(&self) -> usize {
+        self.code_scopes.iter().map(|s| s.rules.len() + s.codings.len()).sum()
+    }
+}
+
+/// How output files are named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputNames {
+    /// `<input stem>_anonymised.fhir.json`. NHA stems are case ids, so the
+    /// released file names identify the case.
+    Input,
+    /// `<hmac>_anonymised.fhir.json`: the first 32 hex characters of
+    /// HMAC-SHA256 of the input stem under the `<output name>` salt in
+    /// `fhir_bundle_salts.json`. Whoever holds the salt can map an input to
+    /// its output; the released folder alone cannot.
+    Pseudonym,
+}
+
+/// One block of `code_rules`: code lists and the resource types whose `code`
+/// they are read against.
+#[derive(Debug, Clone)]
+pub struct CodeScope {
+    /// Resource types, as written (`Observation`, `Condition`, …).
+    pub resources: Vec<String>,
+    /// Single-segment globs over the normalised `code.text` and
+    /// `code.coding[].display`.
+    pub rules: Vec<Rule>,
+    /// Entries written as `system|code`, lowercased, matched exactly.
+    pub codings: Vec<(String, Action)>,
+}
+
+impl CodeScope {
+    fn applies_to(&self, rt: &str) -> bool {
+        self.resources.iter().any(|r| r == rt)
+    }
+}
+
+/// A `drop_resources` entry: `Type`, `Type[predicate]`, or a type glob such
+/// as `*[meta.security="…|GDIS"]`. The predicate is tested against the
+/// resource itself, with the syntax of a path-rule predicate.
+#[derive(Debug, Clone)]
+pub struct ResourceSelector {
+    /// The entry as written, for the census.
+    pub text: String,
+    /// Lowercased type glob.
+    type_glob: String,
+    predicate: Option<Predicate>,
+}
+
+impl ResourceSelector {
+    fn parse(text: &str) -> Result<ResourceSelector, PipelineError> {
+        let bad =
+            |why: &str| validation("CONFIG_INVALID_VALUE", "Malformed drop_resources entry", &format!("{text}: {why}"));
+        let trimmed = text.trim();
+        let (ty, rest) = match trimmed.find('[') {
+            Some(i) => (&trimmed[..i], Some(&trimmed[i..])),
+            None => (trimmed, None),
+        };
+        if ty.is_empty() || !ty.chars().all(|c| c.is_ascii_alphanumeric() || c == '*') {
+            return Err(bad("must start with a resource type (letters, or * as a wildcard)"));
+        }
+        if ty.eq_ignore_ascii_case("bundle") {
+            return Err(bad("the Bundle itself cannot be dropped"));
+        }
+        let predicate = match rest {
+            None => None,
+            Some(r) => {
+                let body = r
+                    .strip_prefix('[')
+                    .and_then(|r| r.strip_suffix(']'))
+                    .ok_or_else(|| bad("a selector is Type or Type[predicate], with nothing after the closing ']'"))?;
+                if body.trim().is_empty() {
+                    return Err(bad("empty predicate"));
+                }
+                Some(Predicate::parse(body).map_err(|why| bad(&why))?)
+            }
+        };
+        Ok(ResourceSelector { text: trimmed.to_string(), type_glob: ty.to_ascii_lowercase(), predicate })
+    }
+
+    fn matches(&self, rt: &str, res: &Map<String, Value>, resolve: Option<Resolver>) -> bool {
+        wildcard_match(&self.type_glob, &rt.to_ascii_lowercase())
+            && self.predicate.as_ref().is_none_or(|p| p.matches_map(res, resolve))
     }
 }
 
@@ -155,31 +250,34 @@ pub fn parse_fhir_bundle(section: &Value) -> Result<FhirBundleConfig, PipelineEr
     cfg.masking = specs.masking;
 
     if let Some(block) = section.get("code_rules") {
-        let obj = block.as_object().ok_or_else(|| {
-            validation("CONFIG_INVALID_VALUE", "code_rules must be an object of technique lists", &block.to_string())
-        })?;
-        for (key, list) in obj {
-            let action = match key.as_str() {
-                "keep" => Action::Keep,
-                "suppress" => Action::Suppress,
-                "hashing_with_salt" => Action::Hash,
-                "free_text" => Action::FreeText,
-                other => {
-                    return Err(validation(
-                        "CONFIG_INVALID_VALUE",
-                        "Unknown code_rules technique",
-                        &format!("'{other}' — must be keep, suppress, hashing_with_salt or free_text"),
-                    ));
-                }
-            };
-            for entry in str_list(list, &format!("code_rules.{key}"))? {
-                if entry.contains('|') {
-                    cfg.coding_rules.push((entry.trim().to_ascii_lowercase(), action.clone()));
-                } else {
-                    cfg.code_rules.push(Rule::new(&normalise_code(&entry), action.clone()));
-                }
-            }
+        let blocks: Vec<&Value> = match block {
+            Value::Array(a) => a.iter().collect(),
+            other => vec![other],
+        };
+        for b in blocks {
+            let scope = parse_code_block(b, &mut cfg.masking)?;
+            cfg.code_scopes.push(scope);
         }
+    }
+
+    if let Some(list) = section.get("drop_resources") {
+        for entry in str_list(list, "drop_resources")? {
+            cfg.drop_resources.push(ResourceSelector::parse(&entry)?);
+        }
+    }
+
+    if let Some(v) = section.get("output_names") {
+        cfg.output_names = match v.as_str() {
+            Some("input") => OutputNames::Input,
+            Some("pseudonym") => OutputNames::Pseudonym,
+            _ => {
+                return Err(validation(
+                    "CONFIG_INVALID_VALUE",
+                    "Invalid output_names",
+                    &format!("{v} — must be \"input\" or \"pseudonym\""),
+                ));
+            }
+        };
     }
 
     if let Some(block) = section.get("propagation") {
@@ -195,7 +293,7 @@ pub fn parse_fhir_bundle(section: &Value) -> Result<FhirBundleConfig, PipelineEr
         }
         if let Some(list) = block.get("from") {
             for p in str_list(list, "propagation.from")? {
-                cfg.propagate_from.push(Rule::new(&p, Action::Suppress));
+                cfg.propagate_from.push(Rule::try_new(&p, Action::Suppress)?);
             }
         }
     }
@@ -220,6 +318,98 @@ pub fn parse_fhir_bundle(section: &Value) -> Result<FhirBundleConfig, PipelineEr
         ));
     }
     Ok(cfg)
+}
+
+/// Reads one `code_rules` block: technique lists of code globs or
+/// `system|code` entries, `masking` entries keyed by `code`, and the
+/// `resources` the block applies to (default `["Observation"]`).
+fn parse_code_block(block: &Value, masking: &mut Vec<MaskingConfigLite>) -> Result<CodeScope, PipelineError> {
+    let invalid = |msg: &str, detail: &str| validation("CONFIG_INVALID_VALUE", msg, detail);
+    let obj = block.as_object().ok_or_else(|| {
+        invalid("code_rules must be an object of technique lists, or a list of them", &block.to_string())
+    })?;
+    let mut scope = CodeScope { resources: vec!["Observation".to_string()], rules: Vec::new(), codings: Vec::new() };
+    if let Some(list) = obj.get("resources") {
+        scope.resources = str_list(list, "code_rules.resources")?.into_iter().map(|r| r.trim().to_string()).collect();
+        if scope.resources.is_empty() {
+            return Err(invalid("code_rules.resources is empty", "list the resource types the codes apply to"));
+        }
+        if let Some(bad) = scope.resources.iter().find(|r| {
+            r.eq_ignore_ascii_case("bundle")
+                || !r.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                || !r.chars().all(|c| c.is_ascii_alphanumeric())
+        }) {
+            return Err(invalid("code_rules.resources entries must be resource type names", bad));
+        }
+    }
+    let observation_only = scope.resources.iter().all(|r| r == "Observation");
+    let push = |scope: &mut CodeScope, entry: &str, action: Action| {
+        if entry.contains('|') {
+            scope.codings.push((entry.trim().to_ascii_lowercase(), action));
+        } else {
+            scope.rules.push(Rule::new(&normalise_code(entry), action));
+        }
+    };
+    for (key, list) in obj {
+        let action = match key.as_str() {
+            "resources" => continue,
+            "keep" => Action::Keep,
+            "suppress" => Action::Suppress,
+            "hashing_with_salt" => Action::Hash,
+            "free_text" => Action::FreeText,
+            "masking" => {
+                let entries = list
+                    .as_array()
+                    .ok_or_else(|| invalid("code_rules.masking must be an array of objects", &list.to_string()))?;
+                if !observation_only && !entries.is_empty() {
+                    return Err(invalid(
+                        "code_rules.masking acts on an Observation's value[x]",
+                        "put it in a block whose resources are [\"Observation\"] only",
+                    ));
+                }
+                for e in entries {
+                    let mut entry = e
+                        .as_object()
+                        .cloned()
+                        .ok_or_else(|| invalid("code_rules.masking entries must be objects", &e.to_string()))?;
+                    if entry.contains_key("column") {
+                        return Err(invalid(
+                            "code_rules.masking entries name a 'code', not a 'column'",
+                            &e.to_string(),
+                        ));
+                    }
+                    let code = entry
+                        .remove("code")
+                        .and_then(|c| c.as_str().map(str::to_string))
+                        .filter(|c| !c.trim().is_empty())
+                        .ok_or_else(|| invalid("code_rules.masking entries need a non-empty 'code'", &e.to_string()))?;
+                    entry.insert("column".into(), Value::String(format!("code:{code}")));
+                    let spec = parse_masking_config(&Value::Object(entry))?;
+                    let action = Action::Masking { spec: masking.len() };
+                    masking.push(spec);
+                    push(&mut scope, &code, action);
+                }
+                continue;
+            }
+            other => {
+                return Err(invalid(
+                    "Unknown code_rules technique",
+                    &format!("'{other}' — must be keep, suppress, hashing_with_salt, free_text, masking or resources"),
+                ));
+            }
+        };
+        let entries = str_list(list, &format!("code_rules.{key}"))?;
+        if !observation_only && matches!(action, Action::Hash | Action::FreeText) && !entries.is_empty() {
+            return Err(invalid(
+                &format!("code_rules.{key} acts on an Observation's value[x]"),
+                "put it in a block whose resources are [\"Observation\"] only; other resources take keep and suppress",
+            ));
+        }
+        for entry in entries {
+            push(&mut scope, &entry, action.clone());
+        }
+    }
+    Ok(scope)
 }
 
 fn str_list(v: &Value, key: &str) -> Result<Vec<String>, PipelineError> {
@@ -554,17 +744,26 @@ fn for_each_resource<'a>(v: &'a Value, f: &mut dyn FnMut(&'a Map<String, Value>)
     }
 }
 
-/// Every leaf of `v` with its match path, re-rooted at nested resources the
+/// A leaf's position: its match path, display path and the array elements
+/// along it (for predicates).
+struct LeafAt<'p, 'v> {
+    lpath: &'p [String],
+    dpath: &'p [String],
+    items: &'p [Option<&'v Value>],
+}
+
+/// Every leaf of `v` with its position, re-rooted at nested resources the
 /// same way the main walk does.
-#[allow(clippy::type_complexity)] // a visitor over (logical path, display path, leaf)
-fn for_each_leaf<'a>(
-    v: &'a Value,
+fn for_each_leaf<'v>(
+    v: &'v Value,
     lpath: &mut Vec<String>,
     dpath: &mut Vec<String>,
-    f: &mut dyn FnMut(&[String], &[String], &'a Value),
+    items: &mut Vec<Option<&'v Value>>,
+    f: &mut dyn FnMut(LeafAt<'_, 'v>, &'v Value),
 ) {
     match v {
         Value::Object(map) => {
+            let mut rooted = false;
             if let Some(rt) = map.get("resourceType").and_then(Value::as_str) {
                 if !lpath.is_empty() {
                     // A nested resource is handled when the outer loop reaches it.
@@ -572,6 +771,8 @@ fn for_each_leaf<'a>(
                 }
                 lpath.push(rt.to_ascii_lowercase());
                 dpath.push(rt.to_string());
+                items.push(None);
+                rooted = true;
             }
             for (k, child) in map {
                 if k == "resourceType" {
@@ -579,27 +780,64 @@ fn for_each_leaf<'a>(
                 }
                 lpath.push(k.to_ascii_lowercase());
                 dpath.push(k.clone());
-                for_each_leaf(child, lpath, dpath, f);
+                items.push(None);
+                for_each_leaf(child, lpath, dpath, items, f);
                 lpath.pop();
                 dpath.pop();
+                items.pop();
+            }
+            if rooted {
+                lpath.pop();
+                dpath.pop();
+                items.pop();
             }
         }
-        Value::Array(items) => {
-            for c in items {
+        Value::Array(elements) => {
+            for c in elements {
                 lpath.push("[]".into());
                 dpath.push("[]".into());
-                for_each_leaf(c, lpath, dpath, f);
+                items.push(Some(c));
+                for_each_leaf(c, lpath, dpath, items, f);
                 lpath.pop();
                 dpath.pop();
+                items.pop();
             }
         }
-        leaf => f(lpath, dpath, leaf),
+        leaf => f(LeafAt { lpath, dpath, items }, leaf),
     }
 }
 
-/// The codes an Observation is known by, for the code-keyed rules: the
+/// Resource type by id, for resolving references to `Type/id`. Built per
+/// bundle from every resource's `id` and every entry's `fullUrl`.
+fn reference_index(bundle: &Value) -> HashMap<String, String> {
+    let mut index = HashMap::new();
+    for_each_resource(bundle, &mut |res| {
+        if let (Some(rt), Some(id)) =
+            (res.get("resourceType").and_then(Value::as_str), res.get("id").and_then(Value::as_str))
+        {
+            index.insert(id.to_string(), rt.to_string());
+        }
+    });
+    for e in bundle.get("entry").and_then(Value::as_array).into_iter().flatten() {
+        if let (Some(full), Some(rt)) = (
+            e.get("fullUrl").and_then(Value::as_str).and_then(reference_target),
+            e.get("resource").and_then(|r| r.get("resourceType")).and_then(Value::as_str),
+        ) {
+            index.entry(full.to_string()).or_insert_with(|| rt.to_string());
+        }
+    }
+    index
+}
+
+/// `Type/id` for a reference the bundle can resolve.
+fn resolve_in(index: &HashMap<String, String>, r: &str) -> Option<String> {
+    let id = reference_target(r)?;
+    index.get(id).map(|rt| format!("{rt}/{id}"))
+}
+
+/// The codes a resource is known by, for the code-keyed rules: the
 /// normalised `code.text` and each `coding[].display`, plus `system|code`.
-fn observation_codes(res: &Map<String, Value>) -> (Vec<String>, Vec<String>) {
+fn resource_codes(res: &Map<String, Value>) -> (Vec<String>, Vec<String>) {
     let mut texts = Vec::new();
     let mut codings = Vec::new();
     if let Some(code) = res.get("code") {
@@ -620,11 +858,16 @@ fn observation_codes(res: &Map<String, Value>) -> (Vec<String>, Vec<String>) {
     (texts, codings)
 }
 
-/// The code rule that governs an Observation: the narrowest matching text
-/// glob or an exact coding, the more protective one winning when several
-/// match — a code that is suppressed under any of its names is suppressed.
-fn code_decision<'a>(cfg: &'a FhirBundleConfig, res: &Map<String, Value>) -> Option<(&'a Action, String)> {
-    let (texts, codings) = observation_codes(res);
+/// The code rule that governs a resource: across every `code_rules` block
+/// scoped to its type, the narrowest matching text glob or an exact coding,
+/// the more protective one winning when several match — a code that is
+/// suppressed under any of its names is suppressed.
+fn code_decision<'a>(cfg: &'a FhirBundleConfig, rt: &str, res: &Map<String, Value>) -> Option<(&'a Action, String)> {
+    let scopes: Vec<&CodeScope> = cfg.code_scopes.iter().filter(|s| s.applies_to(rt)).collect();
+    if scopes.is_empty() {
+        return None;
+    }
+    let (texts, codings) = resource_codes(res);
     let mut best: Option<(&'a Action, String)> = None;
     let mut consider = |action: &'a Action, why: String| {
         let better = match &best {
@@ -635,16 +878,18 @@ fn code_decision<'a>(cfg: &'a FhirBundleConfig, res: &Map<String, Value>) -> Opt
             best = Some((action, why));
         }
     };
-    for t in &texts {
-        let seg = [t.clone()];
-        let (action, by) = decide_in(&cfg.code_rules, &Action::Keep, &seg);
-        if by != "<default>" {
-            consider(action, format!("code:{by}"));
+    for scope in scopes {
+        for t in &texts {
+            let seg = [t.clone()];
+            let (action, by) = decide_in(&scope.rules, &Action::Keep, &seg);
+            if by != "<default>" {
+                consider(action, format!("code:{by}"));
+            }
         }
-    }
-    for c in &codings {
-        if let Some((_, action)) = cfg.coding_rules.iter().find(|(k, _)| k == c) {
-            consider(action, format!("coding:{c}"));
+        for c in &codings {
+            if let Some((_, action)) = scope.codings.iter().find(|(k, _)| k == c) {
+                consider(action, format!("coding:{c}"));
+            }
         }
     }
     best
@@ -658,42 +903,72 @@ struct Walker<'a> {
     /// The `<resource id>` column's key, looked up once per bundle.
     id_key: [u8; 32],
     census: &'a mut Census,
-    /// Original ids of resources a code rule dropped.
+    /// Original ids of resources a code rule or `drop_resources` dropped.
     dropped: HashSet<String>,
+    /// The dropped resources themselves, so one without an id goes too.
+    dropped_at: HashSet<*const Map<String, Value>>,
     needles: Needles,
+    /// Resource type by id, for predicates on references.
+    refs: HashMap<String, String>,
     /// The code rule governing the Observation being walked, if any.
     code_override: Option<(Action, String)>,
 }
 
+/// The match path, display path and array elements of the value being
+/// walked, pushed and popped together.
+struct Pos<'v> {
+    lpath: Vec<String>,
+    dpath: Vec<String>,
+    items: Vec<Option<&'v Value>>,
+}
+
+impl<'v> Pos<'v> {
+    fn root(rt: &str) -> Pos<'v> {
+        Pos { lpath: vec![rt.to_ascii_lowercase()], dpath: vec![rt.to_string()], items: vec![None] }
+    }
+    fn push_key(&mut self, k: &str) {
+        self.lpath.push(k.to_ascii_lowercase());
+        self.dpath.push(k.to_string());
+        self.items.push(None);
+    }
+    fn push_item(&mut self, item: &'v Value) {
+        self.lpath.push("[]".into());
+        self.dpath.push("[]".into());
+        self.items.push(Some(item));
+    }
+    fn pop(&mut self) {
+        self.lpath.pop();
+        self.dpath.pop();
+        self.items.pop();
+    }
+}
+
 impl Walker<'_> {
+    fn resolve(&self, r: &str) -> Option<String> {
+        resolve_in(&self.refs, r)
+    }
+
     /// Walks one value. `None` removes it from its parent.
-    fn walk(&mut self, value: &Value, lpath: &mut Vec<String>, dpath: &mut Vec<String>) -> Option<Value> {
+    fn walk<'v>(&mut self, value: &'v Value, pos: &mut Pos<'v>) -> Option<Value> {
         match value {
-            Value::Object(map) => self.walk_object(map, lpath, dpath),
-            Value::Array(items) => {
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    lpath.push("[]".into());
-                    dpath.push("[]".into());
-                    let kept = self.walk(item, lpath, dpath);
-                    lpath.pop();
-                    dpath.pop();
+            Value::Object(map) => self.walk_object(map, pos),
+            Value::Array(elements) => {
+                let mut out = Vec::with_capacity(elements.len());
+                for item in elements {
+                    pos.push_item(item);
+                    let kept = self.walk(item, pos);
+                    pos.pop();
                     // FHIR JSON forbids nulls in arrays, and nothing indexes
                     // into these by position, so a removed element is dropped.
                     out.extend(kept);
                 }
                 (!out.is_empty()).then_some(Value::Array(out))
             }
-            leaf => self.leaf(leaf, lpath, dpath),
+            leaf => self.leaf(leaf, pos),
         }
     }
 
-    fn walk_object(
-        &mut self,
-        map: &Map<String, Value>,
-        lpath: &mut Vec<String>,
-        dpath: &mut Vec<String>,
-    ) -> Option<Value> {
+    fn walk_object<'v>(&mut self, map: &'v Map<String, Value>, pos: &mut Pos<'v>) -> Option<Value> {
         // A resource restarts the path at its own type, so `Observation.code`
         // means the same thing in `entry[].resource` and in `contained[]`.
         if let Some(rt) = map.get("resourceType").and_then(Value::as_str) {
@@ -709,7 +984,13 @@ impl Walker<'_> {
         if let Some(target) = map.get("reference").and_then(Value::as_str).and_then(reference_target)
             && self.dropped.contains(target)
         {
-            self.census.record_as(&display_path(dpath), &Value::Null, "drop_reference", "<dropped resource>", false);
+            self.census.record_as(
+                &display_path(&pos.dpath),
+                &Value::Null,
+                "drop_reference",
+                "<dropped resource>",
+                false,
+            );
             return None;
         }
 
@@ -718,9 +999,14 @@ impl Walker<'_> {
             if (k == "reference" || k == "fullUrl")
                 && let Some(r) = v.as_str()
             {
-                dpath.push(k.clone());
-                let shown = display_path(dpath);
-                dpath.pop();
+                pos.push_key(k);
+                let shown = display_path(&pos.dpath);
+                let suppressed_by = if k == "reference" { self.reference_suppressed(pos) } else { None };
+                pos.pop();
+                if let Some(by) = suppressed_by {
+                    self.census.record_as(&shown, v, "suppress", &by, false);
+                    continue;
+                }
                 match remap_reference(&self.id_key, r) {
                     Some(new) => {
                         self.census.record_as(&shown, v, "pseudonymise_reference", "<structural>", false);
@@ -730,14 +1016,12 @@ impl Walker<'_> {
                 }
                 continue;
             }
-            lpath.push(k.to_ascii_lowercase());
-            dpath.push(k.clone());
+            pos.push_key(k);
             // An entry whose resource was dropped is dropped whole, rather than
             // left behind as a bare `fullUrl` pointing at nothing.
             let is_resource = v.get("resourceType").is_some_and(Value::is_string);
-            let kept = self.walk(v, lpath, dpath);
-            lpath.pop();
-            dpath.pop();
+            let kept = self.walk(v, pos);
+            pos.pop();
             match kept {
                 Some(kept) => {
                     out.insert(k.clone(), kept);
@@ -746,21 +1030,42 @@ impl Walker<'_> {
                 None => {}
             }
         }
-        self.tidy(map, out, lpath)
+        self.tidy(map, out, &pos.lpath)
+    }
+
+    /// Whether a `reference` (its path on top of `pos`) is suppressed by an
+    /// explicit rule: on the reference itself, or on the nearest ancestor an
+    /// explicit rule names (`Claim.facility`, `Patient.link.**`). A reference
+    /// no rule names is pseudonymised, as it always was; so is one whose
+    /// nearest explicit rule is anything but `suppress`.
+    fn reference_suppressed(&self, pos: &Pos) -> Option<String> {
+        let resolve = |r: &str| self.resolve(r);
+        for end in (2..=pos.lpath.len()).rev() {
+            let (action, by) = decide_at(
+                &self.cfg.rules,
+                &self.cfg.default_action,
+                &pos.lpath[..end],
+                &pos.items[..end],
+                Some(&resolve),
+            );
+            if by != "<default>" {
+                return (*action == Action::Suppress).then(|| by.to_string());
+            }
+        }
+        None
     }
 
     fn walk_resource(&mut self, rt: &str, map: &Map<String, Value>) -> Option<Value> {
         let id = map.get("id").and_then(Value::as_str);
-        if id.is_some_and(|id| self.dropped.contains(id)) {
+        if self.dropped_at.contains(&(map as *const _)) || id.is_some_and(|id| self.dropped.contains(id)) {
             return None;
         }
         let saved = std::mem::take(&mut self.code_override);
         if rt == "Observation" {
-            self.code_override = code_decision(self.cfg, map).map(|(a, by)| (a.clone(), by));
+            self.code_override = code_decision(self.cfg, rt, map).map(|(a, by)| (a.clone(), by));
         }
 
-        let mut lpath = vec![rt.to_ascii_lowercase()];
-        let mut dpath = vec![rt.to_string()];
+        let mut pos = Pos::root(rt);
         let mut out = Map::new();
         out.insert("resourceType".into(), Value::String(rt.to_string()));
         for (k, v) in map {
@@ -771,11 +1076,9 @@ impl Walker<'_> {
                     out.insert("id".into(), Value::String(pseudo_id(&self.id_key, v.as_str().unwrap_or_default())));
                 }
                 _ => {
-                    lpath.push(k.to_ascii_lowercase());
-                    dpath.push(k.clone());
-                    let kept = self.walk(v, &mut lpath, &mut dpath);
-                    lpath.pop();
-                    dpath.pop();
+                    pos.push_key(k);
+                    let kept = self.walk(v, &mut pos);
+                    pos.pop();
                     if let Some(kept) = kept {
                         out.insert(k.clone(), kept);
                     }
@@ -783,7 +1086,7 @@ impl Walker<'_> {
             }
         }
         self.code_override = saved;
-        let tidied = self.tidy(map, out, &lpath)?;
+        let tidied = self.tidy(map, out, &pos.lpath)?;
         Some(tidied)
     }
 
@@ -803,9 +1106,9 @@ impl Walker<'_> {
         (!out.is_empty()).then_some(Value::Object(out))
     }
 
-    fn leaf(&mut self, leaf: &Value, lpath: &[String], dpath: &[String]) -> Option<Value> {
-        let shown = display_path(dpath);
-        let (action, matched_by) = self.decide(lpath);
+    fn leaf(&mut self, leaf: &Value, pos: &Pos) -> Option<Value> {
+        let shown = display_path(&pos.dpath);
+        let (action, matched_by) = self.decide(pos, leaf);
 
         let result = match &action {
             Action::Hash => {
@@ -842,16 +1145,24 @@ impl Walker<'_> {
         result
     }
 
-    fn decide(&self, lpath: &[String]) -> (Action, String) {
+    fn decide(&self, pos: &Pos, leaf: &Value) -> (Action, String) {
         if let Some((action, by)) = &self.code_override {
             // Code-keyed techniques act on the Observation's value; its code,
             // status and the rest stay under the path rules.
-            let on_value = lpath.get(1).is_some_and(|s| s.starts_with("value"));
-            if on_value && matches!(action, Action::Hash) {
-                return (action.clone(), by.clone());
+            let on_value = pos.lpath.get(1).is_some_and(|s| s.starts_with("value"));
+            if on_value {
+                match action {
+                    Action::Hash => return (action.clone(), by.clone()),
+                    // Masking yields text, which would turn a number or a
+                    // boolean into a string FHIR rejects; those are removed.
+                    Action::Masking { .. } if leaf.is_string() => return (action.clone(), by.clone()),
+                    Action::Masking { .. } => return (Action::Suppress, by.clone()),
+                    _ => {}
+                }
             }
         }
-        let (a, by) = decide_in(&self.cfg.rules, &self.cfg.default_action, lpath);
+        let resolve = |r: &str| self.resolve(r);
+        let (a, by) = decide_at(&self.cfg.rules, &self.cfg.default_action, &pos.lpath, &pos.items, Some(&resolve));
         (a.clone(), by.to_string())
     }
 }
@@ -859,18 +1170,36 @@ impl Walker<'_> {
 /// Anonymizes one Bundle. Exposed for tests and for callers holding a parsed
 /// bundle already.
 pub fn anonymize_bundle(bundle: &Value, cfg: &FhirBundleConfig, salts: &mut Salts, census: &mut Census) -> Value {
+    let refs = reference_index(bundle);
+    let resolve = |r: &str| resolve_in(&refs, r);
+
     let mut dropped = HashSet::new();
+    let mut dropped_at: HashSet<*const Map<String, Value>> = HashSet::new();
     for_each_resource(bundle, &mut |res| {
-        if res.get("resourceType").and_then(Value::as_str) != Some("Observation") {
+        let Some(rt) = res.get("resourceType").and_then(Value::as_str) else { return };
+        if rt == "Bundle" {
             return;
         }
-        if let Some((Action::Suppress, by)) = code_decision(cfg, res) {
-            let (texts, _) = observation_codes(res);
-            let code = texts.first().cloned().unwrap_or_default();
-            census.record_as(&format!("Observation[code={code}]"), &Value::Null, "drop_resource", &by, false);
+        let mut drop = |path: String, by: String| {
+            census.record_as(&path, &Value::Null, "drop_resource", &by, false);
+            dropped_at.insert(res as *const _);
             if let Some(id) = res.get("id").and_then(Value::as_str) {
                 dropped.insert(id.to_string());
             }
+        };
+        if let Some(sel) = cfg.drop_resources.iter().find(|s| s.matches(rt, res, Some(&resolve))) {
+            drop(rt.to_string(), format!("drop_resources:{}", sel.text));
+            return;
+        }
+        if let Some((Action::Suppress, by)) = code_decision(cfg, rt, res) {
+            let (texts, codings) = resource_codes(res);
+            let code = match texts.first() {
+                Some(t) => t.clone(),
+                // An Observation's census row has always shown its text only.
+                None if rt != "Observation" => codings.first().cloned().unwrap_or_default(),
+                None => String::new(),
+            };
+            drop(format!("{rt}[code={code}]"), by);
         }
     });
 
@@ -878,26 +1207,26 @@ pub fn anonymize_bundle(bundle: &Value, cfg: &FhirBundleConfig, salts: &mut Salt
     if cfg.propagation_enabled && !cfg.propagate_from.is_empty() {
         for_each_resource(bundle, &mut |res| {
             let v = Value::Object(res.clone());
-            for_each_leaf(&v, &mut Vec::new(), &mut Vec::new(), &mut |lpath, dpath, leaf| {
+            for_each_leaf(&v, &mut Vec::new(), &mut Vec::new(), &mut Vec::new(), &mut |at, leaf| {
                 let text = match leaf {
                     Value::String(s) => s.clone(),
                     Value::Number(n) => n.to_string(),
                     _ => return,
                 };
-                if cfg
-                    .propagate_from
-                    .iter()
-                    .any(|r| decide_in(std::slice::from_ref(r), &Action::Keep, lpath).1 != "<default>")
-                {
-                    needles.add(&text, &display_path(dpath), cfg.propagation_min_length);
+                if cfg.propagate_from.iter().any(|r| {
+                    decide_at(std::slice::from_ref(r), &Action::Keep, at.lpath, at.items, Some(&resolve)).1
+                        != "<default>"
+                }) {
+                    needles.add(&text, &display_path(at.dpath), cfg.propagation_min_length);
                 }
             });
         });
     }
 
     let id_key = salts.for_column(ID_COLUMN);
-    let mut w = Walker { cfg, salts, id_key, census, dropped, needles, code_override: None };
-    w.walk(bundle, &mut Vec::new(), &mut Vec::new()).unwrap_or(Value::Null)
+    let mut w = Walker { cfg, salts, id_key, census, dropped, dropped_at, needles, refs, code_override: None };
+    let mut pos = Pos { lpath: Vec::new(), dpath: Vec::new(), items: Vec::new() };
+    w.walk(bundle, &mut pos).unwrap_or(Value::Null)
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────────
@@ -922,15 +1251,8 @@ pub struct RunReport {
     pub dry_run: bool,
 }
 
-/// The output file name for one bundle: `<input stem>_anonymised.fhir.json`,
-/// so each output sits next to the name of the input it came from.
-///
-/// NHA input names are case ids (`TESTCASE_ST_2025_R0_1000000017.fhir.json`), so
-/// this carries the case id in clear onto the released file. That is the
-/// requested trade-off — traceability for verification — and it means the
-/// released folder must be handled as identifying even though its contents
-/// are not.
-fn output_name(file: &Path) -> String {
+/// An input's name without `.fhir.json` / `.json`.
+fn input_stem(file: &Path) -> &str {
     let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("bundle");
     let lower = name.to_ascii_lowercase();
     let stem_len = [".fhir.json", ".json"]
@@ -938,7 +1260,26 @@ fn output_name(file: &Path) -> String {
         .find(|ext| lower.ends_with(*ext))
         .map(|ext| name.len() - ext.len())
         .unwrap_or(name.len());
-    format!("{}_anonymised.fhir.json", &name[..stem_len])
+    &name[..stem_len]
+}
+
+/// The output file name for one bundle: `<input stem>_anonymised.fhir.json`,
+/// so each output sits next to the name of the input it came from.
+///
+/// NHA input names are case ids (`TESTCASE_ST_2025_R0_1000000017.fhir.json`), so
+/// this carries the case id in clear onto the released file — traceability
+/// for verification, at the cost of a released folder that identifies its
+/// cases. `"output_names": "pseudonym"` ([`pseudonymous_output_name`]) avoids it.
+fn output_name(file: &Path) -> String {
+    format!("{}_anonymised.fhir.json", input_stem(file))
+}
+
+/// `<hmac>_anonymised.fhir.json`, the HMAC of the input stem under `key`
+/// (see [`OutputNames::Pseudonym`]). The stem is hashed exactly as written, so
+/// `X` and `X (1)` stay apart and one does not overwrite the other.
+fn pseudonymous_output_name(key: &[u8; 32], file: &Path) -> String {
+    let mac = keyed_hash(key, input_stem(file).as_bytes());
+    format!("{}_anonymised.fhir.json", &mac[..32])
 }
 
 pub fn run(cfg: &FhirBundleConfig, root: &Path) -> Result<RunReport, PipelineError> {
@@ -1006,7 +1347,11 @@ pub fn run(cfg: &FhirBundleConfig, root: &Path) -> Result<RunReport, PipelineErr
         if cfg.dry_run {
             continue;
         }
-        let out_path = output_dir.join(output_name(file));
+        let out_name = match cfg.output_names {
+            OutputNames::Input => output_name(file),
+            OutputNames::Pseudonym => pseudonymous_output_name(&salts.for_column(OUTPUT_NAME_COLUMN), file),
+        };
+        let out_path = output_dir.join(out_name);
         let text = serde_json::to_string_pretty(&anon)?;
         fs::write(&out_path, text)
             .map_err(|e| io_err("write anonymized bundle", &out_path.display().to_string(), e))?;
@@ -1128,7 +1473,11 @@ mod tests {
         FhirBundleConfig {
             enabled: true,
             rules,
-            code_rules: vec![Rule::new("gps_*", Action::Suppress), Rule::new("nurse_remarks", Action::FreeText)],
+            code_scopes: vec![CodeScope {
+                resources: vec!["Observation".into()],
+                rules: vec![Rule::new("gps_*", Action::Suppress), Rule::new("nurse_remarks", Action::FreeText)],
+                codings: Vec::new(),
+            }],
             propagate_from: ["Patient.name.**", "Claim.identifier[].value", "Organization.name", "Organization.alias"]
                 .iter()
                 .map(|p| Rule::new(p, Action::Suppress))
@@ -1303,7 +1652,7 @@ mod tests {
             "code": {"text": "patient uhid"}, "valueString": "90000001"})));
         let mut c = cfg();
         c.rules.push(Rule::new("Observation.valueString", Action::Keep));
-        c.code_rules.push(Rule::new("*uhid*", Action::Hash));
+        c.code_scopes[0].rules.push(Rule::new("*uhid*", Action::Hash));
         let mut salts = Salts::default();
         let (out, _) = anon_in(&c, &b, &mut salts);
         let obs = out["entry"]
@@ -1375,12 +1724,14 @@ mod tests {
             "hash_strip_prefixes": ["urn:example:"]
         }))
         .unwrap();
-        assert_eq!(c.code_rules.len(), 2);
+        let scope = &c.code_scopes[0];
+        assert_eq!(scope.resources, vec!["Observation".to_string()], "an object block is Observation-scoped");
+        assert_eq!(scope.rules.len(), 2);
         assert!(
-            c.code_rules.iter().any(|r| r.pattern == "gps_latitude" && r.action == Action::Suppress),
+            scope.rules.iter().any(|r| r.pattern == "gps_latitude" && r.action == Action::Suppress),
             "code patterns are normalised to the technique-list spelling"
         );
-        assert_eq!(c.coding_rules, vec![("http://loinc.org|42130-5".to_string(), Action::Suppress)]);
+        assert_eq!(scope.codings, vec![("http://loinc.org|42130-5".to_string(), Action::Suppress)]);
         assert_eq!(c.propagation_min_length, 5);
         let seg: Vec<String> = ["patient", "gender"].iter().map(|s| s.to_string()).collect();
         assert_eq!(decide_in(&c.rules, &c.default_action, &seg).0, &Action::Keep);
@@ -1458,7 +1809,7 @@ mod tests {
             ("haemoglobin", None),
             ("blood bank", None),
         ] {
-            let got = code_decision(&c, obs(text).as_object().unwrap()).map(|(a, _)| a.clone());
+            let got = code_decision(&c, "Observation", obs(text).as_object().unwrap()).map(|(a, _)| a.clone());
             assert_eq!(got, want, "{text}");
         }
     }
@@ -1555,6 +1906,400 @@ mod tests {
         let second = run(&c, &root).unwrap();
         assert_eq!(second.salts_created, 0, "a rerun reuses the persisted salts");
         assert_eq!(listing(), names, "so it produces the same pseudonyms");
+    }
+
+    // ── 4.1: predicates, resource drops, scoped code rules, references ─────
+
+    const CADAVERIC: &str = "http://hl7.org/fhir/StructureDefinition/patient-cadavericDonor";
+    const V2_0074: &str = "http://terminology.hl7.org/CodeSystem/v2-0074";
+
+    fn policy(extra: Value) -> FhirBundleConfig {
+        let mut section = json!({"fhir_bundle": true, "input_path": "x", "keep": ["Bundle.type", "**.status"]});
+        for (k, v) in extra.as_object().unwrap() {
+            section[k] = v.clone();
+        }
+        parse_fhir_bundle(&section).unwrap()
+    }
+
+    fn bundle_of(resources: Vec<Value>) -> Value {
+        json!({"resourceType": "Bundle", "type": "collection", "entry": resources.into_iter().map(entry).collect::<Vec<_>>()})
+    }
+
+    fn resources_of<'a>(out: &'a Value, rt: &str) -> Vec<&'a Value> {
+        out["entry"].as_array().unwrap().iter().map(|e| &e["resource"]).filter(|r| r["resourceType"] == rt).collect()
+    }
+
+    fn patient_with_identifiers() -> Value {
+        json!({"resourceType": "Patient", "id": "p1", "identifier": [
+            {"system": "urn:example:aadhaar", "value": "900000000001"},
+            {"system": "urn:example:naco-art", "value": "ART-0001-TEST"},
+            {"system": "urn:example:uhid", "type": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/v2-0203", "code": "MR"}]}, "value": "UHID9000001"}
+        ]})
+    }
+
+    #[test]
+    fn an_art_predicate_suppresses_only_naco_identifiers() {
+        let c = policy(json!({
+            "keep": ["Bundle.type", "Patient.identifier[].system", "Patient.identifier[].type.**"],
+            "hashing_with_salt": ["Patient.identifier[].value"],
+            "suppress": ["Patient.identifier[system~\"*NACO*\"].**"]
+        }));
+        let mut salts = Salts::default();
+        let (out, census) = anon_in(&c, &bundle_of(vec![patient_with_identifiers()]), &mut salts);
+        let ids = resource(&out, "Patient")["identifier"].as_array().unwrap().clone();
+        assert_eq!(ids.len(), 2, "the ART identifier is removed whole: {ids:?}");
+        let key = salts.for_column("Patient.identifier[].value");
+        assert_eq!(ids[0]["system"], json!("urn:example:aadhaar"));
+        assert_eq!(ids[0]["value"], json!(keyed_hash(&key, b"900000000001")), "Aadhaar stays hashed");
+        assert_eq!(ids[1]["value"], json!(keyed_hash(&key, b"uhid9000001")), "and so does the UHID");
+        assert!(!serde_json::to_string(&out).unwrap().contains("ART-0001"));
+        // One census path holds all three; the last writer names the rule.
+        assert!(census.contains_key("Patient.identifier[].value"));
+    }
+
+    #[test]
+    fn predicates_reach_nested_codings_and_masking_columns() {
+        let c = policy(json!({
+            "keep": ["Bundle.type", "Patient.identifier[].system", "Patient.identifier[].type.**"],
+            "hashing_with_salt": ["Patient.identifier[].value"],
+            "masking": [{"column": "Patient.identifier[type.coding.code=\"MR\"].value",
+                         "characters_to_mask": [1, 2, 3, 4], "apply_order": ["characters"]}]
+        }));
+        let (out, census) = anon_with(&c, &bundle_of(vec![patient_with_identifiers()]));
+        let ids = resource(&out, "Patient")["identifier"].as_array().unwrap();
+        assert_eq!(ids[2]["value"], json!("****9000001"), "masking.column takes a predicate");
+        assert_eq!(ids[0]["value"].as_str().unwrap().len(), 64, "others keep the plain rule");
+        assert_eq!(census["Patient.identifier[].value"].seen, 3);
+    }
+
+    #[test]
+    fn an_organ_donor_extension_is_kept_while_religion_is_suppressed() {
+        let c = policy(json!({"keep": ["Bundle.type", format!("Patient.extension[url=\"{CADAVERIC}\"].**")]}));
+        let p = json!({"resourceType": "Patient", "id": "p1", "extension": [
+            {"url": CADAVERIC, "valueBoolean": true},
+            {"url": "http://hl7.org/fhir/StructureDefinition/patient-religion", "valueCodeableConcept": {"text": "TESTFAITH"}}
+        ]});
+        let (out, _) = anon_with(&c, &bundle_of(vec![p]));
+        let ext = resource(&out, "Patient")["extension"].as_array().unwrap();
+        assert_eq!(ext, &vec![json!({"url": CADAVERIC, "valueBoolean": true})]);
+    }
+
+    #[test]
+    fn a_predicate_beats_a_plain_rule_with_fewer_double_stars() {
+        // Equal-length plain rules would pick the hash; the predicate rule,
+        // though it has a `**`, is narrower by content.
+        let c = policy(json!({
+            "keep": ["Bundle.type", "Patient.identifier[system~\"*naco*\"].**"],
+            "hashing_with_salt": ["Patient.identifier[].value"]
+        }));
+        let (out, _) = anon_with(&c, &bundle_of(vec![patient_with_identifiers()]));
+        assert_eq!(resource(&out, "Patient")["identifier"][1]["value"], json!("ART-0001-TEST"));
+        assert_eq!(resource(&out, "Patient")["identifier"][0]["value"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn predicates_work_in_propagation_from() {
+        let c = policy(json!({
+            "keep": ["Bundle.type", "DocumentReference.description"],
+            "propagation": {"from": ["Patient.identifier[system~\"*naco*\"].value"]}
+        }));
+        let doc =
+            json!({"resourceType": "DocumentReference", "id": "d1", "description": "ART card ART-0001-TEST scanned"});
+        let other = json!({"resourceType": "DocumentReference", "id": "d2", "description": "UHID9000001 card"});
+        let (out, census) = anon_with(&c, &bundle_of(vec![patient_with_identifiers(), doc, other]));
+        let descs: Vec<&Value> = resources_of(&out, "DocumentReference").iter().map(|d| &d["description"]).collect();
+        assert_eq!(descs, vec![&Value::Null, &json!("UHID9000001 card")], "only the NACO value is a needle");
+        assert_eq!(census["DocumentReference.description"].seen, 2);
+    }
+
+    fn genetics_bundle() -> Value {
+        bundle_of(vec![
+            json!({"resourceType": "Patient", "id": "p1"}),
+            json!({"resourceType": "DiagnosticReport", "id": "dr-ge", "status": "final",
+                   "category": [{"coding": [{"system": V2_0074, "code": "GE"}]}], "code": {"text": "exome"},
+                   "subject": {"reference": "urn:uuid:p1"}}),
+            json!({"resourceType": "DiagnosticReport", "id": "dr-lab", "status": "final",
+                   "category": [{"coding": [{"system": V2_0074, "code": "LAB"}]}], "code": {"text": "cbc"}}),
+            json!({"resourceType": "Procedure", "id": "pr1", "status": "completed",
+                   "report": [{"reference": "urn:uuid:dr-ge"}, {"reference": "urn:uuid:dr-lab"}]}),
+            json!({"resourceType": "MolecularSequence", "id": "ms1", "patient": {"reference": "urn:uuid:p1"}}),
+            json!({"resourceType": "Observation", "id": "o-var", "status": "final", "code": {"text": "variant"},
+                   "derivedFrom": [{"reference": "urn:uuid:ms1"}]}),
+            json!({"resourceType": "Observation", "id": "o-hb", "status": "final", "code": {"text": "hemoglobin"},
+                   "derivedFrom": [{"reference": "urn:uuid:dr-lab"}]}),
+            json!({"resourceType": "Specimen", "id": "sp-dna", "type": {"coding": [{"code": "DNA"}]}}),
+            json!({"resourceType": "Specimen", "id": "sp-bld", "type": {"coding": [{"code": "BLD"}]}}),
+            json!({"resourceType": "Media", "id": "m1", "status": "completed"}),
+        ])
+    }
+
+    fn genetics_policy() -> FhirBundleConfig {
+        policy(json!({
+            "keep": ["Bundle.type", "**.status", "**.code.text"],
+            "drop_resources": [
+                "MolecularSequence",
+                "Media",
+                format!("DiagnosticReport[category.coding=\"{V2_0074}|GE\"]"),
+                "Specimen[type.coding.code=\"DNA\"|\"RNA\"]",
+                "Observation[derivedFrom.reference~\"MolecularSequence/*\"]"
+            ]
+        }))
+    }
+
+    #[test]
+    fn a_ge_diagnostic_report_is_dropped_with_its_references() {
+        let mut salts = Salts::default();
+        let (out, census) = anon_in(&genetics_policy(), &genetics_bundle(), &mut salts);
+        let reports = resources_of(&out, "DiagnosticReport");
+        assert_eq!(reports.len(), 1, "only the lab report is left");
+        let lab_id = pseudo_id(&salts.for_column(ID_COLUMN), "dr-lab");
+        assert_eq!(reports[0]["id"], json!(lab_id));
+        assert_eq!(
+            resource(&out, "Procedure")["report"],
+            json!([{"reference": format!("urn:uuid:{lab_id}")}]),
+            "the procedure no longer points at the genetics report"
+        );
+        let row = &census["DiagnosticReport"];
+        assert_eq!(row.action, "drop_resource");
+        assert_eq!(row.matched_by, format!("drop_resources:DiagnosticReport[category.coding=\"{V2_0074}|GE\"]"));
+    }
+
+    #[test]
+    fn resources_are_dropped_by_type_and_by_predicate() {
+        let (out, census) = anon_with(&genetics_policy(), &genetics_bundle());
+        assert!(resources_of(&out, "MolecularSequence").is_empty(), "no empty shell with a pseudonymous id");
+        assert!(resources_of(&out, "Media").is_empty());
+        assert_eq!(resources_of(&out, "Specimen").len(), 1, "the DNA specimen goes, blood stays");
+        let obs = resources_of(&out, "Observation");
+        assert_eq!(obs.len(), 1, "the variant derived from a MolecularSequence goes via its urn:uuid reference");
+        assert_eq!(obs[0]["code"]["text"], json!("hemoglobin"));
+        assert_eq!(census["Specimen"].seen, 1);
+        assert!(!serde_json::to_string(&out).unwrap().contains("ms1"));
+        let mut c = Census::default();
+        anonymize_bundle(&genetics_bundle(), &genetics_policy(), &mut Salts::default(), &mut c);
+        let dropped: usize = c.rows().iter().filter(|(_, r)| r.action == "drop_resource").map(|(_, r)| r.seen).sum();
+        assert_eq!(dropped, 5);
+    }
+
+    #[test]
+    fn a_sensitivity_label_drops_any_resource_type() {
+        let c = policy(json!({"keep": ["Bundle.type", "**.code.text"],
+            "drop_resources": ["*[meta.security=\"http://terminology.hl7.org/CodeSystem/v3-ActCode|GDIS\"]"]}));
+        let b = bundle_of(vec![
+            json!({"resourceType": "Condition", "id": "c1", "code": {"text": "x"},
+                   "meta": {"security": [{"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "GDIS"}]}}),
+            json!({"resourceType": "Condition", "id": "c2", "code": {"text": "y"}}),
+        ]);
+        let (out, _) = anon_with(&c, &b);
+        let left = resources_of(&out, "Condition");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0]["code"]["text"], json!("y"));
+    }
+
+    #[test]
+    fn scoped_code_rules_drop_conditions_and_service_requests() {
+        let c = policy(json!({
+            "keep": ["Bundle.type", "**.code.text", "**.coding[].*"],
+            "code_rules": [
+                {"suppress": ["gps_*"]},
+                {"resources": ["Condition", "ServiceRequest", "DiagnosticReport"],
+                 "suppress": ["*hiv*", "http://hl7.org/fhir/sid/icd-10|B20"]}
+            ]
+        }));
+        let b = bundle_of(vec![
+            json!({"resourceType": "Condition", "id": "c1", "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10", "code": "B20"}]}}),
+            json!({"resourceType": "Condition", "id": "c2", "code": {"text": "Fracture of radius"}}),
+            json!({"resourceType": "ServiceRequest", "id": "s1", "code": {"text": "HIV-1 viral load"}}),
+            json!({"resourceType": "DiagnosticReport", "id": "d1", "code": {"text": "HIV screening"}}),
+            json!({"resourceType": "Observation", "id": "o1", "code": {"text": "hiv antibody"}}),
+            json!({"resourceType": "Observation", "id": "o2", "code": {"text": "gps latitude"}}),
+            json!({"resourceType": "Procedure", "id": "x1", "code": {"text": "hiv counselling"}}),
+        ]);
+        let (out, census) = anon_with(&c, &b);
+        assert_eq!(resources_of(&out, "Condition").len(), 1);
+        assert!(resources_of(&out, "ServiceRequest").is_empty());
+        assert!(resources_of(&out, "DiagnosticReport").is_empty());
+        let obs = resources_of(&out, "Observation");
+        assert_eq!(obs.len(), 1, "Observations follow the Observation block only");
+        assert_eq!(obs[0]["code"]["text"], json!("hiv antibody"));
+        assert_eq!(resources_of(&out, "Procedure").len(), 1, "Procedure is in no scope");
+        assert_eq!(
+            census["Condition[code=http://hl7.org/fhir/sid/icd-10|b20]"].matched_by,
+            "coding:http://hl7.org/fhir/sid/icd-10|b20"
+        );
+        assert_eq!(census["ServiceRequest[code=hiv_1_viral_load]"].matched_by, "code:*hiv*");
+    }
+
+    fn dob_observations() -> Value {
+        bundle_of(vec![
+            json!({"resourceType": "Observation", "id": "o1", "status": "final", "code": {"text": "patient_dob"}, "valueString": "1970-06-15"}),
+            json!({"resourceType": "Observation", "id": "o2", "status": "final", "code": {"text": "admission date"}, "valueDateTime": "2025-04-21T10:30:00+05:30"}),
+            json!({"resourceType": "Observation", "id": "o3", "status": "final", "code": {"text": "patient_dob"}, "valueQuantity": {"value": 1970, "unit": "a"}}),
+            json!({"resourceType": "Observation", "id": "o4", "status": "final", "code": {"text": "hemoglobin"}, "valueString": "1970-06-15"}),
+        ])
+    }
+
+    #[test]
+    fn a_dob_observation_is_masked_to_the_year_by_a_code_rule() {
+        let c = policy(json!({
+            "keep": ["Bundle.type", "**.status", "**.code.text", "Observation.value*", "Observation.valueQuantity.*"],
+            "code_rules": {"masking": [
+                {"code": "*_dob", "masking_char": "*", "characters_to_mask": [6, 7, 9, 10], "apply_order": ["characters"]},
+                {"code": "admission_date", "characters_to_mask": [9, 10, 12, 13, 15, 16, 18, 19], "apply_order": ["characters"]}
+            ]}
+        }));
+        let (out, census) = anon_with(&c, &dob_observations());
+        let obs = resources_of(&out, "Observation");
+        assert_eq!(obs[0]["valueString"], json!("1970-**-**"));
+        assert_eq!(obs[1]["valueDateTime"], json!("2025-04-**T**:**:**+05:30"), "admission date to the month");
+        assert!(obs[2]["valueQuantity"].get("value").is_none(), "a number under a masking code is removed");
+        assert_eq!(obs[2]["valueQuantity"]["unit"], json!("a"));
+        assert_eq!(obs[3]["valueString"], json!("1970-06-15"), "other codes follow the path rules");
+        assert_eq!(census["Observation.valueString"].seen, 2);
+        assert_eq!(obs[0]["code"]["text"], json!("patient_dob"), "the code itself is untouched");
+    }
+
+    #[test]
+    fn explicit_rules_suppress_references() {
+        let c = policy(json!({
+            "keep": ["Bundle.type", "**.status"],
+            "suppress": ["Patient.link.**", "Claim.facility", "Encounter.location[].location.reference"]
+        }));
+        let b = bundle_of(vec![
+            json!({"resourceType": "Patient", "id": "p1", "link": [{"other": {"reference": "urn:uuid:p2"}, "type": "seealso"}]}),
+            json!({"resourceType": "Patient", "id": "p2"}),
+            json!({"resourceType": "Location", "id": "l1"}),
+            json!({"resourceType": "Claim", "id": "c1", "status": "active", "patient": {"reference": "urn:uuid:p1"},
+                   "facility": {"reference": "urn:uuid:l1", "display": "TESTWARD"}}),
+            json!({"resourceType": "Encounter", "id": "e1", "status": "finished", "subject": {"reference": "urn:uuid:p1"},
+                   "location": [{"location": {"reference": "urn:uuid:l1"}}]}),
+        ]);
+        let mut salts = Salts::default();
+        let (out, census) = anon_in(&c, &b, &mut salts);
+        let p1 = pseudo_id(&salts.for_column(ID_COLUMN), "p1");
+        assert!(resources_of(&out, "Patient")[0].get("link").is_none());
+        let claim = resource(&out, "Claim");
+        assert!(claim.get("facility").is_none(), "a rule on the parent removes the reference");
+        assert_eq!(claim["patient"]["reference"], json!(format!("urn:uuid:{p1}")), "no rule: pseudonymised");
+        let enc = resource(&out, "Encounter");
+        assert!(enc.get("location").is_none());
+        assert_eq!(enc["subject"]["reference"], json!(format!("urn:uuid:{p1}")));
+        for e in out["entry"].as_array().unwrap() {
+            assert!(e["fullUrl"].as_str().unwrap().starts_with("urn:uuid:"), "fullUrl stays pseudonymised");
+        }
+        assert_eq!(census["Claim.facility.reference"].matched_by, "Claim.facility");
+        assert_eq!(census["Claim.facility.reference"].action, "suppress");
+    }
+
+    #[test]
+    fn a_reference_under_a_non_suppress_rule_stays_pseudonymised() {
+        let c = policy(json!({"keep": ["Bundle.type", "Claim.facility.**"]}));
+        let b = bundle_of(vec![json!({"resourceType": "Claim", "id": "c1", "facility": {"reference": "Location/l1"}})]);
+        let mut salts = Salts::default();
+        let (out, census) = anon_in(&c, &b, &mut salts);
+        let want = format!("Location/{}", pseudo_id(&salts.for_column(ID_COLUMN), "l1"));
+        assert_eq!(resource(&out, "Claim")["facility"]["reference"], json!(want));
+        assert_eq!(census["Claim.facility.reference"].action, "pseudonymise_reference");
+    }
+
+    #[test]
+    fn output_names_can_be_pseudonymous() {
+        let root = tmpdir("pseudo_names");
+        let input = root.join("in");
+        fs::create_dir_all(&input).unwrap();
+        for n in ["TESTCASE_ST_2025_R0_1000000017.fhir.json", "TESTCASE_ST_2025_R0_1000000017 (1).fhir.json"] {
+            fs::write(input.join(n), serde_json::to_string(&bundle()).unwrap()).unwrap();
+        }
+        let c = FhirBundleConfig {
+            input_path: Some(PathBuf::from("in")),
+            output_subdir: "out".into(),
+            key_material_dir: PathBuf::from("keys"),
+            output_root: PathBuf::from("output"),
+            output_names: OutputNames::Pseudonym,
+            ..cfg()
+        };
+        let listing = || -> Vec<String> {
+            let mut v: Vec<String> = fs::read_dir(root.join("output/out"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.ends_with(".fhir.json"))
+                .collect();
+            v.sort();
+            v
+        };
+        run(&c, &root).unwrap();
+        let names = listing();
+        assert_eq!(names.len(), 2, "duplicates keep apart: {names:?}");
+        for n in &names {
+            assert!(!n.contains("TESTCASE") && !n.contains("1000000017"), "{n}");
+            assert_eq!(n.len(), 32 + "_anonymised.fhir.json".len());
+        }
+        let salts = Salts::load(&root.join("keys").join(SALT_FILE)).unwrap();
+        let key = salts.by_column[OUTPUT_NAME_COLUMN];
+        let want = format!("{}_anonymised.fhir.json", &keyed_hash(&key, b"TESTCASE_ST_2025_R0_1000000017")[..32]);
+        assert!(names.contains(&want), "recomputable from the salt: {want}");
+        run(&c, &root).unwrap();
+        assert_eq!(listing(), names, "stable across runs");
+    }
+
+    #[test]
+    fn new_keys_parse_and_default_as_before() {
+        let c = policy(json!({}));
+        assert_eq!(c.output_names, OutputNames::Input);
+        assert!(c.drop_resources.is_empty() && c.code_scopes.is_empty());
+        let c =
+            policy(json!({"output_names": "pseudonym", "code_rules": {"resources": ["Observation"], "keep": ["x"]}}));
+        assert_eq!(c.output_names, OutputNames::Pseudonym);
+        assert_eq!(c.code_rule_count(), 1);
+    }
+
+    #[test]
+    fn malformed_new_syntax_is_a_config_error() {
+        let base = |extra: Value| {
+            let mut section = json!({"fhir_bundle": true, "input_path": "x", "keep": ["Bundle.type"]});
+            for (k, v) in extra.as_object().unwrap() {
+                section[k] = v.clone();
+            }
+            parse_fhir_bundle(&section).map(|_| ()).unwrap_err()
+        };
+        for (extra, want) in [
+            (json!({"suppress": ["Patient.identifier[system~naco].value"]}), "double-quoted"),
+            (json!({"suppress": ["Patient.identifier[system:\"x\"].value"]}), "not a field path"),
+            (json!({"suppress": ["Patient.identifier[system=\"x].value"]}), "closing ']'"),
+            (json!({"suppress": ["Patient.identifier[=\"x\"].value"]}), "field name"),
+            (json!({"suppress": ["Patient.identifier[sys tem=\"x\"].value"]}), "not a field path"),
+            (json!({"suppress": ["Patient.identifier[system=\"x\"]value"]}), "after ']'"),
+            (json!({"suppress": ["Patient.identifier[system=\"x\" use=\"y\"]"]}), "unexpected"),
+            (json!({"suppress": ["Patient.identifier[system=\"\\x\"]"]}), "escapes"),
+            (json!({"suppress": ["Patient..identifier[system=\"x\"]"]}), "empty path segment"),
+            (
+                json!({"masking": [{"column": "a[b=\"c\"", "characters_to_mask": [1], "apply_order": ["characters"]}]}),
+                "closing",
+            ),
+            (json!({"propagation": {"from": ["a[b]"]}}), "'=' or '~'"),
+            (json!({"drop_resources": ["Bundle"]}), "Bundle itself"),
+            (json!({"drop_resources": ["Specimen[type.coding.code=\"DNA\"]x"]}), "nothing after"),
+            (json!({"drop_resources": ["Spec-imen"]}), "resource type"),
+            (json!({"drop_resources": ["Specimen[]"]}), "empty predicate"),
+            (json!({"drop_resources": "Media"}), "array of strings"),
+            (json!({"output_names": "hashed"}), "\\\"pseudonym\\\""),
+            (
+                json!({"code_rules": {"masking": [{"column": "x", "characters_to_mask": [1], "apply_order": ["characters"]}]}}),
+                "'code', not a 'column'",
+            ),
+            (json!({"code_rules": {"masking": [{"code": "x"}]}}), "no masking step"),
+            (json!({"code_rules": {"resources": ["Condition"], "hashing_with_salt": ["x"]}}), "value[x]"),
+            (
+                json!({"code_rules": {"resources": ["Condition", "Observation"], "masking": [{"code": "x", "characters_to_mask": [1], "apply_order": ["characters"]}]}}),
+                "value[x]",
+            ),
+            (json!({"code_rules": {"resources": ["condition"], "suppress": ["x"]}}), "resource type names"),
+            (json!({"code_rules": {"resources": [], "suppress": ["x"]}}), "empty"),
+            (json!({"code_rules": [{"suppress": ["x"]}, "nope"]}), "list of them"),
+        ] {
+            let err = format!("{:?}", base(extra.clone()));
+            assert!(err.contains(want), "{extra}: expected {want} in {err}");
+        }
     }
 
     #[test]

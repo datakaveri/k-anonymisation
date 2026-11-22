@@ -1075,10 +1075,11 @@ fn run_fhir_bundle(
     log.info(
         "fhir-bundle",
         &format!(
-            "FHIR Bundle de-identification: {} path rule(s), {} code rule(s), default_action={:?} — \
-             one bundle per patient, so the k-anonymity flow is not run",
+            "FHIR Bundle de-identification: {} path rule(s), {} code rule(s), {} drop_resources selector(s), \
+             default_action={:?} — one bundle per patient, so the k-anonymity flow is not run",
             cfg.fhir_bundle.rules.len(),
-            cfg.fhir_bundle.code_rules.len() + cfg.fhir_bundle.coding_rules.len(),
+            cfg.fhir_bundle.code_rule_count(),
+            cfg.fhir_bundle.drop_resources.len(),
             cfg.fhir_bundle.default_action,
         ),
     );
@@ -1107,7 +1108,7 @@ fn run_fhir_bundle(
         "fhir-bundle",
         &format!(
             "{}{} bundle(s) examined, {} written to {}; {} path(s) seen, {} released as-is; \
-             {} resource(s) dropped by code rules, {} leaf value(s) suppressed by the propagation sweep — review {}",
+             {} resource(s) dropped by drop_resources or code rules, {} leaf value(s) suppressed by the propagation sweep — review {}",
             if report.dry_run { "DRY RUN — " } else { "" },
             report.documents_examined,
             report.files_written,

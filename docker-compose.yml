@@ -16,7 +16,7 @@
 
 services:
   skald:
-    image: ghcr.io/datakaveri/skald:v4.0.0
+    image: ghcr.io/datakaveri/skald:v4.1.0
     build:
       context: .
       dockerfile: Dockerfile

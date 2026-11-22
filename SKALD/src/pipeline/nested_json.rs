@@ -155,6 +155,13 @@ pub struct Rule {
 /// the whole rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Specificity {
+    /// Predicate segments (`identifier[system~"*naco*"]`). Compared first: a
+    /// rule that picks an element out by its content outranks every rule that
+    /// does not, whatever their `**` counts, so `Patient.identifier[system~"*naco*"].**`
+    /// beats `Patient.identifier[].value` on the NACO identifier's value and
+    /// leaves every other identifier to the plain rule. Zero for every rule
+    /// without a predicate, so their ordering is unchanged.
+    predicates: i32,
     /// Negated so fewer `**` segments sorts higher.
     neg_double_stars: i32,
     /// Negated so fewer `*` wildcards sorts higher.
@@ -190,62 +197,360 @@ enum Segment {
     DoubleStar,
     /// One segment, possibly containing `*` wildcards.
     Literal(String),
+    /// `[field="v"]` — an array element (`[]`) whose own content satisfies
+    /// the predicate. See [`Predicate`].
+    Predicate(Predicate),
+}
+
+/// Looks up the resource type a reference points at, as `Type/id`. The FHIR
+/// flow passes one built from the bundle, so a `urn:uuid:` reference can be
+/// matched by the type of what it names; `None` elsewhere.
+pub(crate) type Resolver<'r> = &'r dyn Fn(&str) -> Option<String>;
+
+/// The array elements along a path, aligned with its segments: `Some(element)`
+/// at each `[]` segment, `None` at a key. Predicate segments test against it.
+pub(crate) type Items<'p, 'v> = &'p [Option<&'v Value>];
+
+/// A condition on the content of one array element, written in brackets in
+/// place of `[]`: `identifier[system~"*naco*"]`.
+///
+/// ```text
+/// predicate := clause ("," clause)*           every clause must hold
+/// clause    := field op value ("|" value)*    any one value may match
+/// field     := name ("." name)*               path inside the element
+/// op        := "="                            exact, case-sensitive
+///            | "~"                            `*` glob, case-insensitive
+/// value     := "…" (JSON-style \" and \\ escapes)
+/// ```
+///
+/// A field is followed through nested arrays, so `type.coding.code="MR"`
+/// holds when any coding of the type has that code. A field that ends on an
+/// object with a `code` (a Coding) compares as `system|code`. A field ending
+/// in `reference` compares both as written and, when the flow can resolve it,
+/// as `Type/id` — so `derivedFrom.reference~"MolecularSequence/*"` also
+/// catches `urn:uuid:` references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Predicate {
+    clauses: Vec<Clause>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Clause {
+    /// Field path inside the element, lowercased; matched case-insensitively.
+    field: Vec<String>,
+    glob: bool,
+    /// Alternatives. Lowercased when `glob`.
+    values: Vec<String>,
+}
+
+impl Predicate {
+    /// Parses the text between the brackets.
+    pub(crate) fn parse(body: &str) -> Result<Predicate, String> {
+        let mut clauses = Vec::new();
+        let chars: Vec<char> = body.chars().collect();
+        let mut i = 0;
+        loop {
+            // field
+            let start = i;
+            while i < chars.len() && !matches!(chars[i], '=' | '~' | '"' | ',') {
+                i += 1;
+            }
+            let field_text: String = chars[start..i].iter().collect();
+            let field_text = field_text.trim();
+            if field_text.is_empty() {
+                return Err("a predicate clause needs a field name before '=' or '~'".into());
+            }
+            let field: Vec<String> = field_text.split('.').map(|s| s.trim().to_ascii_lowercase()).collect();
+            if let Some(bad) = field
+                .iter()
+                .find(|s| s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            {
+                return Err(format!("'{field_text}' is not a field path (bad part '{bad}')"));
+            }
+            // operator
+            let glob = match chars.get(i) {
+                Some('=') => false,
+                Some('~') => true,
+                _ => return Err(format!("'{field_text}' must be followed by '=' or '~'")),
+            };
+            i += 1;
+            // values
+            let mut values = Vec::new();
+            loop {
+                while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                    i += 1;
+                }
+                if chars.get(i) != Some(&'"') {
+                    return Err(format!("the value for '{field_text}' must be a double-quoted string"));
+                }
+                i += 1;
+                let mut v = String::new();
+                loop {
+                    match chars.get(i) {
+                        None => return Err(format!("unterminated string in the value for '{field_text}'")),
+                        Some('"') => {
+                            i += 1;
+                            break;
+                        }
+                        Some('\\') => match chars.get(i + 1) {
+                            Some(c @ ('"' | '\\')) => {
+                                v.push(*c);
+                                i += 2;
+                            }
+                            _ => return Err(format!("only \\\" and \\\\ escapes are allowed (in '{field_text}')")),
+                        },
+                        Some(c) => {
+                            v.push(*c);
+                            i += 1;
+                        }
+                    }
+                }
+                values.push(if glob { v.to_lowercase() } else { v });
+                while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                    i += 1;
+                }
+                if chars.get(i) == Some(&'|') {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            clauses.push(Clause { field, glob, values });
+            match chars.get(i) {
+                None => break,
+                Some(',') => i += 1,
+                Some(c) => return Err(format!("unexpected '{c}' after the value for '{field_text}'")),
+            }
+        }
+        Ok(Predicate { clauses })
+    }
+
+    /// Whether an array element satisfies every clause.
+    pub(crate) fn matches(&self, item: &Value, resolve: Option<Resolver>) -> bool {
+        self.clauses.iter().all(|c| {
+            let mut found = Vec::new();
+            follow(item, &c.field, &mut found);
+            c.hit(&found, resolve)
+        })
+    }
+
+    /// [`Predicate::matches`] against an object held as a map — a resource.
+    pub(crate) fn matches_map(&self, map: &Map<String, Value>, resolve: Option<Resolver>) -> bool {
+        self.clauses.iter().all(|c| {
+            let mut found = Vec::new();
+            if let Some((first, rest)) = c.field.split_first()
+                && let Some((_, child)) = map.iter().find(|(k, _)| k.eq_ignore_ascii_case(first))
+            {
+                follow(child, rest, &mut found);
+            }
+            c.hit(&found, resolve)
+        })
+    }
+}
+
+impl Clause {
+    fn hit(&self, found: &[&Value], resolve: Option<Resolver>) -> bool {
+        let is_reference = self.field.last().is_some_and(|f| f == "reference");
+        found.iter().any(|v| {
+            let mut texts: Vec<String> = Vec::new();
+            match v {
+                Value::String(s) => texts.push(s.clone()),
+                Value::Number(n) => texts.push(n.to_string()),
+                Value::Bool(b) => texts.push(b.to_string()),
+                // A Coding compares as `system|code`.
+                Value::Object(o) => {
+                    if let Some(code) = o.get("code").and_then(Value::as_str) {
+                        let system = o.get("system").and_then(Value::as_str).unwrap_or("");
+                        texts.push(format!("{system}|{code}"));
+                    }
+                }
+                _ => {}
+            }
+            if is_reference
+                && let (Some(r), Some(resolve)) = (v.as_str(), resolve)
+                && let Some(resolved) = resolve(r)
+            {
+                texts.push(resolved);
+            }
+            texts.iter().any(|t| {
+                self.values
+                    .iter()
+                    .any(|want| if self.glob { wildcard_match(want, &t.to_lowercase()) } else { want == t })
+            })
+        })
+    }
+}
+
+/// Collects what `field` reaches from `v`, fanning out over arrays.
+fn follow<'v>(v: &'v Value, field: &[String], out: &mut Vec<&'v Value>) {
+    match v {
+        Value::Array(items) => items.iter().for_each(|i| follow(i, field, out)),
+        _ if field.is_empty() => out.push(v),
+        Value::Object(map) => {
+            if let Some((_, child)) = map.iter().find(|(k, _)| k.eq_ignore_ascii_case(&field[0])) {
+                follow(child, &field[1..], out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Splits a pattern holding predicates into segments. Unlike the plain
+/// splitter, a `.` inside quotes or brackets does not end a segment, and
+/// anything malformed is an error rather than a literal that never matches.
+fn split_with_predicates(pattern: &str) -> Result<Vec<Segment>, String> {
+    let chars: Vec<char> = pattern.trim().trim_start_matches('.').chars().collect();
+    let mut segments = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+    let push_literal = |buf: &mut String, segments: &mut Vec<Segment>| -> Result<(), String> {
+        let s = std::mem::take(buf);
+        if s.is_empty() {
+            return Err("empty path segment".into());
+        }
+        segments.push(if s == "**" { Segment::DoubleStar } else { Segment::Literal(s.to_ascii_lowercase()) });
+        Ok(())
+    };
+    while i < chars.len() {
+        match chars[i] {
+            '.' => {
+                push_literal(&mut buf, &mut segments)?;
+                i += 1;
+            }
+            '[' => {
+                if !buf.is_empty() {
+                    push_literal(&mut buf, &mut segments)?;
+                }
+                // Find the closing bracket outside quotes.
+                let start = i + 1;
+                let mut j = start;
+                let mut in_quotes = false;
+                while j < chars.len() {
+                    match chars[j] {
+                        '\\' if in_quotes => j += 1,
+                        '"' => in_quotes = !in_quotes,
+                        ']' if !in_quotes => break,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if j >= chars.len() {
+                    return Err("'[' without a closing ']'".into());
+                }
+                let body: String = chars[start..j].iter().collect();
+                if body.trim().is_empty() {
+                    segments.push(Segment::Literal("[]".into()));
+                } else {
+                    segments.push(Segment::Predicate(Predicate::parse(&body)?));
+                }
+                i = j + 1;
+                match chars.get(i) {
+                    None | Some('[') => {}
+                    Some('.') => {
+                        i += 1;
+                        if i == chars.len() {
+                            return Err("pattern ends with '.'".into());
+                        }
+                    }
+                    Some(c) => return Err(format!("unexpected '{c}' after ']'")),
+                }
+            }
+            ']' | '"' => return Err(format!("unexpected '{}' outside a predicate", chars[i])),
+            c => {
+                buf.push(c);
+                i += 1;
+            }
+        }
+    }
+    if !buf.is_empty() {
+        push_literal(&mut buf, &mut segments)?;
+    } else if segments.is_empty() || chars.last() == Some(&'.') {
+        return Err("empty path segment".into());
+    }
+    Ok(segments)
 }
 
 impl Rule {
+    /// A rule from a trusted pattern. Panics on a malformed predicate; config
+    /// input goes through [`Rule::try_new`].
     pub fn new(pattern: &str, action: Action) -> Rule {
-        // Census paths print array indices glued to their key (`name[].text`),
-        // so accept that spelling too and a row can be pasted back as a rule.
-        let normalised = pattern.replace("[]", ".[]").replace("..[]", ".[]");
-        let segments: Vec<Segment> = normalised
-            .trim_start_matches('.')
-            .split('.')
-            .map(|s| if s == "**" { Segment::DoubleStar } else { Segment::Literal(s.to_ascii_lowercase()) })
-            .collect();
+        Rule::try_new(pattern, action).unwrap_or_else(|e| panic!("{e:?}"))
+    }
+
+    /// A rule from a config pattern. Only a pattern with a predicate can fail:
+    /// one without brackets other than `[]` is split exactly as before.
+    pub fn try_new(pattern: &str, action: Action) -> Result<Rule, PipelineError> {
+        let segments: Vec<Segment> = if pattern.replace("[]", "").contains(['[', ']']) {
+            split_with_predicates(pattern).map_err(|why| {
+                validation("CONFIG_INVALID_VALUE", "Malformed path pattern", &format!("{pattern}: {why}"))
+            })?
+        } else {
+            // Census paths print array indices glued to their key (`name[].text`),
+            // so accept that spelling too and a row can be pasted back as a rule.
+            let normalised = pattern.replace("[]", ".[]").replace("..[]", ".[]");
+            normalised
+                .trim_start_matches('.')
+                .split('.')
+                .map(|s| if s == "**" { Segment::DoubleStar } else { Segment::Literal(s.to_ascii_lowercase()) })
+                .collect()
+        };
         let spec = Specificity {
+            predicates: segments.iter().filter(|s| matches!(s, Segment::Predicate(_))).count() as i32,
             neg_double_stars: -(segments.iter().filter(|s| **s == Segment::DoubleStar).count() as i32),
             neg_stars: -(segments
                 .iter()
                 .map(|s| match s {
                     Segment::Literal(l) => l.matches('*').count(),
-                    Segment::DoubleStar => 0,
+                    _ => 0,
                 })
                 .sum::<usize>() as i32),
             literal_chars: segments
                 .iter()
                 .map(|s| match s {
                     Segment::Literal(l) => l.chars().filter(|c| *c != '*').count(),
+                    // Counted as the `[]` it stands in for.
+                    Segment::Predicate(_) => 2,
                     Segment::DoubleStar => 0,
                 })
                 .sum::<usize>() as i32,
             segments: segments.len() as i32,
         };
-        Rule { pattern: pattern.to_string(), action, segments, spec }
+        Ok(Rule { pattern: pattern.to_string(), action, segments, spec })
     }
 
-    fn matches(&self, path: &[String]) -> bool {
-        seg_match(&self.segments, path)
+    fn matches(&self, path: &[String], items: Items, resolve: Option<Resolver>) -> bool {
+        seg_match(&self.segments, path, items, resolve)
     }
 }
 
 /// Glob match of pattern segments against path segments. `**` spans any number
 /// of segments; `*` inside a segment matches any run of characters within that
-/// one segment. Recursive because `**` needs backtracking, and these patterns
-/// are a handful of segments long.
-fn seg_match(pat: &[Segment], path: &[String]) -> bool {
+/// one segment; a predicate matches a `[]` whose element satisfies it.
+/// Recursive because `**` needs backtracking, and these patterns are a handful
+/// of segments long. `items` may be shorter than `path` (or empty), in which
+/// case no predicate matches past its end.
+fn seg_match(pat: &[Segment], path: &[String], items: Items, resolve: Option<Resolver>) -> bool {
+    let tail = |n: usize| items.get(n..).unwrap_or(&[]);
     match pat.first() {
         None => path.is_empty(),
-        Some(Segment::DoubleStar) => (0..=path.len()).any(|skip| seg_match(&pat[1..], &path[skip..])),
+        Some(Segment::DoubleStar) => {
+            (0..=path.len()).any(|skip| seg_match(&pat[1..], &path[skip..], tail(skip), resolve))
+        }
         Some(Segment::Literal(lit)) => match path.first() {
             None => false,
-            Some(seg) => wildcard_match(lit, seg) && seg_match(&pat[1..], &path[1..]),
+            Some(seg) => wildcard_match(lit, seg) && seg_match(&pat[1..], &path[1..], tail(1), resolve),
         },
+        Some(Segment::Predicate(p)) => {
+            path.first().is_some_and(|s| s == "[]")
+                && items.first().copied().flatten().is_some_and(|item| p.matches(item, resolve))
+                && seg_match(&pat[1..], &path[1..], tail(1), resolve)
+        }
     }
 }
 
 /// `*`-wildcard match within a single segment. Both sides are lowercased by
 /// their constructors, so this is a plain byte comparison.
-fn wildcard_match(pat: &str, text: &str) -> bool {
+pub(crate) fn wildcard_match(pat: &str, text: &str) -> bool {
     let parts: Vec<&str> = pat.split('*').collect();
     if parts.len() == 1 {
         return pat == text;
@@ -433,7 +738,7 @@ pub(crate) fn parse_policy_rules(section: &Value) -> Result<(Vec<Rule>, PolicySp
         ("filename", Action::Filename),
     ] {
         for pattern in string_list(section.get(key), key)? {
-            rules.push(Rule::new(&pattern, action.clone()));
+            rules.push(Rule::try_new(&pattern, action.clone())?);
         }
     }
 
@@ -460,7 +765,7 @@ pub(crate) fn parse_policy_rules(section: &Value) -> Result<(Vec<Rule>, PolicySp
                     ),
                 ));
             }
-            rules.push(Rule::new(&spec.column.clone(), Action::Masking { spec: masking.len() }));
+            rules.push(Rule::try_new(&spec.column.clone(), Action::Masking { spec: masking.len() })?);
             masking.push(spec);
         }
     }
@@ -471,12 +776,12 @@ pub(crate) fn parse_policy_rules(section: &Value) -> Result<(Vec<Rule>, PolicySp
     let mut tokenization = Vec::new();
     for entry in object_list(section.get("tokenization"), "tokenization")? {
         let spec = parse_tokenization_config(entry)?;
-        rules.push(Rule::new(&spec.column, Action::Tokenize { spec: tokenization.len() }));
+        rules.push(Rule::try_new(&spec.column, Action::Tokenize { spec: tokenization.len() })?);
         tokenization.push(spec);
     }
     for entry in object_list(section.get("encrypt"), "encrypt")? {
         let spec = parse_encrypt_config(entry)?;
-        rules.push(Rule::new(&spec.column, Action::Encrypt { format_preserving: spec.format_preserving }));
+        rules.push(Rule::try_new(&spec.column, Action::Encrypt { format_preserving: spec.format_preserving })?);
     }
 
     // Ages and dates are coarsened with `masking` (`characters_to_mask` over
@@ -922,17 +1227,30 @@ pub fn write_census(census: &Census, path: &Path) -> Result<(), PipelineError> {
 /// pattern naming an array of scalars (`**.logos_present`) covers its elements
 /// without being written twice. The full path is tried first, so an explicit
 /// `**.logos_present.[]` still takes precedence.
-fn decide<'a>(cfg: &'a NestedJsonConfig, path: &[String]) -> (&'a Action, &'a str) {
-    decide_in(&cfg.rules, &cfg.default_action, path)
+fn decide<'a>(cfg: &'a NestedJsonConfig, path: &[String], items: Items) -> (&'a Action, &'a str) {
+    decide_at(&cfg.rules, &cfg.default_action, path, items, None)
 }
 
-/// [`decide`] over a bare rule set and fallback. `path` segments must already
-/// be lowercased, with array indices as `[]`.
+/// [`decide`] over a bare rule set and fallback, with no array elements to
+/// test predicates against — so no predicate rule matches. `path` segments
+/// must already be lowercased, with array indices as `[]`.
 pub(crate) fn decide_in<'a>(rules: &'a [Rule], default: &'a Action, path: &[String]) -> (&'a Action, &'a str) {
+    decide_at(rules, default, path, &[], None)
+}
+
+/// [`decide_in`] with the array elements along `path` (see [`Items`]), so
+/// predicate segments can test them, and an optional reference resolver.
+pub(crate) fn decide_at<'a>(
+    rules: &'a [Rule],
+    default: &'a Action,
+    path: &[String],
+    items: Items,
+    resolve: Option<Resolver>,
+) -> (&'a Action, &'a str) {
     let pick = |p: &[String]| -> Option<&'a Rule> {
         let mut best: Option<&'a Rule> = None;
         for rule in rules {
-            if !rule.matches(p) {
+            if !rule.matches(p, items, resolve) {
                 continue;
             }
             let better = match best {
@@ -985,9 +1303,10 @@ pub(crate) fn display_path(segments: &[String]) -> String {
 /// Array indices are collapsed to `[]` in the path used for matching and for
 /// the census, so one rule covers every page and the census does not grow a
 /// row per page number.
-fn walk(
-    value: &Value,
+fn walk<'v>(
+    value: &'v Value,
     path: &mut Vec<String>,
+    items: &mut Vec<Option<&'v Value>>,
     cfg: &NestedJsonConfig,
     keys: &mut KeyStore,
     census: &mut Census,
@@ -997,20 +1316,24 @@ fn walk(
             let mut out = Map::new();
             for (k, v) in map {
                 path.push(k.to_ascii_lowercase());
-                let kept = walk(v, path, cfg, keys, census);
+                items.push(None);
+                let kept = walk(v, path, items, cfg, keys, census);
                 path.pop();
+                items.pop();
                 if let Some(kept) = kept {
                     out.insert(k.clone(), kept);
                 }
             }
             Some(Value::Object(out))
         }
-        Value::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for v in items {
+        Value::Array(elements) => {
+            let mut out = Vec::with_capacity(elements.len());
+            for v in elements {
                 path.push("[]".to_string());
-                let kept = walk(v, path, cfg, keys, census);
+                items.push(Some(v));
+                let kept = walk(v, path, items, cfg, keys, census);
                 path.pop();
+                items.pop();
                 match kept {
                     Some(kept) => out.push(kept),
                     // Suppressing an object element would shift every later
@@ -1026,7 +1349,7 @@ fn walk(
             Some(Value::Array(out))
         }
         leaf => {
-            let (action, matched_by) = decide(cfg, path);
+            let (action, matched_by) = decide(cfg, path, items);
             census.record(&display_path(path), leaf, action, matched_by);
             apply(action, leaf, matched_by, cfg, keys)
         }
@@ -1036,7 +1359,7 @@ fn walk(
 /// Anonymizes one document. Exposed for tests and for callers holding a parsed
 /// document already.
 pub fn anonymize_document(doc: &Value, cfg: &NestedJsonConfig, keys: &mut KeyStore, census: &mut Census) -> Value {
-    walk(doc, &mut Vec::new(), cfg, keys, census).unwrap_or(Value::Null)
+    walk(doc, &mut Vec::new(), &mut Vec::new(), cfg, keys, census).unwrap_or(Value::Null)
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────────
@@ -1252,11 +1575,99 @@ mod tests {
     }
 
     #[test]
+    fn plain_patterns_split_exactly_as_before() {
+        for (p, want) in [
+            ("Patient.name[].text", vec!["patient", "name", "[]", "text"]),
+            ("**.coding[].system", vec!["**", "coding", "[]", "system"]),
+            ("a.[].b", vec!["a", "[]", "b"]),
+            (".a..b", vec!["a", "", "b"]),
+        ] {
+            let r = Rule::new(p, Action::Keep);
+            let got: Vec<String> = r
+                .segments
+                .iter()
+                .map(|s| match s {
+                    Segment::DoubleStar => "**".to_string(),
+                    Segment::Literal(l) => l.clone(),
+                    Segment::Predicate(_) => "<pred>".to_string(),
+                })
+                .collect();
+            assert_eq!(got, want, "{p}");
+            assert_eq!(r.spec.predicates, 0);
+        }
+    }
+
+    #[test]
+    fn predicates_parse_quoted_dots_alternatives_and_escapes() {
+        let r = Rule::new(r#"Patient.extension[url="http://x.org/a.b", valueCode="y"|"z\"q"].**"#, Action::Keep);
+        assert_eq!(r.segments.len(), 4);
+        let Segment::Predicate(p) = &r.segments[2] else { panic!("{:?}", r.segments) };
+        assert_eq!(p.clauses.len(), 2);
+        assert_eq!(p.clauses[0].values, vec!["http://x.org/a.b".to_string()]);
+        assert_eq!(p.clauses[1].values, vec!["y".to_string(), "z\"q".to_string()]);
+        assert!(Rule::try_new("a[b=\"c\"][d~\"e\"].f", Action::Keep).is_ok(), "stacked predicates");
+        assert!(Rule::try_new("a[b=\"c\"", Action::Keep).is_err());
+        assert!(Rule::try_new("a[b=c]", Action::Keep).is_err());
+    }
+
+    #[test]
+    fn a_predicate_matches_only_the_elements_it_describes() {
+        let r = Rule::new(r#"Patient.identifier[system~"*NACO*", type.coding.code="MR"].value"#, Action::Suppress);
+        let p = path("patient.identifier.[].value");
+        let art = json!({"system": "urn:Example:naco", "type": {"coding": [{"code": "XX"}, {"code": "MR"}]}});
+        let wrong_case = json!({"system": "urn:example:naco", "type": {"coding": [{"code": "mr"}]}});
+        let aadhaar = json!({"system": "urn:example:aadhaar", "type": {"coding": [{"code": "MR"}]}});
+        let items = |v: &Value| vec![None, None, Some(v.clone())];
+        let check = |v: &Value| {
+            let owned = items(v);
+            let refs: Vec<Option<&Value>> = owned.iter().map(Option::as_ref).collect();
+            r.matches(&p, &refs, None)
+        };
+        assert!(check(&art), "glob ignores case; '=' searches every coding");
+        assert!(!check(&wrong_case), "'=' is exact");
+        assert!(!check(&aadhaar));
+        assert!(!r.matches(&p, &[], None), "no elements, no match");
+    }
+
+    #[test]
+    fn a_predicate_rule_outranks_plain_rules_whatever_their_double_stars() {
+        let rules = vec![
+            Rule::new("Patient.identifier[].value", Action::Hash),
+            Rule::new(r#"Patient.identifier[system~"*naco*"].**"#, Action::Keep),
+        ];
+        let p = path("patient.identifier.[].value");
+        let naco = json!({"system": "x-naco"});
+        let other = json!({"system": "x-aadhaar"});
+        let at = |v: &Value| decide_at(&rules, &Action::Suppress, &p, &[None, None, Some(v)], None).0.clone();
+        assert_eq!(at(&naco), Action::Keep);
+        assert_eq!(at(&other), Action::Hash);
+        assert_eq!(decide_in(&rules, &Action::Suppress, &p).0, &Action::Hash, "without elements, as before");
+    }
+
+    #[test]
+    fn nested_documents_apply_predicates_too() {
+        let cfg = NestedJsonConfig {
+            enabled: true,
+            rules: vec![
+                Rule::new("pages[].extracted_data.*", Action::Keep),
+                Rule::new(r#"pages[document~"*aadhaar*"].**"#, Action::Suppress),
+            ],
+            ..Default::default()
+        };
+        let doc = json!({"pages": [{"document": "aadhaar card", "extracted_data": {"x": "1"}},
+                                   {"document": "discharge", "extracted_data": {"x": "2"}}]});
+        let mut census = Census::default();
+        let out = anonymize_document(&doc, &cfg, &mut KeyStore::with_hash_key(KEY), &mut census);
+        assert_eq!(out["pages"][0], json!({"extracted_data": {}}));
+        assert_eq!(out["pages"][1]["extracted_data"]["x"], json!("2"));
+    }
+
+    #[test]
     fn double_star_spans_segments() {
         let r = Rule::new("**.patient_name", Action::Suppress);
-        assert!(r.matches(&path("patient_name")));
-        assert!(r.matches(&path("pages.[].extracted_data.patient_name")));
-        assert!(!r.matches(&path("pages.[].extracted_data.patient_age")));
+        assert!(r.matches(&path("patient_name"), &[], None));
+        assert!(r.matches(&path("pages.[].extracted_data.patient_name"), &[], None));
+        assert!(!r.matches(&path("pages.[].extracted_data.patient_age"), &[], None));
     }
 
     /// The narrowest pattern wins regardless of where it sits, in both
@@ -1268,8 +1679,8 @@ mod tests {
             vec![Rule::new("**.*name*", Action::Suppress), Rule::new("**.hospital_name", Action::Keep)],
         ] {
             let cfg = NestedJsonConfig { rules, ..Default::default() };
-            assert_eq!(decide(&cfg, &path("pages.[].extracted_data.hospital_name")).0, &Action::Keep);
-            assert_eq!(decide(&cfg, &path("pages.[].extracted_data.patient_name")).0, &Action::Suppress);
+            assert_eq!(decide(&cfg, &path("pages.[].extracted_data.hospital_name"), &[]).0, &Action::Keep);
+            assert_eq!(decide(&cfg, &path("pages.[].extracted_data.patient_name"), &[]).0, &Action::Suppress);
         }
     }
 
@@ -1300,7 +1711,7 @@ mod tests {
             ("pages.[].extracted_data.patient_age", Action::Masking { spec: 0 }),
             ("pages.[].extracted_data.status_at_time_of_discharge", Action::Keep),
         ] {
-            assert_eq!(decide(&cfg, &path(p)).0, &want, "{p}");
+            assert_eq!(decide(&cfg, &path(p), &[]).0, &want, "{p}");
         }
     }
 
@@ -1312,14 +1723,14 @@ mod tests {
             vec![Rule::new("**.*_x", Action::Suppress), Rule::new("**.*_x", Action::Keep)],
         ] {
             let cfg = NestedJsonConfig { rules, ..Default::default() };
-            assert_eq!(decide(&cfg, &path("a.b_x")).0, &Action::Suppress);
+            assert_eq!(decide(&cfg, &path("a.b_x"), &[]).0, &Action::Suppress);
         }
     }
 
     #[test]
     fn unmatched_paths_take_the_default() {
         let cfg = NestedJsonConfig { rules: vec![Rule::new("case_id", Action::Keep)], ..Default::default() };
-        let (action, by) = decide(&cfg, &path("pages.[].extracted_data.bed_sheet_color"));
+        let (action, by) = decide(&cfg, &path("pages.[].extracted_data.bed_sheet_color"), &[]);
         assert_eq!(action, &Action::Suppress);
         assert_eq!(by, "<default>");
     }
@@ -1778,7 +2189,7 @@ mod tests {
             ("case_id", Action::Hash),
             ("pages.[].something", Action::Suppress),
         ] {
-            assert_eq!(decide(&cfg, &path(path_str)).0, &want, "{path_str}");
+            assert_eq!(decide(&cfg, &path(path_str), &[]).0, &want, "{path_str}");
         }
     }
 

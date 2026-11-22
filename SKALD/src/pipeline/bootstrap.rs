@@ -692,6 +692,8 @@ const KNOWN_SECTION_KEYS: &[&str] = &[
     "free_text",
     "filename",
     "code_rules",
+    "drop_resources",
+    "output_names",
     "propagation",
     "hash_strip_prefixes",
     // annotation only: lists columns deliberately left in clear

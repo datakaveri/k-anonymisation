@@ -5,7 +5,63 @@ All notable changes to SKALD are recorded here. The format follows
 [Semantic Versioning](https://semver.org/). The version in `SKALD/Cargo.toml`
 is the release version; tags are `v<version>`.
 
-## [4.0.0] — unreleased
+## [4.1.0] — 2026-11-22
+
+FHIR bundle mode can now express the data owner's three-level sheet without
+merging rows onto a shared path. Every 4.0 config keeps working and produces
+the same output: the NHA bundles and their census are byte-identical to 4.0.0
+output.
+
+### Added
+
+- **Predicates in path rules.** Write a condition in place of `[]` to select
+  array elements by their content:
+  - `Patient.identifier[system~"*naco*"].**`
+  - `Patient.identifier[type.coding.code="MR"].value`
+  - `Patient.extension[url="…"].**`
+
+  `=` is exact and `~` is a case-insensitive glob. `|` separates alternative
+  values, and `,` joins clauses that must all hold. A Coding compares as
+  `system|code`, and a `reference` also compares as the `Type/id` it resolves
+  to. A rule with a predicate outranks every rule without one. Predicates work
+  in every bucket, in `masking[].column` and in `propagation.from`, in both the
+  FHIR and nested-JSON flows. A malformed predicate is a config error.
+- **`drop_resources`** (FHIR). Resource selectors such as
+  `MolecularSequence`,
+  `DiagnosticReport[category.coding="…/v2-0074|GE"]`,
+  `Observation[derivedFrom.reference~"MolecularSequence/*"]` and
+  `*[meta.security="…|GDIS"]`. A matching resource is removed together with
+  its entry and every reference to it. Before this, suppressing
+  `MolecularSequence.**` left an empty resource behind, still carrying its id
+  and patient reference.
+- **Scoped `code_rules`** (FHIR). `code_rules` may be a list of blocks, and
+  each block can set `resources` (default `["Observation"]`). This lets a
+  sensitive-diagnosis code list drop matching `Condition`, `ServiceRequest` and
+  `DiagnosticReport` resources.
+- **`code_rules.masking`** (FHIR). Entries are
+  `{"code": "*_dob", <masking fields>}`. They mask an Observation's
+  `value[x]`, e.g. a DOB to the year, where before the Observation had to be
+  dropped.
+- **Suppressing references** (FHIR). An explicit `suppress` rule on a
+  `reference`, or on its nearest named ancestor (`Patient.link.**`,
+  `Claim.facility`), now removes the reference. Before this, references were
+  always kept and pseudonymised. References that no rule names are
+  pseudonymised as before.
+- **`"output_names": "pseudonym"`** (FHIR). Names each output file by an HMAC
+  of its input stem, under a salt kept in `fhir_bundle_salts.json`, so released
+  file names no longer carry case ids. The default (`"input"`) is unchanged.
+- **Release images.** The release workflow now also tags the image
+  `ghcr.io/datakaveri/skald:latest`.
+
+### Fixed
+
+- **Regex group masking masked the wrong text.** It masked the first place the
+  group's text appeared in the match, not the group's own span. For example,
+  `^(.{0,3})(.*)$` with group 2 masked turned `560560` into `***560`, leaving
+  the tail of the PIN in clear. It now masks by capture offsets. This affects
+  tabular masking too.
+
+## [4.0.0] — 2026-11-12
 
 This release fixes privacy and security defects found in an internal review in
 October 2026. Several fixes change behaviour on purpose, and some refuse
