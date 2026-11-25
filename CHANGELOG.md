@@ -5,6 +5,48 @@ All notable changes to SKALD are recorded here. The format follows
 [Semantic Versioning](https://semver.org/). The version in `SKALD/Cargo.toml`
 is the release version; tags are `v<version>`.
 
+## [4.2.0] — 2026-11-26
+
+SKALD can now be driven one batch at a time, so a distributed job (Spark
+executors holding Arrow batches) can do the per-row work while one driver runs
+the k search over merged histograms. Nothing about the command line changed:
+every 4.1 config keeps working and its output is byte-identical. The new
+conformance corpus (`SKALD/conformance`) holds the 4.1.0 binary's own output
+for ten synthetic cases, and the CLI is tested against it.
+
+### Added
+
+- **Batch API** (`skald_ola2::batch`). `Plan` (parse and validate a config),
+  `Preprocessor`, `Stats` (observe/merge), `Model::build`, `Histogram`
+  (observe/merge, byte form), `Model::parameter_grid` and `Model::search`
+  (the pass 1 grid and OLA-2 over a merged histogram, honouring
+  `suppression_limit` and l-diversity), `Generalizer` with `Tally::merge` and
+  `Tally::decide` (k is checked over the whole data set before any row is
+  suppressed or removed) and `Tally::verify` (the final k check on written
+  rows). The command line is a loop over chunk files around these same calls.
+- **Keys passed in.** `KeyMaterial` holds HMAC salts, AES-SIV keys and FPE keys
+  by column. `KeyPolicy::Generate` (what the CLI does) keeps generating missing
+  ones; `KeyPolicy::Require` fails with `KEY_MISSING`.
+- **Token vault trait.** `TokenVault` (lookup, assign, token_in_use, len) with
+  `MemoryVault`, which also loads and exports the `{original: token}` entries
+  of an Anamika vault. `TokenPolicy::LookupOnly` refuses to mint
+  (`TOKEN_MISSING`); `Preprocessor::token_values` and `issue_tokens` let a
+  driver complete the vault before executors run. The CLI still loads and
+  saves `token_vault.json`.
+- **`arrow` feature** (off by default): `batch::arrow_io` converts between
+  `Table` and Arrow `RecordBatch`.
+- **`skald_core`**: a PyO3/maturin wheel in `SKALD/python` exposing the batch
+  API with `pyarrow.RecordBatch` in and out. It is a separate crate, so the
+  CLI build is unchanged.
+- **Benchmark harness** (`SKALD/bench/harness.py`).
+
+### Changed
+
+- `preprocess_chunks`, `scan_chunks_for_flow`, `compute_numerical_min_max`,
+  `build_sparse_histogram`, `build_z_histogram`, `build_sensitive_sets` and
+  `generalize_and_write_outputs_with` keep their signatures and are now file
+  drivers over the batch kernels.
+
 ## [4.1.0] — 2026-11-22
 
 FHIR bundle mode can now express the data owner's three-level sheet without
