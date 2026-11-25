@@ -10,7 +10,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).parent))
 # Python workers must find this package and the same interpreter (skald_core lives in that venv).
-os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, [str(ROOT), os.environ.get("PYTHONPATH")]))
+# anamika_ner (the NER library) lives in the Grievance repo; tests that need it skip when it is absent.
+NER_SRC = Path(os.environ.get("ANAMIKA_NER_SRC", ROOT.parent / "Grievance-data-anonymization" / "app"))
+os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, [str(ROOT), str(Path(__file__).parent), str(NER_SRC),
+                                                         os.environ.get("PYTHONPATH")]))
+sys.path.insert(0, str(NER_SRC))
 os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
