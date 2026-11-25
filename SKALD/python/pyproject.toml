@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "skald_core"
+version = "4.2.0"
+description = "SKALD's per-batch anonymisation and k search over Arrow record batches"
+requires-python = ">=3.9"
+dependencies = ["pyarrow>=14"]
+license = { text = "Apache-2.0" }
+
+[tool.maturin]
+module-name = "skald_core"

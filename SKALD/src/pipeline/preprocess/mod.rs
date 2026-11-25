@@ -191,6 +191,16 @@ impl<V: TokenVault> Preprocessor<V> {
         &self.vault
     }
 
+    /// The keys in use, including any generated so far.
+    pub fn keys(&self) -> &KeyMaterial {
+        &self.keys
+    }
+
+    /// `(kind, column)` pairs this preprocessor generated because none was passed.
+    pub fn generated_keys(&self) -> &[(KeyKind, String)] {
+        &self.generated
+    }
+
     /// Hands back the keys (including any generated), the vault, and the
     /// `(kind, column)` pairs that were generated.
     pub fn into_parts(self) -> (KeyMaterial, V, Vec<(KeyKind, String)>) {

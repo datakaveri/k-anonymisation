@@ -2,6 +2,7 @@
 
 use super::stats::QiColumns;
 use crate::pipeline::bootstrap::{PipelineError, RuntimeConfig, parse_runtime_config_value, validation};
+use crate::pipeline::preprocess::{KeyKind, KeyMaterial, KeyPolicy, MemoryVault, Preprocessor, TokenPolicy};
 use serde_json::Value;
 use std::path::Path;
 
@@ -33,6 +34,20 @@ impl Plan {
             ));
         }
         Ok(Self { cfg, json: json.to_string() })
+    }
+
+    /// Every key the config's techniques need, as `(kind, column)`: what a
+    /// caller must supply (or let [`KeyMaterial::generate_missing`] make)
+    /// before running executors with [`KeyPolicy::Require`].
+    pub fn required_keys(&self) -> Result<Vec<(KeyKind, String)>, PipelineError> {
+        let pre = Preprocessor::new(
+            &self.cfg,
+            KeyMaterial::new(),
+            KeyPolicy::Require,
+            MemoryVault::new(),
+            TokenPolicy::LookupOnly,
+        )?;
+        Ok(pre.required_keys())
     }
 
     pub fn qi_columns(&self) -> QiColumns {
