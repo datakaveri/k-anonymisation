@@ -20,6 +20,16 @@ pub struct Table {
 }
 
 impl Table {
+    /// Reads a whole CSV file (every row as wide as its header).
+    pub fn from_csv_file(path: &std::path::Path) -> Result<Self, crate::pipeline::bootstrap::PipelineError> {
+        let (headers, mut records) = crate::pipeline::bootstrap::open_csv(path)?;
+        let mut rows = Vec::new();
+        while let Some(fields) = records.next_record_of_width(headers.len())? {
+            rows.push(fields);
+        }
+        Ok(Self::new(headers, rows, path.display().to_string()))
+    }
+
     pub fn new(headers: Vec<String>, rows: Vec<Vec<String>>, source: impl Into<String>) -> Self {
         Self { headers, rows, source: source.into() }
     }

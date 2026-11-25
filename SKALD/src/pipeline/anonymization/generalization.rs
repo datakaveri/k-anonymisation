@@ -23,7 +23,8 @@
 //! when that `*` class itself has at least `k` records (and is l-diverse);
 //! otherwise they are removed from the output altogether.
 
-use super::{QuasiIdentifierLite, normalize_categorical, parse_numeric_qi, resolve_qi_columns};
+use super::{QuasiIdentifierLite, normalize_categorical, parse_numeric_qi};
+use crate::batch::{Generalizer, Table, Tally};
 use crate::pipeline::bootstrap::{CsvRecords, HierarchyMap, PipelineError, csv_row_to_line, open_csv, validation};
 use std::collections::BTreeMap;
 use std::fs;
@@ -81,7 +82,7 @@ pub(super) fn generalize_categorical_label(
 
 /// The written form of one QI cell at `level`. Cells with no bin — an
 /// unusable number, a value outside every interval — are written as `*`.
-fn generalize_cell(qi: &QuasiIdentifierLite, raw: &str, level: i64, hierarchies: &HierarchyMap) -> String {
+pub(crate) fn generalize_cell(qi: &QuasiIdentifierLite, raw: &str, level: i64, hierarchies: &HierarchyMap) -> String {
     if let Some(h) = &qi.interval_hierarchy {
         let level = (level as usize).clamp(1, h.num_levels);
         return parse_numeric_qi(raw)
@@ -105,7 +106,7 @@ pub struct LDiversity {
 }
 
 /// What the generalization step actually wrote, measured on the output itself.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GeneralizationSummary {
     /// Data rows read.
     pub total_records: i64,
@@ -130,15 +131,15 @@ pub struct GeneralizationSummary {
 
 /// One class while counting: its size, and up to `l` distinct values of each
 /// sensitive attribute.
-#[derive(Default)]
-struct ClassTally {
-    size: i64,
-    sensitive: Vec<Vec<String>>,
+#[derive(Default, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ClassTally {
+    pub(crate) size: i64,
+    pub(crate) sensitive: Vec<Vec<String>>,
 }
 
 impl ClassTally {
     /// Counts one record with these sensitive values (one per attribute).
-    fn add(&mut self, values: &[String], l: usize) {
+    pub(crate) fn add(&mut self, values: &[String], l: usize) {
         self.size += 1;
         for (a, v) in values.iter().enumerate() {
             self.note(a, v, l);
@@ -146,7 +147,7 @@ impl ClassTally {
     }
 
     /// Folds another class into this one.
-    fn absorb(&mut self, other: &ClassTally, l: usize) {
+    pub(crate) fn absorb(&mut self, other: &ClassTally, l: usize) {
         self.size += other.size;
         for (a, values) in other.sensitive.iter().enumerate() {
             for v in values {
@@ -165,7 +166,7 @@ impl ClassTally {
         }
     }
 
-    fn passes(&self, k: i64, l: Option<&LDiversity>) -> bool {
+    pub(crate) fn passes(&self, k: i64, l: Option<&LDiversity>) -> bool {
         self.size >= k
             && l.is_none_or(|l| {
                 self.sensitive.len() == l.sensitive_attributes.len() && self.sensitive.iter().all(|s| s.len() >= l.l)
@@ -241,86 +242,39 @@ fn write_outputs(
     output_path: &str,
     hierarchies: &HierarchyMap,
 ) -> Result<GeneralizationSummary, PipelineError> {
-    let l_cap = l.map_or(0, |l| l.l);
+    // The per-batch work is the batch API's; this function is the chunk-file
+    // plumbing around it.
+    let generalizer = Generalizer::new(qis, final_rf, hierarchies, l)?;
     let mut headers: Option<Vec<String>> = None;
-    let mut qi_idx: Vec<usize> = Vec::new();
-    let mut sens_idx: Vec<usize> = Vec::new();
 
     // --- Pass 1: generalize every chunk into a temp file, counting classes globally ---
-    let mut classes: BTreeMap<Vec<String>, ClassTally> = BTreeMap::new();
-    let mut total_records = 0_i64;
-
+    // Counts must span every chunk before anything is suppressed.
+    let mut tally = Tally::new(l);
     for (chunk, tmp_path) in chunk_paths.iter().zip(tmp_paths) {
         let (header, mut records) = open_csv(chunk)?;
         match &headers {
-            None => {
-                qi_idx = resolve_qi_columns(&header, qis)?;
-                if let Some(l) = l {
-                    sens_idx = l
-                        .sensitive_attributes
-                        .iter()
-                        .map(|c| {
-                            header.iter().position(|h| h == c).ok_or_else(|| {
-                                validation(
-                                    "DATA_COLUMN_MISSING",
-                                    "l_diversity sensitive attribute not found in CSV header",
-                                    c,
-                                )
-                            })
-                        })
-                        .collect::<Result<_, _>>()?;
-                }
-                headers = Some(header.clone());
-            }
+            None => headers = Some(header.clone()),
             Some(first) if *first != header => {
                 return Err(validation("GENERALIZATION_FAILED", "chunk headers differ", &chunk.display().to_string()));
             }
             Some(_) => {}
         }
+        let mut rows = Vec::new();
+        while let Some(fields) = records.next_record_of_width(header.len())? {
+            rows.push(fields);
+        }
+        let mut table = Table::new(header, rows, chunk.display().to_string());
+        tally.merge(&generalizer.apply(&mut table)?);
 
         let mut w = BufWriter::new(fs::File::create(tmp_path)?);
-        while let Some(mut fields) = records.next_record_of_width(header.len())? {
-            for (qi_pos, qi) in qis.iter().enumerate() {
-                let i = qi_idx[qi_pos];
-                fields[i] = generalize_cell(qi, &fields[i], final_rf[qi_pos], hierarchies);
-            }
-            let key: Vec<String> = qi_idx.iter().map(|&i| fields[i].clone()).collect();
-            let sensitive: Vec<String> = sens_idx.iter().map(|&i| normalize_categorical(&fields[i])).collect();
-            classes.entry(key).or_default().add(&sensitive, l_cap);
-            total_records += 1;
-
-            w.write_all(csv_row_to_line(&fields).as_bytes())?;
+        for row in &table.rows {
+            w.write_all(csv_row_to_line(row).as_bytes())?;
             w.write_all(b"\n")?;
         }
         w.flush()?;
     }
     let headers = headers.unwrap_or_default();
-
-    // Every failing class goes into the `*` class; publish it only if it would
-    // itself pass, otherwise its records are removed.
-    let mut star = ClassTally::default();
-    let mut summary = GeneralizationSummary { total_records, ..Default::default() };
-    for tally in classes.values() {
-        if tally.passes(k, l) {
-            summary.num_equivalence_classes += 1;
-            summary.dm_star = summary.dm_star.saturating_add(tally.size.saturating_mul(tally.size));
-            *summary.class_size_counts.entry(tally.size).or_insert(0) += 1;
-        } else {
-            if tally.size < k {
-                summary.classes_failing_k += 1;
-            } else {
-                summary.classes_failing_l += 1;
-            }
-            summary.suppressed_records += tally.size;
-            star.absorb(tally, l_cap);
-        }
-    }
-    let publish_suppressed = star.size == 0 || star.passes(k, l);
-    if publish_suppressed {
-        summary.published_suppressed_records = star.size;
-    } else {
-        summary.removed_records = star.size;
-    }
+    let decision = tally.decide(k, l);
 
     // --- Pass 2: suppress or remove failing records, writing straight into the final file ---
     let final_path =
@@ -332,20 +286,17 @@ fn write_outputs(
     for tmp_path in tmp_paths {
         // Temp files hold data rows only — no header record to skip.
         let mut records = CsvRecords::new(BufReader::new(fs::File::open(tmp_path)?), &tmp_path.display().to_string());
-        while let Some(mut fields) = records.next_record_of_width(headers.len())? {
-            let key: Vec<String> = qi_idx.iter().map(|&i| fields[i].clone()).collect();
-            if !classes.get(&key).is_some_and(|t| t.passes(k, l)) {
-                if !publish_suppressed {
-                    continue;
-                }
-                for &i in &qi_idx {
-                    fields[i] = "*".to_string();
-                }
-            }
-            final_writer.write_all(csv_row_to_line(&fields).as_bytes())?;
+        let mut rows = Vec::new();
+        while let Some(fields) = records.next_record_of_width(headers.len())? {
+            rows.push(fields);
+        }
+        let mut table = Table::new(headers.clone(), rows, tmp_path.display().to_string());
+        generalizer.finish(&mut table, &decision)?;
+        for row in &table.rows {
+            final_writer.write_all(csv_row_to_line(row).as_bytes())?;
             final_writer.write_all(b"\n")?;
         }
     }
     final_writer.flush()?;
-    Ok(summary)
+    Ok(decision.summary)
 }

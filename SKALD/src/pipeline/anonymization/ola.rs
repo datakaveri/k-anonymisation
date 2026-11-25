@@ -1,7 +1,9 @@
 use super::generalization::generalize_categorical_label;
-use crate::pipeline::bootstrap::{HierarchyMap, PipelineError, open_csv, validation};
+use crate::batch::histogram::{SensCells, collapse_z, intern_sensitive, observe_sensitive, observe_sparse, observe_z};
+use crate::batch::{QiColumns, Stats, Table};
+use crate::pipeline::bootstrap::{HierarchyMap, PipelineError, validation};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 // ── Non-uniform interval hierarchy ───────────────────────────────────────────
@@ -653,22 +655,18 @@ pub fn resolve_qi_columns(header: &[String], qis: &[QuasiIdentifierLite]) -> Res
         .collect()
 }
 
-/// Calls `visit` with every data row of every chunk, after checking each
-/// chunk's header resolves the QIs and each row has the header's width.
-fn for_each_row(
+/// Reads each chunk into a [`Table`] and hands it to `visit`, after checking
+/// there is at least one chunk. The chunk-file drivers below all go through
+/// this, so the per-row work is the batch API's and not a second copy.
+fn for_each_chunk(
     chunk_paths: &[PathBuf],
-    qis: &[QuasiIdentifierLite],
-    mut visit: impl FnMut(&[String], &[usize]) -> Result<(), PipelineError>,
+    mut visit: impl FnMut(&Table) -> Result<(), PipelineError>,
 ) -> Result<(), PipelineError> {
     if chunk_paths.is_empty() {
         return Err(validation("GENERALIZATION_FAILED", "No chunks provided", "histogram"));
     }
     for chunk in chunk_paths {
-        let (header, mut records) = open_csv(chunk)?;
-        let col_idx = resolve_qi_columns(&header, qis)?;
-        while let Some(fields) = records.next_record_of_width(header.len())? {
-            visit(&fields, &col_idx)?;
-        }
+        visit(&Table::from_csv_file(chunk)?)?;
     }
     Ok(())
 }
@@ -682,23 +680,24 @@ fn for_each_row(
 /// - **categorical domains** — for each QI position `i`, a sorted `Vec<String>`
 ///   of every distinct normalised value in that column (see
 ///   [`normalize_categorical`]). Non-categorical positions hold an empty `Vec`.
+///
+/// A file driver over [`Stats`], which is what the batch API scans with.
 pub fn scan_chunks_for_flow(
     chunk_paths: &[PathBuf],
     qis: &[QuasiIdentifierLite],
 ) -> Result<(i64, Vec<Vec<String>>), PipelineError> {
-    let mut cat_sets: Vec<BTreeSet<String>> = vec![BTreeSet::new(); qis.len()];
-    let mut total: i64 = 0;
-    for_each_row(chunk_paths, qis, |fields, col_idx| {
-        total += 1;
-        for (i, qi) in qis.iter().enumerate() {
-            if qi.is_categorical {
-                cat_sets[i].insert(normalize_categorical(&fields[col_idx[i]]));
-            }
-        }
-        Ok(())
-    })?;
-    let categorical_domains = cat_sets.into_iter().map(|s| s.into_iter().collect()).collect();
-    Ok((total, categorical_domains))
+    let cols = QiColumns {
+        numeric: qis.iter().filter(|q| !q.is_categorical).map(|q| q.column_name.clone()).collect(),
+        categorical: qis.iter().filter(|q| q.is_categorical).map(|q| q.column_name.clone()).collect(),
+    };
+    let mut stats = Stats::new(&cols);
+    for_each_chunk(chunk_paths, |t| stats.observe(&cols, t))?;
+    let mut cats = stats.categorical.into_iter();
+    let domains = qis
+        .iter()
+        .map(|q| if q.is_categorical { cats.next().unwrap_or_default().into_iter().collect() } else { Vec::new() })
+        .collect();
+    Ok((stats.rows, domains))
 }
 
 // ── Equivalence-space computation ─────────────────────────────────────────────
@@ -735,7 +734,7 @@ pub fn compute_equivalence_space(qis: &[QuasiIdentifierLite], categorical_domain
 /// with numeric offsets rounded down to a multiple of that QI's `initial_ri`
 /// (the bin start), so `key / width` lands on the bin the output step writes
 /// for any lattice width, which is always a multiple of `initial_ri`.
-fn base_key(
+pub(crate) fn base_key(
     qis: &[QuasiIdentifierLite],
     fields: &[String],
     col_idx: &[usize],
@@ -774,9 +773,8 @@ pub fn build_sparse_histogram(
     }
     let mut hist: SparseHist = HashMap::new();
     let mut total_records: i64 = 0;
-    for_each_row(chunk_paths, qis, |fields, col_idx| {
-        *hist.entry(base_key(qis, fields, col_idx, initial_ri, categorical_domains)?).or_insert(0) += 1;
-        total_records += 1;
+    for_each_chunk(chunk_paths, |t| {
+        total_records += observe_sparse(&mut hist, qis, initial_ri, categorical_domains, t)?;
         Ok(())
     })?;
     if total_records == 0 {
@@ -846,6 +844,12 @@ fn from_z(qi: &QuasiIdentifierLite, u: i64) -> i64 {
     if qi.is_categorical { u } else { u - 1 }
 }
 
+/// Z value of a base key (as [`base_key`] builds it at `initial_ri` all ones).
+pub(crate) fn z_of_key(qis: &[QuasiIdentifierLite], key: &[i64], weights: &[i64]) -> i64 {
+    let u: Vec<i64> = qis.iter().zip(key).map(|(qi, &c)| to_z(qi, c)).collect();
+    encode_z(&u, weights)
+}
+
 /// Encode a normalized u-vector to a single scalar Z.
 #[inline]
 fn encode_z(u: &[i64], weights: &[i64]) -> i64 {
@@ -864,19 +868,6 @@ fn decode_z(mut z: i64, weights: &[i64]) -> Vec<i64> {
     u
 }
 
-/// Sort a Vec<i64> of Z values and RLE-compress into a ZHist.
-fn collapse_z_values(mut zs: Vec<i64>) -> ZHist {
-    zs.sort_unstable();
-    let mut hist = ZHist::new();
-    for z in zs {
-        match hist.last_mut() {
-            Some(last) if last.0 == z => last.1 += 1,
-            _ => hist.push((z, 1)),
-        }
-    }
-    hist
-}
-
 /// Build a Z-encoded histogram at finest granularity.
 ///
 /// Each record is converted to a single Z scalar via mixed-radix encoding.
@@ -891,14 +882,8 @@ pub fn build_z_histogram(
     if categorical_domains.len() != qis.len() || weights.len() != qis.len() {
         return Err(validation("GENERALIZATION_FAILED", "length mismatch", "build_z_histogram"));
     }
-    let ones = vec![1; qis.len()];
     let mut zs: Vec<i64> = Vec::new();
-    for_each_row(chunk_paths, qis, |fields, col_idx| {
-        let key = base_key(qis, fields, col_idx, &ones, categorical_domains)?;
-        let u: Vec<i64> = qis.iter().zip(&key).map(|(qi, &c)| to_z(qi, c)).collect();
-        zs.push(encode_z(&u, weights));
-        Ok(())
-    })?;
+    for_each_chunk(chunk_paths, |t| observe_z(&mut zs, qis, categorical_domains, weights, t))?;
     if zs.is_empty() {
         return Err(validation(
             "GENERALIZATION_FAILED",
@@ -907,7 +892,7 @@ pub fn build_z_histogram(
         ));
     }
     let n = zs.len() as i64;
-    Ok((collapse_z_values(zs), n))
+    Ok((collapse_z(zs), n))
 }
 
 /// Convert a `ZHist` to a `SparseHist` with the same keys
@@ -991,32 +976,11 @@ pub fn build_sensitive_sets(
     sensitive_columns: &[String],
     l: usize,
 ) -> Result<SensitiveSets, PipelineError> {
-    let mut sets: SensitiveSets = HashMap::new();
-    let mut interned: Vec<HashMap<String, u32>> = vec![HashMap::new(); sensitive_columns.len()];
-    let mut sens_idx: Option<Vec<usize>> = None;
-    for chunk in chunk_paths {
-        let (header, mut records) = open_csv(chunk)?;
-        let col_idx = resolve_qi_columns(&header, qis)?;
-        let s_idx: Vec<usize> = sensitive_columns
-            .iter()
-            .map(|c| {
-                header.iter().position(|h| h == c).ok_or_else(|| {
-                    validation("DATA_COLUMN_MISSING", "l_diversity sensitive attribute not found in CSV header", c)
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        sens_idx.get_or_insert_with(|| s_idx.clone());
-        while let Some(fields) = records.next_record_of_width(header.len())? {
-            let key = base_key(qis, &fields, &col_idx, initial_ri, categorical_domains)?;
-            let cell = sets.entry(key).or_insert_with(|| vec![Vec::new(); sensitive_columns.len()]);
-            for (a, &si) in s_idx.iter().enumerate() {
-                let next = interned[a].len() as u32;
-                let id = *interned[a].entry(normalize_categorical(&fields[si])).or_insert(next);
-                union_capped(&mut cell[a], &[id], l);
-            }
-        }
-    }
-    Ok(sets)
+    let mut sets = SensCells::new();
+    for_each_chunk(chunk_paths, |t| {
+        observe_sensitive(&mut sets, qis, initial_ri, categorical_domains, sensitive_columns, l, t)
+    })?;
+    Ok(intern_sensitive(&sets))
 }
 
 /// Class sizes at `node`, with every class that is not l-diverse reported as

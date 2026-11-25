@@ -447,13 +447,13 @@ pub fn preprocess_chunks(chunks: &[PathBuf], cfg: &RuntimeConfig) -> Result<Prep
     let fpe_encrypt_keys_path = out_dir.join("fpe_encrypt_keys.json");
     let mut keys = KeyMaterial::new();
     for (col, k) in hash_salts {
-        keys.insert_hex(KeyKind::HmacSalt, &col, k);
+        keys.insert_raw(KeyKind::HmacSalt, &col, k);
     }
     for (col, k) in read_json_map_string(&symmetric_keys_path)? {
-        keys.insert_hex(KeyKind::AesKey, &col, k);
+        keys.insert_raw(KeyKind::AesKey, &col, k);
     }
     for (col, k) in read_json_map_string(&fpe_encrypt_keys_path)? {
-        keys.insert_hex(KeyKind::FpeKey, &col, k);
+        keys.insert_raw(KeyKind::FpeKey, &col, k);
     }
 
     let mut pre = Preprocessor::new(cfg, keys, KeyPolicy::Generate, vault, TokenPolicy::Issue)?;

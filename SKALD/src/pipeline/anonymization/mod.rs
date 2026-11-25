@@ -16,6 +16,9 @@
 mod generalization;
 mod ola;
 
+pub(crate) use generalization::{ClassTally, generalize_cell};
+pub(crate) use ola::{base_key, z_of_key};
+
 pub use generalization::{
     GeneralizationSummary, LDiversity, generalize_and_write_outputs, generalize_and_write_outputs_with,
 };
@@ -32,7 +35,8 @@ pub use ola::{
     z_hist_to_sparse,
 };
 
-use crate::pipeline::bootstrap::{PipelineError, RuntimeConfig, open_csv, validation};
+use crate::batch::{QiColumns, Stats, Table};
+use crate::pipeline::bootstrap::{PipelineError, RuntimeConfig, validation};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -56,33 +60,14 @@ pub fn compute_numerical_min_max(
     chunk_paths: &[PathBuf],
     numerical_columns: &[String],
 ) -> Result<BTreeMap<String, (f64, f64)>, PipelineError> {
-    let mut acc: Vec<Option<(i64, i64)>> = vec![None; numerical_columns.len()];
+    // A file driver over the batch API's `Stats`, which reads every cell the
+    // same way.
+    let cols = QiColumns { numeric: numerical_columns.to_vec(), categorical: Vec::new() };
+    let mut stats = Stats::new(&cols);
     for chunk_path in chunk_paths {
-        let (headers, mut records) = open_csv(chunk_path)?;
-        let col_indices: Vec<usize> = numerical_columns
-            .iter()
-            .map(|col| {
-                headers.iter().position(|h| h == col).ok_or_else(|| {
-                    validation("DATA_COLUMN_MISSING", "Quasi-identifier column not found in CSV header", col)
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        while let Some(fields) = records.next_record_of_width(headers.len())? {
-            for (slot, &idx) in acc.iter_mut().zip(&col_indices) {
-                if let Some(v) = parse_numeric_qi(&fields[idx]) {
-                    *slot = Some(slot.map_or((v, v), |(mn, mx)| (mn.min(v), mx.max(v))));
-                }
-            }
-        }
+        stats.observe(&cols, &Table::from_csv_file(chunk_path)?)?;
     }
-    Ok(numerical_columns
-        .iter()
-        .zip(acc)
-        .map(|(c, mm)| {
-            let (mn, mx) = mm.unwrap_or((0, 0));
-            (c.clone(), (mn as f64, mx as f64))
-        })
-        .collect())
+    Ok(stats.min_max(&cols))
 }
 
 /// Builds the ordered list of [`QuasiIdentifierLite`] descriptors from the

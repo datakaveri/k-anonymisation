@@ -1,11 +1,8 @@
+use crate::batch::model::node_from_names;
+use crate::batch::{Model, QiColumns, Stats, Table};
 use crate::pipeline::anonymization::{
-    GRID_K_VALUES, GRID_SUPPRESSION_LIMITS, GeneralizationSummary, GridEntry, QuasiIdentifierLite, SparseHist, ZHist,
-    allowed_suppressions, attach_categorical_levels, build_quasi_identifiers, build_sensitive_sets,
-    build_sparse_histogram, build_z_histogram, categorical_ladder_len, compute_equivalence_space, compute_k_optimal,
-    compute_numerical_min_max, compute_parameter_grid, compute_parameter_grid_for, compute_parameter_grid_z,
-    compute_z_weights, find_ola1_initial_ri, find_ola2_best_rf_detailed, find_ola2_best_rf_z_detailed, find_ola2_with,
-    generalize_and_write_outputs_with, l_aware_class_sizes, merge_histogram, merge_z_histogram, scan_chunks_for_flow,
-    z_hist_to_sparse,
+    GeneralizationSummary, GridEntry, QuasiIdentifierLite, SparseHist, allowed_suppressions, compute_k_optimal,
+    generalize_and_write_outputs_with, merge_histogram,
 };
 use crate::pipeline::bootstrap::{
     FlowMode, Logger, PipelineError, RuntimeConfig, StatusPayload, available_ram_bytes, clear_output_dir,
@@ -249,18 +246,23 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
         log_preprocess_stats(&mut log, &pre_stats);
     }
 
-    // ── Min/max scan ─────────────────────────────────────────────────────────
+    // ── Scan: row count, numeric ranges and categorical domains ──────────────
+    // One pass over the chunks through the batch API's `Stats`; the same call
+    // a distributed driver merges per-batch reports from.
     log.info("min_max_scan", &format!("Computing min/max for {} numerical QI(s)", cfg.numerical_qis.len()));
-    let numerical_cols = cfg.numerical_qis.iter().map(|q| q.column.clone()).collect::<Vec<_>>();
-    let dynamic_min_max = compute_numerical_min_max(&chunk_paths, &numerical_cols)?;
-    log.info("min_max_scan", &format!("Scanned {} column(s)", dynamic_min_max.len()));
+    let qi_cols = QiColumns::from_config(&cfg);
+    let mut stats = Stats::new(&qi_cols);
+    for chunk in &chunk_paths {
+        stats.observe(&qi_cols, &Table::from_csv_file(chunk)?)?;
+    }
+    log.info("min_max_scan", &format!("Scanned {} column(s)", qi_cols.numeric.len()));
 
     // ── Build QIs ────────────────────────────────────────────────────────────
     log.info(
         "qi_building",
         &format!("Building QIs: {} numerical, {} categorical", cfg.numerical_qis.len(), cfg.categorical_qis.len()),
     );
-    let mut qis = build_quasi_identifiers(&cfg, &dynamic_min_max)?;
+    let qis = Model::qis_only(&cfg, &stats)?;
     let interval_qi_count = qis.iter().filter(|q| q.interval_hierarchy.is_some()).count();
     log.info("qi_building", &format!("{} QI(s) built ({} with interval constraints)", qis.len(), interval_qi_count));
 
@@ -277,7 +279,7 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
                     "Add \"k_anonymize\": {\"k\": <value>} to config",
                 ));
             }
-            let final_rf = resolve_generalization_node(chosen, &qis, &cfg)?;
+            let final_rf = node_from_names(chosen, &qis, &cfg.categorical_hierarchies)?;
             log.info(
                 "generalization",
                 &format!(
@@ -334,10 +336,11 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
         log.warn("config", &format!("generalization_node is only used by pass2 — ignored in {pass}"));
     }
 
-    // ── Pre-scan: record count + categorical domains (needed for flow decision) ─
-    log.info("pre_scan", "Scanning chunks for flow selection");
-    let (n_approx, categorical_domains) = scan_chunks_for_flow(&chunk_paths, &qis)?;
-    attach_categorical_levels(&mut qis, &categorical_domains, &cfg.categorical_hierarchies)?;
+    // ── Model: levels, flow decision, OLA-1 ──────────────────────────────────
+    log.info("pre_scan", "Building the model from the scanned ranges and domains");
+    let model = Model::build(&cfg, &stats, None)?;
+    let qis = &model.qis;
+    let categorical_domains = &model.domains;
     for qi in qis.iter().filter(|q| q.is_categorical) {
         if let Some(c) = &qi.categorical_levels {
             log.info(
@@ -346,8 +349,7 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
             );
         }
     }
-    let e = compute_equivalence_space(&qis, &categorical_domains);
-    let n_log_n = (n_approx as f64) * (n_approx as f64).log2().max(0.0);
+    let (n_approx, e, n_log_n) = (stats.rows, model.equivalence_space, model.n_log_n);
 
     // Per-QI breakdown so the flow decision is fully traceable
     // categorical_domains is indexed by QI position (same length as qis)
@@ -379,11 +381,6 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
     );
     log.info("flow", "───────────────────────────────────────────────────");
 
-    let use_direct = match cfg.flow_mode {
-        FlowMode::Auto => n_log_n <= e,
-        FlowMode::Original => false,
-        FlowMode::Direct => true,
-    };
     let mode_label = match cfg.flow_mode {
         FlowMode::Auto => "AUTO",
         FlowMode::Original => "ORIGINAL (forced)",
@@ -393,39 +390,26 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
         "flow",
         &format!(
             "Flow selected: {}  [config flow_mode={}]",
-            if use_direct { "DIRECT" } else { "ORIGINAL" },
+            if model.direct_requested { "DIRECT" } else { "ORIGINAL" },
             mode_label
         ),
     );
 
-    // ── OLA-1 + Sparse Histogram  OR  Z-encoded Direct Histogram ─────────────
+    // ── Histogram ─────────────────────────────────────────────────────────────
     //
-    // DIRECT: build Z histogram (sorted compact array, ~16 bytes/entry).
-    //         Falls back to ORIGINAL if Z weights overflow i64.
-    // ORIGINAL: OLA-1 to find initial coarsening, then SparseHist.
+    // DIRECT: Z histogram (sorted compact array, ~16 bytes/entry) at the finest
+    //         granularity; OLA-1 is skipped. Falls back to ORIGINAL if the Z
+    //         weights overflow i64 (the model has already decided).
+    // ORIGINAL: OLA-1 found the initial coarsening and the histogram is sparse.
     //
-    // After this block, `base_sparse` is always populated (the SparseHist form of
-    // the base histogram) and `z_hist_opt` is Some only in the DIRECT path.
-
-    let actual_use_direct = if use_direct {
-        match compute_z_weights(&qis, &categorical_domains) {
-            Some(_) => true,
-            None => {
-                log.info("flow", "Z weights overflow i64 — falling back to ORIGINAL flow");
-                false
-            }
-        }
-    } else {
-        false
-    };
-
-    enum BaseHist {
-        Sparse(SparseHist),
-        Z(ZHist, Vec<i64>),
+    // The same `Histogram` is what a distributed driver gets by merging the
+    // per-batch ones.
+    let actual_use_direct = model.weights.is_some();
+    let initial_ri = model.initial_ri.clone();
+    if model.direct_requested && !actual_use_direct {
+        log.info("flow", "Z weights overflow i64 — falling back to ORIGINAL flow");
     }
-
-    let (initial_ri, base, total_records) = if actual_use_direct {
-        // DIRECT: RAM constraint log
+    if actual_use_direct {
         let ram = available_ram_bytes().unwrap_or(32_000_000);
         let needed = 16u64.saturating_mul(n_approx as u64);
         if needed > ram / 2 {
@@ -439,7 +423,7 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
             );
         }
         log.info("z_enc", &format!("Direct Z-histogram over {} chunk(s) — OLA-1 skipped", chunk_paths.len()));
-        let weights = compute_z_weights(&qis, &categorical_domains).unwrap();
+        let weights = model.weights.as_ref().expect("DIRECT flow has weights");
 
         // ── Z weight table ────────────────────────────────────────────────────
         log.info("z_enc", "── mixed-radix weights ────────────────────────────────");
@@ -458,71 +442,58 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
             log.info("z_enc", &format!("  {:20}  {:>10}  {:>12}", qi.column_name, r_qi, weights[i]));
         }
         log.info("z_enc", &format!("  {}", "─".repeat(46)));
-
-        let ri = vec![1i64; qis.len()];
-        let (zh, n) = build_z_histogram(&chunk_paths, &qis, &categorical_domains, &weights)?;
-
+    } else {
+        log.info("ola1", &format!("OLA-1: initial RI {:?} (max_eq={:?})", initial_ri, model.max_eq));
+        log.info("histogram", &format!("Building sparse histogram over {} chunk(s)", chunk_paths.len()));
+    }
+    if let Some(l) = &cfg.l_diversity {
+        log.info(
+            "l_diversity",
+            &format!(
+                "Collecting distinct values of {} sensitive attribute(s) for l={}",
+                l.sensitive_attributes.len(),
+                l.l
+            ),
+        );
+    }
+    let mut hist = model.new_histogram();
+    for chunk in &chunk_paths {
+        hist.observe(&model, &Table::from_csv_file(chunk)?)?;
+    }
+    let total_records = hist.total;
+    if total_records == 0 {
+        return Err(crate::pipeline::bootstrap::validation(
+            "GENERALIZATION_FAILED",
+            "No records to anonymize",
+            "the input has a header but no rows",
+        ));
+    }
+    if actual_use_direct {
         // ── Collapse stats ────────────────────────────────────────────────────
-        // n raw Z values sorted → zh.len() unique buckets; compression = n/buckets
-        let compression = if !zh.is_empty() { n as f64 / zh.len() as f64 } else { 1.0 };
+        // n raw Z values sorted → hist.len() unique buckets; compression = n/buckets
+        let n = total_records;
+        let buckets = hist.len();
+        let compression = if buckets > 0 { n as f64 / buckets as f64 } else { 1.0 };
         log.info(
             "z_enc",
-            &format!("{} raw Z values → {} unique buckets (avg {:.1} records/bucket)", n, zh.len(), compression),
+            &format!("{} raw Z values → {} unique buckets (avg {:.1} records/bucket)", n, buckets, compression),
         );
         log.info(
             "z_enc",
             &format!(
                 "Z array: ~{}KB raw  →  ~{}KB collapsed  ({}× smaller)",
                 n * 8 / 1024,
-                zh.len() * 16 / 1024,
-                if !zh.is_empty() { (n * 8) / (zh.len() as i64 * 16).max(1) } else { 1 }
+                buckets * 16 / 1024,
+                if buckets > 0 { (n * 8) / (buckets as i64 * 16).max(1) } else { 1 }
             ),
         );
-
-        log.info("histogram", &format!("{} valid records, {} histogram buckets (Z-encoded)", n, zh.len()));
-        (ri, BaseHist::Z(zh, weights), n)
+        log.info("histogram", &format!("{} valid records, {} histogram buckets (Z-encoded)", n, buckets));
     } else {
-        let max_eq = (available_ram_bytes().unwrap_or(32_000_000) / 32) as i64;
-        log.info("ola1", &format!("OLA-1: finding initial RI (max_eq={})", max_eq));
-        let ri = find_ola1_initial_ri(&qis, chunk_paths.len() as i64, max_eq, &cfg.size_factors)?;
-        log.info("ola1", &format!("Initial RI: {:?}", ri));
-        log.info("histogram", &format!("Building sparse histogram over {} chunk(s)", chunk_paths.len()));
-        let (hist, n) = build_sparse_histogram(&chunk_paths, &qis, &ri, &categorical_domains)?;
-        log.info("histogram", &format!("{} valid records, {} histogram buckets", n, hist.len()));
-        (ri, BaseHist::Sparse(hist), n)
-    };
-
-    // Convert to SparseHist for diagnostics, parameter grid, pass1, and eq_stats.
-    // In DIRECT flow this conversion is only done once here and reused.
-    let base_sparse: SparseHist = match &base {
-        BaseHist::Sparse(h) => h.clone(),
-        BaseHist::Z(zh, w) => z_hist_to_sparse(zh, &qis, w),
-    };
-
-    // ── l-diversity: distinct sensitive values per base cell ─────────────────
-    let sensitive_sets = match &cfg.l_diversity {
-        Some(l) => {
-            log.info(
-                "l_diversity",
-                &format!(
-                    "Collecting distinct values of {} sensitive attribute(s) for l={}",
-                    l.sensitive_attributes.len(),
-                    l.l
-                ),
-            );
-            Some(build_sensitive_sets(
-                &chunk_paths,
-                &qis,
-                &initial_ri,
-                &categorical_domains,
-                &l.sensitive_attributes,
-                l.l,
-            )?)
-        }
-        None => None,
-    };
+        log.info("histogram", &format!("{} valid records, {} histogram buckets", total_records, hist.len()));
+    }
 
     // ── Histogram diagnostic ─────────────────────────────────────────────────
+    let base_sparse: SparseHist = hist.to_sparse(&model);
     let diag_label = if actual_use_direct { "Base Z-histogram (decoded)" } else { "Base histogram" };
     log_histogram_diagnostic(&mut log, "hist_diag", diag_label, &base_sparse);
 
@@ -534,23 +505,7 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
         vec![]
     } else if cfg.compute_param_grid {
         log.info("parameter_grid", "Computing k × suppression_limit parameter grid (multi-combination OLA-2)");
-        let grid = match (&base, &sensitive_sets, &cfg.l_diversity) {
-            (_, Some(sens), Some(l)) => compute_parameter_grid_for(
-                &qis,
-                &initial_ri,
-                &cfg.size_factors,
-                total_records,
-                GRID_K_VALUES,
-                GRID_SUPPRESSION_LIMITS,
-                |node| l_aware_class_sizes(&base_sparse, sens, &qis, node, l.l),
-            )?,
-            (BaseHist::Z(zh, w), _, _) => {
-                compute_parameter_grid_z(&qis, zh, w, &initial_ri, &cfg.size_factors, total_records)?
-            }
-            (BaseHist::Sparse(h), _, _) => {
-                compute_parameter_grid(&qis, h, &initial_ri, &cfg.size_factors, total_records)?
-            }
-        };
+        let grid = model.parameter_grid(&hist)?;
         log.info(
             "parameter_grid",
             &format!(
@@ -592,7 +547,7 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
 
     // ── Pass 1: compute k_optimal and return ─────────────────────────────────
     if pass == "pass1" {
-        let k_optimal = compute_k_optimal(&qis, &base_sparse, cfg.suppression_limit, total_records);
+        let k_optimal = compute_k_optimal(qis, &base_sparse, cfg.suppression_limit, total_records);
         log.info("pass1", &format!("k_optimal={} (suppression_limit={:.3})", k_optimal, cfg.suppression_limit));
         log.info("startup", "Pass 1 complete — awaiting k input");
 
@@ -623,32 +578,7 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
     }
 
     log.info("ola2", &format!("OLA-2: lattice search (k={}, suppression_limit={:.3})", cfg.k, cfg.suppression_limit));
-    let ola2 = match (&base, &sensitive_sets, &cfg.l_diversity) {
-        (_, Some(sens), Some(l)) => {
-            find_ola2_with(&qis, &initial_ri, &cfg.size_factors, cfg.k, cfg.suppression_limit, total_records, |node| {
-                l_aware_class_sizes(&base_sparse, sens, &qis, node, l.l)
-            })?
-        }
-        (BaseHist::Z(zh, w), _, _) => find_ola2_best_rf_z_detailed(
-            &qis,
-            zh,
-            w,
-            &initial_ri,
-            &cfg.size_factors,
-            cfg.k,
-            cfg.suppression_limit,
-            total_records,
-        )?,
-        (BaseHist::Sparse(h), _, _) => find_ola2_best_rf_detailed(
-            &qis,
-            h,
-            &initial_ri,
-            &cfg.size_factors,
-            cfg.k,
-            cfg.suppression_limit,
-            total_records,
-        )?,
-    };
+    let ola2 = model.search(&hist, cfg.k, cfg.suppression_limit)?;
     let final_rf = ola2.best_rf.clone();
     let lowest_dm_star = ola2.lowest_dm_star;
     let num_equivalence_classes = ola2.num_equivalence_classes;
@@ -677,13 +607,7 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
     log.info("ola2_trace", &format!("  {}", "─".repeat(75)));
 
     // ── Merged histogram at best RF ───────────────────────────────────────────
-    let merged_sparse = match &base {
-        BaseHist::Z(zh, w) => {
-            let merged_z = merge_z_histogram(zh, &qis, w, &final_rf);
-            z_hist_to_sparse(&merged_z, &qis, w)
-        }
-        BaseHist::Sparse(h) => merge_histogram(h, &qis, &final_rf),
-    };
+    let merged_sparse = merge_histogram(&base_sparse, qis, &final_rf);
     let merged_label = if actual_use_direct {
         format!("Merged Z-histogram at best RF {:?}", final_rf)
     } else {
@@ -695,7 +619,7 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
         &mut log,
         &cfg,
         &chunk_paths,
-        &qis,
+        qis,
         &final_rf,
         &output_dir_path,
         &restore_plan,
@@ -745,47 +669,6 @@ fn run_pipeline_inner(paths: &Paths) -> Result<StatusPayload, PipelineError> {
         error: None,
         log_file: log_file.clone(),
     })
-}
-
-/// Maps pass2's `generalization_node` onto QI order, and checks that it names
-/// every QI, nothing else, and only levels each QI actually has.
-fn resolve_generalization_node(
-    chosen: &BTreeMap<String, i64>,
-    qis: &[QuasiIdentifierLite],
-    cfg: &RuntimeConfig,
-) -> Result<Vec<i64>, PipelineError> {
-    let invalid = |message: &str, details: String| {
-        crate::pipeline::bootstrap::validation("CONFIG_INVALID_VALUE", message, &details)
-    };
-    let names_qi = |col: &str| qis.iter().any(|q| q.column_name == col);
-    let unknown: Vec<&str> = chosen.keys().map(String::as_str).filter(|c| !names_qi(c)).collect();
-    if !unknown.is_empty() {
-        return Err(invalid("generalization_node names columns that are not quasi-identifiers", unknown.join(", ")));
-    }
-
-    let mut final_rf = Vec::with_capacity(qis.len());
-    for qi in qis {
-        let level = chosen
-            .get(&qi.column_name)
-            .copied()
-            .ok_or_else(|| invalid("generalization_node is missing a quasi-identifier", qi.column_name.clone()))?;
-        let max_level = if let Some(h) = &qi.interval_hierarchy {
-            h.num_levels as i64
-        } else if qi.is_categorical {
-            categorical_ladder_len(&qi.column_name, &cfg.categorical_hierarchies) as i64 + 2
-        } else {
-            let (mn, mx) = (qi.min_value.unwrap_or(0.0), qi.max_value.unwrap_or(0.0));
-            ((mx.round() - mn.floor() + 1.0) as i64).max(1)
-        };
-        if level > max_level {
-            return Err(invalid(
-                "generalization_node level is beyond what this quasi-identifier supports",
-                format!("{}: {} (max {})", qi.column_name, level, max_level),
-            ));
-        }
-        final_rf.push(level);
-    }
-    Ok(final_rf)
 }
 
 /// Everything pass 2 writes once the generalization node is known.

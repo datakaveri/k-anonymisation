@@ -107,18 +107,30 @@ impl KeyMaterial {
                 column,
             ));
         }
-        self.map_mut(kind).insert(column.to_string(), hex::encode(bytes));
+        self.map_mut(kind).insert(column.to_string(), ::hex::encode(bytes));
         Ok(())
     }
 
-    /// Sets the key for `column` from the hex string a key file holds.
-    pub(crate) fn insert_hex(&mut self, kind: KeyKind, column: &str, hex: String) {
+    /// Sets the key for `column` from the hex string a key file holds,
+    /// without checking it: a key file's contents are used as they always were
+    /// and a malformed salt is reported when it is first used.
+    pub(crate) fn insert_raw(&mut self, kind: KeyKind, column: &str, hex: String) {
         self.map_mut(kind).insert(column.to_string(), hex);
+    }
+
+    /// Sets the key for `column` from lowercase or uppercase hex.
+    ///
+    /// # Errors
+    /// `KEY_MATERIAL_INVALID` when it is not hex of the length `kind` needs.
+    pub fn insert_hex(&mut self, kind: KeyKind, column: &str, hex: &str) -> Result<(), PipelineError> {
+        let bytes = ::hex::decode(hex)
+            .map_err(|_| validation("KEY_MATERIAL_INVALID", &format!("A {} must be hex", kind.as_str()), column))?;
+        self.insert(kind, column, &bytes)
     }
 
     /// The key for `column` as raw bytes, if present.
     pub fn bytes(&self, kind: KeyKind, column: &str) -> Option<Vec<u8>> {
-        hex::decode(self.map(kind).get(column)?).ok()
+        ::hex::decode(self.map(kind).get(column)?).ok()
     }
 
     pub fn contains(&self, kind: KeyKind, column: &str) -> bool {
@@ -149,7 +161,7 @@ impl KeyMaterial {
                 KeyKind::HmacSalt => generate_random_salt_hex()?,
                 KeyKind::AesKey | KeyKind::FpeKey => generate_random_key_hex()?,
             };
-            self.insert_hex(*kind, column, k);
+            self.insert_raw(*kind, column, k);
             made.push((*kind, column.clone()));
         }
         Ok(made)
