@@ -23,6 +23,8 @@
 //! 8. [`Generalizer::tally`] on the written rows and [`Tally::verify`] — the
 //!    final k check.
 
+#[cfg(feature = "arrow")]
+pub mod arrow_io;
 pub mod generalise;
 pub mod histogram;
 pub mod model;
