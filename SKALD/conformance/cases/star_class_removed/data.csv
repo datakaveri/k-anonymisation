@@ -1,0 +1,121 @@
+id,name,phone,email,age,pin,gender,blood,diagnosis,note
+P1000,Rahul Sharma,9620801967,rahul.sharma0@example.org,66,560010,M,A+,Hypertension,allergic to penicillin
+P1001,Arjun Patel,9926931358,arjun.patel1@example.org,19,560010,F,B-,Cancer,allergic to penicillin
+P1002,Anita Sharma,9307215935,anita.sharma2@example.org,54,560066,F,A-,Anaemia,referred
+P1003,Ravi Patel,9959297026,ravi.patel3@example.org,n/a,560100,F,AB-,Cancer,stable
+P1004,Kiran Nair,9204744504,kiran.nair4@example.org,78,560001,M,O-,Anaemia,"follow-up, 2 weeks"
+P1005,Anita Kumar,9780192309,anita.kumar5@example.org,99,560100,F,AB-,Asthma,stable
+P1006,Ravi Iyer,9225439233,ravi.iyer6@example.org,56,560095,F,O+,Cancer,"follow-up, 2 weeks"
+P1007,Priya Das,9339163888,priya.das7@example.org,26,,M,A+,Hypertension,"follow-up, 2 weeks"
+P1008,Asha Patel,9698874971,asha.patel8@example.org,75,560095,F,O-,Anaemia,allergic to penicillin
+P1009,Divya Reddy,9828780303,divya.reddy9@example.org,17,560001,M,AB-,Malaria,allergic to penicillin
+P1010,Ravi Das,9363400723,ravi.das10@example.org,69,560001,F,AB-,Anaemia,stable
+P1011,Anita Singh,9605657027,anita.singh11@example.org,37,560095,F, O+ ,Hypertension,referred
+P1012,Suresh Das,9875915185,suresh.das12@example.org,68,560002,M,A+,Malaria,stable
+P1013,Divya Patel,9301390018,divya.patel13@example.org,34,560066,F,O-,Malaria,"said ""ok"", left"
+P1014,Priya Singh,9757320220,priya.singh14@example.org,49,560010,F,AB-,Anaemia,"follow-up, 2 weeks"
+P1015,Priya Das,9428214451,priya.das15@example.org,58,560100,F,O-,Asthma,"follow-up, 2 weeks"
+P1016,Rahul Singh,9845662501,rahul.singh16@example.org,56,560010,F,AB+,Anaemia,"follow-up, 2 weeks"
+P1017,Divya Kumar,9769782956,divya.kumar17@example.org,46,560001,M,A+,Malaria,stable
+P1018,Arjun Patel,9634122895,arjun.patel18@example.org,72,560066,M,B-,Hypertension,referred
+P1019,Rahul Kumar,9553238887,rahul.kumar19@example.org,69,560100,F,A-,Anaemia,"follow-up, 2 weeks"
+P1020,Ravi Patel,9488664479,ravi.patel20@example.org,79,560002,M,O-,Hypertension,stable
+P1021,Ravi Sharma,9148603128,ravi.sharma21@example.org,59,560034,F,A-,Cancer,stable
+P1022,Anita Reddy,9762087793,anita.reddy22@example.org,71,560001,M,O+,Cancer,allergic to penicillin
+P1023,Suresh Kumar,9949686777,suresh.kumar23@example.org,58,560002,M,AB-,Anaemia,allergic to penicillin
+P1024,Suresh Nair,9612638513,suresh.nair24@example.org,63,560066,M,O+,Asthma,referred
+P1025,Arjun Kumar,9189852601,arjun.kumar25@example.org,50,560100,F,O+,Asthma,allergic to penicillin
+P1026,Priya Das,9498846624,priya.das26@example.org,20,560095,M,B-,Malaria,"follow-up, 2 weeks"
+P1027,Anita Kumar,9893543245,anita.kumar27@example.org,29,560010,F,A+,Diabetes,"follow-up, 2 weeks"
+P1028,Priya Patel,9183316793,priya.patel28@example.org,28,560095,M,AB+,Malaria,"follow-up, 2 weeks"
+P1029,Suresh Das,9786554074,suresh.das29@example.org,22,560002,M,O-,Malaria,stable
+P1030,Meena Reddy,9297253589,meena.reddy30@example.org,36,560095,M,AB+,Hypertension,"follow-up, 2 weeks"
+P1031,Rahul Reddy,9550038583,rahul.reddy31@example.org,62,560002,F,B-,Malaria,stable
+P1032,Rahul Singh,9302020470,rahul.singh32@example.org,66,560010,F,AB-,Diabetes,allergic to penicillin
+P1033,Anita Reddy,9869199026,anita.reddy33@example.org,32,560095,F,O+,Cancer,"follow-up, 2 weeks"
+P1034,Meena Reddy,9841146034,meena.reddy34@example.org,58,560002,F,A-,Diabetes,stable
+P1035,Asha Das,9914933113,asha.das35@example.org,21,560001,M,O-,Malaria,stable
+P1036,Asha Iyer,9944398942,asha.iyer36@example.org,44,560002,F,A-,Anaemia,stable
+P1037,Rahul Kumar,9281045800,rahul.kumar37@example.org,75,560095,F,A-,Diabetes,"follow-up, 2 weeks"
+P1038,Asha Kumar,9905427971,asha.kumar38@example.org,71,560095,F,O+,Asthma,allergic to penicillin
+P1039,Kiran Iyer,9975974974,kiran.iyer39@example.org,72,560095,M,O+,Malaria,stable
+P1040,Divya Patel,9934314622,divya.patel40@example.org,51,560001,M,O-,Asthma,stable
+P1041,Kiran Kumar,9486939506,kiran.kumar41@example.org,76,560095,F,AB+,Cancer,stable
+P1042,Arjun Reddy,9132638940,arjun.reddy42@example.org,18,560010,M,AB-,Diabetes,allergic to penicillin
+P1043,Divya Sharma,9827041277,divya.sharma43@example.org,55,560066,F,B-,Hypertension,"follow-up, 2 weeks"
+P1044,Priya Reddy,9360881676,priya.reddy44@example.org,60,560034,F,AB-,Asthma,referred
+P1045,Meena Nair,9135284865,meena.nair45@example.org,30,560100,F,A-,Hypertension,stable
+P1046,Asha Reddy,9228754314,asha.reddy46@example.org,27,560066,F,AB-,Anaemia,allergic to penicillin
+P1047,Kiran Singh,9265732172,kiran.singh47@example.org,67,560034,M,O-,Anaemia,referred
+P1048,Arjun Reddy,9406856217,arjun.reddy48@example.org,41,560066,F,B-,Diabetes,referred
+P1049,Meena Sharma,9537709659,meena.sharma49@example.org,57,560066,M,A-,Hypertension,allergic to penicillin
+P1050,Priya Reddy,9908629729,priya.reddy50@example.org,76,560100,M,A+,Malaria,allergic to penicillin
+P1051,Arjun Patel,9864927973,arjun.patel51@example.org,55,560034,F,A-,Asthma,"follow-up, 2 weeks"
+P1052,Asha Sharma,9732392447,asha.sharma52@example.org,56,560066,M,A-,Cancer,stable
+P1053,Ravi Sharma,9332056925,ravi.sharma53@example.org,40,560010,M,B-,Hypertension,"follow-up, 2 weeks"
+P1054,Kiran Reddy,9614402924,kiran.reddy54@example.org,65,560034,M,B+,Anaemia,"follow-up, 2 weeks"
+P1055,Rahul Patel,9888109600,rahul.patel55@example.org,27,560010,F,A-,Asthma,stable
+P1056,Asha Kumar,9615032760,asha.kumar56@example.org,58,560034,F,A+,Diabetes,referred
+P1057,Ravi Singh,9769839051,ravi.singh57@example.org,39,560001,F,B+,Hypertension,referred
+P1058,Suresh Singh,9945597346,suresh.singh58@example.org,19,560066,M,A-,Anaemia,referred
+P1059,Asha Reddy,9828441522,asha.reddy59@example.org,53,560034,F,A-,Anaemia,stable
+P1060,Priya Iyer,9953089805,priya.iyer60@example.org,52,560100,M,AB-,Asthma,referred
+P1061,Anita Patel,9415994461,anita.patel61@example.org,52,560095,F,AB-,Malaria,stable
+P1062,Anita Iyer,9810323592,anita.iyer62@example.org,57,560001,F,O+,Hypertension,stable
+P1063,Arjun Kumar,9325327650,arjun.kumar63@example.org,54,560010,M,B+,Asthma,stable
+P1064,Divya Nair,9854289976,divya.nair64@example.org,74,560010,M,B+,Malaria,stable
+P1065,Ravi Patel,9719603523,ravi.patel65@example.org,29,560010,M,AB-,Cancer,"follow-up, 2 weeks"
+P1066,Suresh Singh,9687325419,suresh.singh66@example.org,57,560010,M,A-,Anaemia,stable
+P1067,Rahul Iyer,9753864825,rahul.iyer67@example.org,46,560010,M,A+,Anaemia,referred
+P1068,Anita Nair,9787651513,anita.nair68@example.org,41,560010,F,O-,Diabetes,allergic to penicillin
+P1069,Meena Nair,9165527176,meena.nair69@example.org,59,560066,F,A+,Diabetes,stable
+P1070,Asha Das,9562305873,asha.das70@example.org,52,560001,M,O+,Asthma,stable
+P1071,Ravi Nair,9867637628,ravi.nair71@example.org,37,560010,F,AB+,Malaria,stable
+P1072,Ravi Nair,9960865422,ravi.nair72@example.org,49,560034,F,O+,Hypertension,stable
+P1073,Asha Singh,9264673059,asha.singh73@example.org,32,560100,F,A+,Diabetes,referred
+P1074,Meena Sharma,9133231446,meena.sharma74@example.org,43,560010,F,B-,Diabetes,referred
+P1075,Meena Reddy,9265106781,meena.reddy75@example.org,24,560100,M,B-,Malaria,referred
+P1076,Priya Das,9757111311,priya.das76@example.org,54,560034,F,O-,Malaria,allergic to penicillin
+P1077,Kiran Reddy,9671153422,kiran.reddy77@example.org,25,560002,M,AB+,Hypertension,referred
+P1078,Suresh Nair,9736007913,suresh.nair78@example.org,71,560066,M,B-,Cancer,stable
+P1079,Priya Iyer,9525796441,priya.iyer79@example.org,54,560095,M,A+,Asthma,referred
+P1080,Suresh Nair,9568203611,suresh.nair80@example.org,42,560010,F,O-,Malaria,stable
+P1081,Priya Reddy,9427398086,priya.reddy81@example.org,36,560066,F,B-,Diabetes,allergic to penicillin
+P1082,Rahul Reddy,9493462272,rahul.reddy82@example.org,54,560034,F,O-,Diabetes,allergic to penicillin
+P1083,Priya Das,9112773484,priya.das83@example.org,72,560001,M,AB-,Anaemia,stable
+P1084,Asha Patel,9489174053,asha.patel84@example.org,28,560002,F,A-,Anaemia,stable
+P1085,Asha Patel,9976685990,asha.patel85@example.org,59,560002,F,O+,Anaemia,referred
+P1086,Asha Patel,9548958276,asha.patel86@example.org,37,560002,F,O-,Diabetes,stable
+P1087,Anita Iyer,9107006899,anita.iyer87@example.org,67,560001,M,AB-,Cancer,stable
+P1088,Anita Singh,9619144870,anita.singh88@example.org,38,560034,M,B-,Asthma,"follow-up, 2 weeks"
+P1089,Ravi Iyer,9153298513,ravi.iyer89@example.org,77,560002,F,AB+,Hypertension,referred
+P1090,Suresh Patel,9261155291,suresh.patel90@example.org,41,560095,F,B-,Cancer,stable
+P1091,Anita Iyer,9315606209,anita.iyer91@example.org,43,560066,M,AB+,Cancer,stable
+P1092,Ravi Sharma,9227603688,ravi.sharma92@example.org,61,560066,M,A-,Malaria,allergic to penicillin
+P1093,Arjun Reddy,9573409385,arjun.reddy93@example.org,31,560100,M,B-,Asthma,"follow-up, 2 weeks"
+P1094,Anita Nair,9261282653,anita.nair94@example.org,56,560001,M,O+,Diabetes,allergic to penicillin
+P1095,Anita Iyer,9814077515,anita.iyer95@example.org,31,560095,F,AB-,Diabetes,allergic to penicillin
+P1096,Rahul Reddy,9248187353,rahul.reddy96@example.org,60,560066,M,O+,Anaemia,referred
+P1097,Priya Kumar,9570695708,priya.kumar97@example.org,31,560002,F,B-,Cancer,allergic to penicillin
+P1098,Arjun Kumar,9800260059,arjun.kumar98@example.org,76,560010,F,O-,Anaemia,allergic to penicillin
+P1099,Arjun Singh,9997258670,arjun.singh99@example.org,36,560100,M,O+,Cancer,"follow-up, 2 weeks"
+P1100,Rahul Das,9638306513,rahul.das100@example.org,29,560095,M,B+,Diabetes,"follow-up, 2 weeks"
+P1101,Anita Nair,9598911042,anita.nair101@example.org,56,560001,M,O+,Diabetes,stable
+P1102,Suresh Singh,9233581640,suresh.singh102@example.org,40,560010,M,O+,Malaria,stable
+P1103,Rahul Nair,9952894129,rahul.nair103@example.org,67,560100,M,O+,Cancer,referred
+P1104,Ravi Patel,9228784149,ravi.patel104@example.org,55,560066,M,B-,Asthma,"follow-up, 2 weeks"
+P1105,Kiran Sharma,9562490823,kiran.sharma105@example.org,75,560001,F,O-,Hypertension,allergic to penicillin
+P1106,Priya Kumar,9163399721,priya.kumar106@example.org,29,560095,M,B-,Asthma,"follow-up, 2 weeks"
+P1107,Divya Reddy,9751324697,divya.reddy107@example.org,40,560010,F,B-,Hypertension,stable
+P1108,Meena Das,9158913465,meena.das108@example.org,25,560001,M,O-,Asthma,allergic to penicillin
+P1109,Priya Nair,9656305954,priya.nair109@example.org,66,560002,F,AB+,Asthma,allergic to penicillin
+P1110,Priya Iyer,9153508896,priya.iyer110@example.org,73,560095,M,AB+,Cancer,allergic to penicillin
+P1111,Ravi Das,9456633246,ravi.das111@example.org,55,560066,M,A-,Cancer,stable
+P1112,Ravi Iyer,9320576767,ravi.iyer112@example.org,49,560095,M,A+,Asthma,"follow-up, 2 weeks"
+P1113,Asha Kumar,9521653577,asha.kumar113@example.org,18,560010,F,A-,Hypertension,allergic to penicillin
+P1114,Meena Kumar,9116063904,meena.kumar114@example.org,48,560095,F,B-,Hypertension,allergic to penicillin
+P1115,Priya Singh,9700016875,priya.singh115@example.org,33,560010,M,A-,Cancer,allergic to penicillin
+P1116,Suresh Kumar,9332172009,suresh.kumar116@example.org,36,560066,F,A-,Malaria,referred
+P1117,Kiran Patel,9928693889,kiran.patel117@example.org,56,560010,F,O+,Anaemia,allergic to penicillin
+P1118,Arjun Das,9474010320,arjun.das118@example.org,30,560001,F,O+,Diabetes,"follow-up, 2 weeks"
+P1119,Arjun Kumar,9183709847,arjun.kumar119@example.org,64,560001,M,A+,Malaria,referred

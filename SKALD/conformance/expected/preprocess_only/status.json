@@ -1,0 +1,132 @@
+{
+  "log_file": "<ROOT>/output/pipeline.log",
+  "outputs": {
+    "chunk_count": 1,
+    "database_sink": null,
+    "final_output_path": "<ROOT>/output/anonymized.csv",
+    "format_matched_output_path": null,
+    "pass": "preprocess_only",
+    "preprocessing": {
+      "encrypt:email": 60,
+      "encrypt_fpe:phone": 60,
+      "hashing_with_salt:id": 60,
+      "masking:note": 60,
+      "suppress:name": 60
+    },
+    "restored_workbook_path": null,
+    "sample_generalized_rows": [
+      {
+        "age": "59",
+        "blood": "A-",
+        "diagnosis": "Asthma",
+        "email": "ENC1$581f5d9761a83bdd81c05616506473c0ef242485fc0a7c28e8ee25a22cd81b133fb0d9d889ffe8a8",
+        "gender": "M",
+        "id": "744ec2b6951bf24ae528bfb12179173e231937010246ec96c2687b3b567ff608",
+        "note": "###ble",
+        "phone": "7530264799",
+        "pin": "560001"
+      },
+      {
+        "age": "23",
+        "blood": "A-",
+        "diagnosis": "Hypertension",
+        "email": "ENC1$7180f4611cc8d48dc297b102c3248994e4dcaf243d75fa6098d4ae30016e8c12cba336698d7d43",
+        "gender": "F",
+        "id": "7665191ce129908970618a76f5057150ae82cd7071b6a940bf638b34febb912f",
+        "note": "###ble",
+        "phone": "7219319716",
+        "pin": "560034"
+      },
+      {
+        "age": "70",
+        "blood": "B-",
+        "diagnosis": "Cancer",
+        "email": "ENC1$73e3ea384f52c25a4ad7a81989d02a335ad77c71245c69fde264048da1f747fb4728797711bbd973",
+        "gender": "M",
+        "id": "8b4d7d5551d0ac0d36bf613ab84f7a34e4b77e8da0c0e70b19e9a106876aa00d",
+        "note": "###ble",
+        "phone": "5009281280",
+        "pin": "560066"
+      },
+      {
+        "age": "n/a",
+        "blood": "O+",
+        "diagnosis": "Anaemia",
+        "email": "ENC1$b47f8ce79ac31bbbacd5d816aa2954b08aab1c94f4569a6a2d194c3b3381451dfd65476c4c75af67",
+        "gender": "M",
+        "id": "8d0395a7c302e0cdb6506fa6779f2ccaea33055ee1ed840283dc66225531f7fd",
+        "note": "###low-up, 2 weeks",
+        "phone": "8388763252",
+        "pin": "560001"
+      },
+      {
+        "age": "37",
+        "blood": "A-",
+        "diagnosis": "Malaria",
+        "email": "ENC1$40a6c677c014d4d37d0ddeb04dc084d3830e8960c6386c84d6b38c54f8e3ccf6018d484cddbe969fe3",
+        "gender": "M",
+        "id": "cf4a48a037a20f2c8ca332b2e985d84e83c1913589e88c33ed95c90b5bc8b355",
+        "note": "###low-up, 2 weeks",
+        "phone": "1597985085",
+        "pin": "560066"
+      },
+      {
+        "age": "99",
+        "blood": "AB-",
+        "diagnosis": "Anaemia",
+        "email": "ENC1$fd74b51cbfce51f2f7f3699e0dac4d172c7cf1968a18b258b38ca92a583a06cf85115b6b8b78fba5d9",
+        "gender": "F",
+        "id": "40e15d5fb24c6ea2eb4a2843d3ed461158d8a872d429b90848925ac945c47094",
+        "note": "###ergic to penicillin",
+        "phone": "7720136333",
+        "pin": "560100"
+      },
+      {
+        "age": "77",
+        "blood": "O+",
+        "diagnosis": "Hypertension",
+        "email": "ENC1$40485523dc528169a28fa7d8f722394d7bb90b39f98351dcf7fa392ce2cc1499ab164de7904a",
+        "gender": "F",
+        "id": "283bebb39677054d073340828738bea3c8e0af012fbc8e111c961e202c7f49d9",
+        "note": "###low-up, 2 weeks",
+        "phone": "4368145126",
+        "pin": "560034"
+      },
+      {
+        "age": "37",
+        "blood": "O-",
+        "diagnosis": "Cancer",
+        "email": "ENC1$09acc7693e52ca5e14c167a489358661b59c281327972805d5f6081b7bdfd3debfac2120b484d26908",
+        "gender": "F",
+        "id": "bc291f908e6712eaa9d3f0f00c212b21379b07beefac5e03e6651bdc9e9646cb",
+        "note": "###ergic to penicillin",
+        "phone": "6484043248",
+        "pin": ""
+      },
+      {
+        "age": "50",
+        "blood": "O-",
+        "diagnosis": "Hypertension",
+        "email": "ENC1$e534f44353c91891c9d303c87ae5acf725fe7398daeb045159cb0c987c73c9150bec46fa3d9b4e42e3",
+        "gender": "M",
+        "id": "8f86c3fa5222066251c5458a4f9f4deaa7406cbd54366f75f0cfc6a635eb9301",
+        "note": "###ergic to penicillin",
+        "phone": "2135077071",
+        "pin": "560034"
+      },
+      {
+        "age": "17",
+        "blood": "AB-",
+        "diagnosis": "Cancer",
+        "email": "ENC1$66b6096d6ee5f76fd165d05406ae37ad4ffa1150c9ac9597aab5cc6bb6932061e4aa2c48c078e8d1",
+        "gender": "M",
+        "id": "b27eaae2063cf1b472873779e15132b90f765813332dde78a6262505257714cd",
+        "note": "###erred",
+        "phone": "4035652759",
+        "pin": "560001"
+      }
+    ]
+  },
+  "phase": "done",
+  "status": "success"
+}

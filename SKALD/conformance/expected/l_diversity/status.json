@@ -1,0 +1,454 @@
+{
+  "log_file": "<ROOT>/output/pipeline.log",
+  "outputs": {
+    "anonymisation_summary": {
+      "allowed_suppressions": 15,
+      "class_size_max": 15,
+      "class_size_mean": 9.28,
+      "class_size_median": 9,
+      "class_size_min": 4,
+      "classes_failing_k": 3,
+      "classes_failing_l": 0,
+      "dm_star": 2979,
+      "equivalence_classes": 32,
+      "k": 4,
+      "l": 2,
+      "published_suppressed_records": 0,
+      "removed_records": 3,
+      "sensitive_attributes": [
+        "diagnosis"
+      ],
+      "suppressed_records": 3,
+      "suppression_limit": 0.05,
+      "t_closeness": "not implemented",
+      "total_records": 300
+    },
+    "chunk_count": 1,
+    "database_sink": null,
+    "equivalence_class_stats": {
+      "10": 4,
+      "11": 5,
+      "12": 1,
+      "13": 1,
+      "14": 2,
+      "15": 1,
+      "4": 1,
+      "5": 3,
+      "7": 3,
+      "8": 5,
+      "9": 6
+    },
+    "equivalence_space": 132800.0,
+    "final_output_path": "<ROOT>/output/anonymized.csv",
+    "final_rf": [
+      4,
+      100,
+      1,
+      3
+    ],
+    "flow": "DIRECT_Z",
+    "format_matched_output_path": null,
+    "initial_ri": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "interval_qi_count": 0,
+    "lattice_size": 144,
+    "lowest_dm_star": 2979,
+    "max_equivalence_classes": null,
+    "n_approx": 300,
+    "n_log2_n": 2468.6456071487646,
+    "nodes_evaluated": 35,
+    "num_equivalence_classes": 32,
+    "output_path": "anonymized.csv",
+    "parameter_grid": [
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 5,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          64,
+          1,
+          2,
+          2
+        ],
+        "dm_star": 3351,
+        "feasible": true,
+        "generalization_node": {
+          "age": 64,
+          "blood": 2,
+          "gender": 2,
+          "pin": 1
+        },
+        "k": 5,
+        "num_equivalence_classes": 28,
+        "suppression_count": 3,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          4,
+          100,
+          1,
+          3
+        ],
+        "dm_star": 2963,
+        "feasible": true,
+        "generalization_node": {
+          "age": 4,
+          "blood": 3,
+          "gender": 1,
+          "pin": 100
+        },
+        "k": 5,
+        "num_equivalence_classes": 31,
+        "suppression_count": 7,
+        "suppression_limit": 0.1
+      },
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 10,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          4,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 5691,
+        "feasible": true,
+        "generalization_node": {
+          "age": 4,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 10,
+        "num_equivalence_classes": 16,
+        "suppression_count": 3,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          4,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 5691,
+        "feasible": true,
+        "generalization_node": {
+          "age": 4,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 10,
+        "num_equivalence_classes": 16,
+        "suppression_count": 3,
+        "suppression_limit": 0.1
+      },
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 50,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          32,
+          100,
+          1,
+          3
+        ],
+        "dm_star": 22099,
+        "feasible": true,
+        "generalization_node": {
+          "age": 32,
+          "blood": 3,
+          "gender": 1,
+          "pin": 100
+        },
+        "k": 50,
+        "num_equivalence_classes": 4,
+        "suppression_count": 3,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          32,
+          100,
+          1,
+          3
+        ],
+        "dm_star": 22099,
+        "feasible": true,
+        "generalization_node": {
+          "age": 32,
+          "blood": 3,
+          "gender": 1,
+          "pin": 100
+        },
+        "k": 50,
+        "num_equivalence_classes": 4,
+        "suppression_count": 3,
+        "suppression_limit": 0.1
+      },
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 100,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          32,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 44109,
+        "feasible": true,
+        "generalization_node": {
+          "age": 32,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 100,
+        "num_equivalence_classes": 2,
+        "suppression_count": 3,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          32,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 44109,
+        "feasible": true,
+        "generalization_node": {
+          "age": 32,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 100,
+        "num_equivalence_classes": 2,
+        "suppression_count": 3,
+        "suppression_limit": 0.1
+      }
+    ],
+    "pass": "no_bounds",
+    "preprocessing": {
+      "encrypt:email": 300,
+      "encrypt_fpe:phone": 300,
+      "hashing_with_salt:id": 300,
+      "masking:note": 300,
+      "suppress:name": 300
+    },
+    "quasi_identifier_count": 4,
+    "removed_records": 3,
+    "restored_workbook_path": null,
+    "sample_generalized_rows": [
+      {
+        "age": "[61-64]",
+        "blood": "*",
+        "diagnosis": "Diabetes",
+        "email": "ENC1$d4ab10aa12f0ca37fd761cbf7638b49ef0530c7c8e063e13dd46bd7985bf616b2adee1e49e5920",
+        "gender": "F",
+        "id": "744ec2b6951bf24ae528bfb12179173e231937010246ec96c2687b3b567ff608",
+        "note": "###ble",
+        "phone": "4874209859",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[73-76]",
+        "blood": "*",
+        "diagnosis": "Malaria",
+        "email": "ENC1$236712ea04431004f01e7682ad3c06ab08c43864fd6c3d15f0d75e9a67b1ec532f6b10183e0b42",
+        "gender": "M",
+        "id": "7665191ce129908970618a76f5057150ae82cd7071b6a940bf638b34febb912f",
+        "note": "###erred",
+        "phone": "7036221033",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[21-24]",
+        "blood": "*",
+        "diagnosis": "Cancer",
+        "email": "ENC1$14b5f80fa120bf9c13dcc9eb94e735c60f29685c6571bc0f491367df2b6c6287aa838be27d50423c",
+        "gender": "M",
+        "id": "8b4d7d5551d0ac0d36bf613ab84f7a34e4b77e8da0c0e70b19e9a106876aa00d",
+        "note": "###erred",
+        "phone": "5741950715",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[33-36]",
+        "blood": "*",
+        "diagnosis": "Malaria",
+        "email": "ENC1$4ca3316c791b7f9176c3ecccdeabb008f02ffe8d4b5d12b019aced4ec9ec6f1b917610017f3590",
+        "gender": "F",
+        "id": "cf4a48a037a20f2c8ca332b2e985d84e83c1913589e88c33ed95c90b5bc8b355",
+        "note": "###erred",
+        "phone": "8873942917",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[29-32]",
+        "blood": "*",
+        "diagnosis": "Diabetes",
+        "email": "ENC1$fbc6da38ef2472c3d738bc17afdcf93b893c18908330962dff00bb8bb2b121d8296db6755f16",
+        "gender": "F",
+        "id": "283bebb39677054d073340828738bea3c8e0af012fbc8e111c961e202c7f49d9",
+        "note": "###ble",
+        "phone": "1563095018",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[57-60]",
+        "blood": "*",
+        "diagnosis": "Hypertension",
+        "email": "ENC1$3b32fe1ea51d5f1e7c36b25ed98dc7809bcac67ec51f7805cff97f42eb116432a2f76852a984be",
+        "gender": "F",
+        "id": "8f86c3fa5222066251c5458a4f9f4deaa7406cbd54366f75f0cfc6a635eb9301",
+        "note": "###erred",
+        "phone": "0375467451",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[17-20]",
+        "blood": "*",
+        "diagnosis": "Diabetes",
+        "email": "ENC1$310ca7e8d693c9f5da7fec181d18a5396d23cb9825ca63d292b4cba67a2fa299477435837fdb8001",
+        "gender": "M",
+        "id": "b27eaae2063cf1b472873779e15132b90f765813332dde78a6262505257714cd",
+        "note": "###low-up, 2 weeks",
+        "phone": "2163506383",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[37-40]",
+        "blood": "*",
+        "diagnosis": "Diabetes",
+        "email": "ENC1$2379938627e6e6497d1dfddb0aba208051268fa128cf8404af6ec0e613bf0a50314c45541fa4cc75",
+        "gender": "F",
+        "id": "3ec028cd01f1ab5f7b7ab12bd04a813e62c55ffcd39058d7d164ce81635697a0",
+        "note": "###ble",
+        "phone": "9769356178",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[65-68]",
+        "blood": "*",
+        "diagnosis": "Asthma",
+        "email": "ENC1$ac11edfee9c5670e63c984120d6f4747d94d2e5d53962be59fb1fc85bdc80943fe131c56b928160908ec",
+        "gender": "F",
+        "id": "8a7b24c758a53f196b43c61a8192130261017e4cc5b0475108a42481f8f8cc2a",
+        "note": "###erred",
+        "phone": "0618258996",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[57-60]",
+        "blood": "*",
+        "diagnosis": "Malaria",
+        "email": "ENC1$c015b35ed7feee000b93dda3592f4f2bdd86e9a96c2bf35aa1f8d47e60079d9116d4408b635565e21b",
+        "gender": "M",
+        "id": "de5931e3e0858670f2c7e59a45d80558f21cf3ac543c3f554fada927e15d6268",
+        "note": "###low-up, 2 weeks",
+        "phone": "5763776887",
+        "pin": "[560001-560100]"
+      }
+    ],
+    "source_config": "<ROOT>/config/config.json",
+    "suppressed_records": 3,
+    "top_ola2_nodes": [
+      {
+        "dm_star": 2979,
+        "node": [
+          4,
+          100,
+          1,
+          3
+        ],
+        "num_equivalence_classes": 32,
+        "suppression_count": 3
+      },
+      {
+        "dm_star": 2985,
+        "node": [
+          32,
+          100,
+          1,
+          1
+        ],
+        "num_equivalence_classes": 32,
+        "suppression_count": 3
+      },
+      {
+        "dm_star": 3025,
+        "node": [
+          2,
+          100,
+          2,
+          3
+        ],
+        "num_equivalence_classes": 32,
+        "suppression_count": 3
+      },
+      {
+        "dm_star": 3111,
+        "node": [
+          16,
+          100,
+          2,
+          1
+        ],
+        "num_equivalence_classes": 30,
+        "suppression_count": 9
+      },
+      {
+        "dm_star": 3141,
+        "node": [
+          8,
+          100,
+          2,
+          2
+        ],
+        "num_equivalence_classes": 30,
+        "suppression_count": 7
+      }
+    ],
+    "total_records": 300
+  },
+  "phase": "done",
+  "status": "success"
+}

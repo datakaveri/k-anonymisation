@@ -1,0 +1,33 @@
+{
+  "data_type": "tabular",
+  "tabular": {
+    "output_path": "anonymized.csv",
+    "suppress": [
+      "name"
+    ],
+    "hashing_with_salt": [
+      "id"
+    ],
+    "shared_hash_salts": true,
+    "masking": [
+      {
+        "column": "note",
+        "masking_char": "#",
+        "characters_to_mask": [
+          1,
+          2,
+          3
+        ]
+      }
+    ],
+    "encrypt": [
+      "email",
+      {
+        "phone": {
+          "format_preserving": true
+        }
+      }
+    ],
+    "suppression_limit": 0.05
+  }
+}

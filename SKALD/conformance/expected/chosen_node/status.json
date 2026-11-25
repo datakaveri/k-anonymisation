@@ -1,0 +1,188 @@
+{
+  "log_file": "<ROOT>/output/pipeline.log",
+  "outputs": {
+    "anonymisation_summary": {
+      "allowed_suppressions": 15,
+      "class_size_max": 15,
+      "class_size_mean": 9.28,
+      "class_size_median": 9,
+      "class_size_min": 5,
+      "classes_failing_k": 3,
+      "classes_failing_l": 0,
+      "dm_star": 2957,
+      "equivalence_classes": 32,
+      "k": 5,
+      "l": null,
+      "published_suppressed_records": 0,
+      "removed_records": 3,
+      "sensitive_attributes": null,
+      "suppressed_records": 3,
+      "suppression_limit": 0.05,
+      "t_closeness": "not implemented",
+      "total_records": 300
+    },
+    "chunk_count": 1,
+    "database_sink": null,
+    "equivalence_class_stats": {
+      "10": 4,
+      "11": 1,
+      "12": 3,
+      "13": 2,
+      "15": 2,
+      "5": 2,
+      "6": 1,
+      "7": 4,
+      "8": 7,
+      "9": 6
+    },
+    "final_output_path": "<ROOT>/output/anonymized.csv",
+    "final_rf": [
+      32,
+      100,
+      1,
+      1
+    ],
+    "flow": "CHOSEN_NODE",
+    "format_matched_output_path": null,
+    "generalization_node": {
+      "age": 32,
+      "blood": 1,
+      "gender": 1,
+      "pin": 100
+    },
+    "interval_qi_count": 0,
+    "lowest_dm_star": 2957,
+    "num_equivalence_classes": 32,
+    "output_path": "anonymized.csv",
+    "parameter_grid": [],
+    "pass": "pass2",
+    "preprocessing": {
+      "encrypt:email": 300,
+      "encrypt_fpe:phone": 300,
+      "hashing_with_salt:id": 300,
+      "masking:note": 300,
+      "suppress:name": 300
+    },
+    "quasi_identifier_count": 4,
+    "removed_records": 3,
+    "restored_workbook_path": null,
+    "sample_generalized_rows": [
+      {
+        "age": "[17-48]",
+        "blood": "AB-",
+        "diagnosis": "Cancer",
+        "email": "ENC1$c5eb87ed3a145a1acc12a49d4c04bba36ad0a45e428fbf83340568b64a78850a0e46da6c555f9fd04f",
+        "gender": "F",
+        "id": "744ec2b6951bf24ae528bfb12179173e231937010246ec96c2687b3b567ff608",
+        "note": "###ergic to penicillin",
+        "phone": "9688381003",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[17-48]",
+        "blood": "AB+",
+        "diagnosis": "Malaria",
+        "email": "ENC1$0a364b5c2261e9bd237a35af96bdf6c7f46b13023b79544a35aade4ee8fc083a184263d8928c9c4e70",
+        "gender": "F",
+        "id": "7665191ce129908970618a76f5057150ae82cd7071b6a940bf638b34febb912f",
+        "note": "###ble",
+        "phone": "8213928422",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[49-80]",
+        "blood": "O-",
+        "diagnosis": "Diabetes",
+        "email": "ENC1$5c50445820ac63a62dce26fe697f612fc7368c864303a90fab05673bf7c40f72dab7da110a99ece8",
+        "gender": "M",
+        "id": "8b4d7d5551d0ac0d36bf613ab84f7a34e4b77e8da0c0e70b19e9a106876aa00d",
+        "note": "###ble",
+        "phone": "2402952365",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[17-48]",
+        "blood": "B-",
+        "diagnosis": "Anaemia",
+        "email": "ENC1$14a5699031f574ff58d0ddb8c131f5a5d78060e7583255ce917e7211e709e7e4ea3e0680804f40",
+        "gender": "M",
+        "id": "cf4a48a037a20f2c8ca332b2e985d84e83c1913589e88c33ed95c90b5bc8b355",
+        "note": "###erred",
+        "phone": "6311770652",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[49-80]",
+        "blood": "B-",
+        "diagnosis": "Asthma",
+        "email": "ENC1$9a909bc85f2669e2fa934fd75eab59bd50919432aa5b1187073ece7b960a70655542facb33b69f",
+        "gender": "F",
+        "id": "283bebb39677054d073340828738bea3c8e0af012fbc8e111c961e202c7f49d9",
+        "note": "###erred",
+        "phone": "4440316902",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[49-80]",
+        "blood": "A-",
+        "diagnosis": "Anaemia",
+        "email": "ENC1$d8f9741c2c708520bc6de86252542432f2cee9cd832f413a7e70d112168fae99d40026c84c0c19ea",
+        "gender": "F",
+        "id": "8f86c3fa5222066251c5458a4f9f4deaa7406cbd54366f75f0cfc6a635eb9301",
+        "note": "###ble",
+        "phone": "2895664990",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[17-48]",
+        "blood": "AB-",
+        "diagnosis": "Diabetes",
+        "email": "ENC1$e87238975240f67f2bb2aaa386cba698dad31ee4d7f809d30b61e0d603a3f9d2db91a638cf357992",
+        "gender": "M",
+        "id": "b27eaae2063cf1b472873779e15132b90f765813332dde78a6262505257714cd",
+        "note": "###erred",
+        "phone": "4719837447",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[17-48]",
+        "blood": "A+",
+        "diagnosis": "Hypertension",
+        "email": "ENC1$5e7ff384185135ed8cc9fa75c802fc1fe5daf7cbc38bb82e6342c6ac7d5e5e6e41840f7b4193ba3434",
+        "gender": "M",
+        "id": "3ec028cd01f1ab5f7b7ab12bd04a813e62c55ffcd39058d7d164ce81635697a0",
+        "note": "###low-up, 2 weeks",
+        "phone": "6890660470",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[17-48]",
+        "blood": "O+",
+        "diagnosis": "Anaemia",
+        "email": "ENC1$645aa92798f61881528bee010b04ea4ce63eb8732abc00352047c6c1ec5ce838eeee0478ec68d551af",
+        "gender": "F",
+        "id": "8a7b24c758a53f196b43c61a8192130261017e4cc5b0475108a42481f8f8cc2a",
+        "note": "###low-up, 2 weeks",
+        "phone": "0798617954",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[49-80]",
+        "blood": "O-",
+        "diagnosis": "Malaria",
+        "email": "ENC1$6ef9a4361ad7ff75c0f7fd56e17dcdf84b6a39f9a1b24437e5b731b0716bcdb8b26e76eb57783176",
+        "gender": "F",
+        "id": "de5931e3e0858670f2c7e59a45d80558f21cf3ac543c3f554fada927e15d6268",
+        "note": "###low-up, 2 weeks",
+        "phone": "3878488756",
+        "pin": "[560001-560100]"
+      }
+    ],
+    "source_config": "<ROOT>/config/config.json",
+    "suppressed_records": 3,
+    "top_ola2_nodes": [],
+    "total_records": 300
+  },
+  "phase": "done",
+  "status": "success"
+}

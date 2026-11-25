@@ -1,0 +1,220 @@
+{
+  "log_file": "<ROOT>/output/pipeline.log",
+  "outputs": {
+    "histogram_buckets": 288,
+    "initial_ri": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "k_optimal": 298,
+    "parameter_grid": [
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 5,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          16,
+          100,
+          2,
+          1
+        ],
+        "dm_star": 2977,
+        "feasible": true,
+        "generalization_node": {
+          "age": 16,
+          "blood": 1,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 5,
+        "num_equivalence_classes": 32,
+        "suppression_count": 3,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          16,
+          100,
+          2,
+          1
+        ],
+        "dm_star": 2977,
+        "feasible": true,
+        "generalization_node": {
+          "age": 16,
+          "blood": 1,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 5,
+        "num_equivalence_classes": 32,
+        "suppression_count": 3,
+        "suppression_limit": 0.1
+      },
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 10,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          16,
+          100,
+          2,
+          2
+        ],
+        "dm_star": 5673,
+        "feasible": true,
+        "generalization_node": {
+          "age": 16,
+          "blood": 2,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 10,
+        "num_equivalence_classes": 16,
+        "suppression_count": 3,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          16,
+          100,
+          2,
+          2
+        ],
+        "dm_star": 5673,
+        "feasible": true,
+        "generalization_node": {
+          "age": 16,
+          "blood": 2,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 10,
+        "num_equivalence_classes": 16,
+        "suppression_count": 3,
+        "suppression_limit": 0.1
+      },
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 50,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          16,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 22147,
+        "feasible": true,
+        "generalization_node": {
+          "age": 16,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 50,
+        "num_equivalence_classes": 4,
+        "suppression_count": 3,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          16,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 22147,
+        "feasible": true,
+        "generalization_node": {
+          "age": 16,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 50,
+        "num_equivalence_classes": 4,
+        "suppression_count": 3,
+        "suppression_limit": 0.1
+      },
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 100,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          32,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 44285,
+        "feasible": true,
+        "generalization_node": {
+          "age": 32,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 100,
+        "num_equivalence_classes": 2,
+        "suppression_count": 3,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          32,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 44285,
+        "feasible": true,
+        "generalization_node": {
+          "age": 32,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 100,
+        "num_equivalence_classes": 2,
+        "suppression_count": 3,
+        "suppression_limit": 0.1
+      }
+    ],
+    "pass": "pass1",
+    "suppression_limit": 0.05,
+    "total_records": 300
+  },
+  "phase": "awaiting_pass2",
+  "status": "success"
+}

@@ -1,0 +1,35 @@
+[
+  {
+    "node": [
+      64,
+      100,
+      1,
+      3
+    ],
+    "dm_star": 6849,
+    "num_equivalence_classes": 2,
+    "suppression_count": 3
+  },
+  {
+    "node": [
+      83,
+      100,
+      1,
+      3
+    ],
+    "dm_star": 6970,
+    "num_equivalence_classes": 2,
+    "suppression_count": 2
+  },
+  {
+    "node": [
+      32,
+      100,
+      2,
+      3
+    ],
+    "dm_star": 6989,
+    "num_equivalence_classes": 2,
+    "suppression_count": 3
+  }
+]
