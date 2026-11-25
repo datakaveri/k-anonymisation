@@ -16,7 +16,7 @@
 //! and tests outside the crate.
 
 use crate::pipeline::bootstrap::{PipelineError, validation};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use num_bigint::BigUint;
 use serde_json::Value;
 use sha2::Sha256;
