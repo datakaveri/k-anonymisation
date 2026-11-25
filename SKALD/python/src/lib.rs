@@ -283,6 +283,13 @@ impl PyStats {
     fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &serde_json::to_vec(&self.inner).expect("stats always serialise"))
     }
+    /// Rebuilds stats from `to_bytes` for the same plan. Public so a driver can
+    /// ship stats between processes (Spark phases) without reaching into the
+    /// private pickle helper.
+    #[staticmethod]
+    fn from_bytes(py: Python<'_>, plan: Py<PyPlan>, data: &[u8]) -> PyResult<PyStats> {
+        _stats_from_bytes(py, plan, data)
+    }
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<(Bound<'py, PyAny>, (Py<PyPlan>, Bound<'py, PyBytes>))> {
         let py = slf.py();
         let me = slf.borrow();
@@ -435,6 +442,11 @@ impl PyHistogram {
     fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.inner.to_bytes())
     }
+    /// Rebuilds a histogram from `to_bytes` (public form of the pickle helper).
+    #[staticmethod]
+    fn from_bytes(data: &[u8]) -> PyResult<PyHistogram> {
+        _histogram_from_bytes(data)
+    }
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
         let py = slf.py();
         Ok((py.import("skald_core")?.getattr("_histogram_from_bytes")?, (slf.borrow().to_bytes(py),)))
@@ -559,6 +571,11 @@ impl PyTally {
     fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.inner.to_bytes())
     }
+    /// Rebuilds a tally from `to_bytes` for the same plan.
+    #[staticmethod]
+    fn from_bytes(plan: Py<PyPlan>, data: &[u8]) -> PyResult<PyTally> {
+        _tally_from_bytes(plan, data)
+    }
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<(Bound<'py, PyAny>, (Py<PyPlan>, Bound<'py, PyBytes>))> {
         let py = slf.py();
         let me = slf.borrow();
@@ -597,6 +614,11 @@ impl PyDecision {
     }
     fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.inner.to_bytes())
+    }
+    /// Rebuilds a decision from `to_bytes` (public form of the pickle helper).
+    #[staticmethod]
+    fn from_bytes(data: &[u8]) -> PyResult<PyDecision> {
+        _decision_from_bytes(data)
     }
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
         let py = slf.py();
