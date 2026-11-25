@@ -27,6 +27,7 @@ def build_session(env: Mapping[str, str] = os.environ, master: Optional[str] = N
     b = (SparkSession.builder.appName("anamika-spark")
          .config("spark.ui.enabled", "false")
          .config("spark.eventLog.enabled", "false")
+         .config("spark.ui.showConsoleProgress", "false")
          .config("spark.io.encryption.enabled", "true")
          .config("spark.sql.shuffle.partitions", "8")
          .config("spark.python.worker.reuse", "true"))
