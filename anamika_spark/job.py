@@ -37,7 +37,7 @@ from .bundle import Keys
 from .errors import JobError, code_of, coded_iter
 from .io import IoError, JobIO, read_vault, store_from_spec, write_vault
 from .kbs import KeySource, KeyStore, KeyUnavailable
-from .keymap import saved_keys, vault_specs
+from .keymap import job_keys, vault_specs
 from .ner import NerSettings, ner_columns, redact_batch
 from .parts import from_ipc, parse_csv, to_ipc, verify_part, write_csv
 
@@ -204,7 +204,7 @@ def _grid_cells(model, hist) -> List[Dict[str, Any]]:
 
 class Job:
     def __init__(self, job: str, phase: str, store_spec: Dict[str, str], kbs: KeySource, spark, *,
-                 choice: Optional[str] = None, ner: Optional[NerSettings] = None, vault_prefix: str = "vaults"):
+                 choice: Optional[str] = None, ner: Optional[NerSettings] = None, vault_prefix: str = ""):
         if phase not in PHASES:
             raise JobError("INVALID_INPUT")
         self.job, self.phase, self.store_spec, self.spark = job, phase, store_spec, spark
@@ -280,9 +280,10 @@ class Job:
         if spec.ner_cols and self.ner is None:
             raise JobError("INVALID_INPUT")  # the manifest asks for NER and no model is configured
 
-        # Keys: saved ones from the slots, the rest generated here, then broadcast. They are never
-        # written by this code; spark.io.encryption (session.py) covers what Spark itself spills.
-        skeys = sk.generate_keys(plan, saved_keys(manifest, self.kstore))
+        # Keys: saved ones from the slots, the rest derived from K_user (same on every executor and in both
+        # explore_k phases), then broadcast. They are never written by this code; spark.io.encryption
+        # (session.py) covers what Spark itself spills. generate_keys only validates completeness.
+        skeys = sk.generate_keys(plan, job_keys(plan, manifest, self.kstore))
         bc_io = self.sc.broadcast({"input": keys.input, "output": keys.output})
         vaults = self._open_vaults(manifest, plan)
         cached = []
@@ -333,8 +334,8 @@ class Job:
         sc = self.sc
         if self.phase == "apply":
             body = json.loads(self.jio.read_histogram())
-            model = sk.Model(plan, sk._stats_from_bytes(plan, base64.b64decode(body["stats"])))
-            hist = sk._histogram_from_bytes(base64.b64decode(body["hist"]))
+            model = sk.Model(plan, sk.Stats.from_bytes(plan, base64.b64decode(body["stats"])))
+            hist = sk.Histogram.from_bytes(base64.b64decode(body["hist"]))
         else:
             stats = pre.mapPartitions(_observe_stage(plan)).treeReduce(_merge)
             model = sk.Model(plan, stats)
@@ -444,7 +445,7 @@ def _storage():
 
 
 def run_job(job: str, phase: str, store_spec: Dict[str, str], kbs: KeySource, *, spark=None, choice: Optional[str] = None,
-            ner: Optional[NerSettings] = None, vault_prefix: str = "vaults") -> Dict[str, Any]:
+            ner: Optional[NerSettings] = None, vault_prefix: str = "") -> Dict[str, Any]:
     """Run one phase of one job and return {"ok", "code", "summary"?}. Never raises for a job failure."""
     logscrub.install()
     if spark is None:

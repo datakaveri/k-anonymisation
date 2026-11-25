@@ -36,7 +36,7 @@ Env vars the driver reads (`anamika_spark/run.py`). The Co-ordinator's `Spec` fi
 | `ANAMIKA_KEY_MODE` | | `cdh` (default) or `dir` (files in `ANAMIKA_KEY_DIR`; NOT confidential, development only) |
 | `ANAMIKA_SPARK_MASTER` | | `local[*]` for the single-VM path; unset on Kubernetes |
 | `ANAMIKA_DRIVER_MEMORY`, `ANAMIKA_LOCAL_DIR` | | local mode only |
-| `ANAMIKA_VAULT_PREFIX` | | blob prefix of token vaults, default `vaults` |
+| `ANAMIKA_VAULT_PREFIX` | | where `vaults/{vault_id}/v{n}.enc` live; default the container root (workload contract) |
 | `ANAMIKA_NER_MODEL_REF`, `ANAMIKA_NER_SHA256`, `ANAMIKA_NER_CACHE` | | only used if the manifest says `ner.required` |
 
 Exit code: 0 only when `status.json` says `{"ok": true}`. The failure code is in `status.json`, never on stderr.

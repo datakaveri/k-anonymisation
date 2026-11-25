@@ -21,17 +21,17 @@ def config():
     return cfg
 
 
-def make(root, job, *, vaults=None, saved=True, vault_slot_data=MASTER):
+def make(root, job, *, vaults=None, saved=True, vault_slot_data=MASTER, k_user=K_USER):
     listed, slots = corpus.case_keys(CASE)
     n = len(listed)
     store = pack_rows(root, job, corpus.case_data(CASE), config(), parts=3, keys=listed if saved else None,
-                      vaults=[{**v, "slot": f"key-{n:02d}"} for v in vaults] if vaults else None)
-    kbs = fake_kbs(job, **(slots if saved else {}), **({f"key_{n:02d}": vault_slot_data} if vaults else {}))
+                      vaults=[{**v, "slot": f"key-{n:02d}"} for v in vaults] if vaults else None, k_user=k_user)
+    kbs = fake_kbs(job, k_user=k_user, **(slots if saved else {}), **({f"key_{n:02d}": vault_slot_data} if vaults else {}))
     return store, kbs
 
 
-def output_rows(store, job):
-    _, header, data, _ = read_result(store, job)
+def output_rows(store, job, k_user=K_USER):
+    _, header, data, _ = read_result(store, job, k_user)
     return list(csv.reader(io.StringIO(data.decode())))
 
 
@@ -114,13 +114,15 @@ def test_wrong_vault_key_is_invalid_input(spark, tmp_path):
 
 def test_saved_keys_give_the_same_pseudonym_in_two_jobs_and_per_job_keys_do_not(spark, tmp_path):
     outs = {}
+    # Per-job keys are derived from K_user, so two jobs differ because their K_user differ.
+    k_users = {"c": bytes(range(32)), "d": bytes(range(1, 33))}
     for tag, saved in (("a", True), ("b", True), ("c", False), ("d", False)):
         job = f"j-keys-{tag}"
-        store, kbs = make(tmp_path, job, saved=saved)
+        store, kbs = make(tmp_path, job, saved=saved, k_user=k_users.get(tag, K_USER))
         assert run(spark, tmp_path, job, kbs, "all")["ok"]
-        rows = output_rows(store, job)
+        rows = output_rows(store, job, k_users.get(tag, K_USER))
         outs[tag] = {c: [r[rows[0].index(c)] for r in rows[1:]] for c in ("id", "email", "phone")}
     assert outs["a"] == outs["b"]
     for c in ("id", "email"):
-        assert outs["c"][c] != outs["d"][c], "keys generated per job differ between jobs"
+        assert outs["c"][c] != outs["d"][c], "derived per-job keys differ between jobs with different K_user"
         assert outs["c"][c] != outs["a"][c]

@@ -10,7 +10,7 @@ Environment (see deploy/README.md):
   ANAMIKA_SPARK_MASTER   local[*] for the single-VM path; unset on Kubernetes (spark-submit supplies it)
   ANAMIKA_DRIVER_MEMORY  local mode only (default 1g)
   ANAMIKA_LOCAL_DIR      spark.local.dir for local mode (put it on tmpfs)
-  ANAMIKA_VAULT_PREFIX   blob prefix of token vaults (default "vaults")
+  ANAMIKA_VAULT_PREFIX   where vaults/{id}/v{n}.enc live (default: the container root)
   ANAMIKA_NER_MODEL_REF, ANAMIKA_NER_SHA256, ANAMIKA_NER_CACHE   NER model (used only if the manifest asks)
 
 Exit code 0 only when status.json says ok; the code itself is in status.json, never on stderr.
@@ -38,7 +38,7 @@ def main(env=os.environ) -> int:
     store = {"kind": "local", "root": env["ANAMIKA_STORE_DIR"]} if env.get("ANAMIKA_STORE_DIR") else {"kind": "azure", "url": env["ANAMIKA_STORE_URL"]}
     kbs = DirKeySource(env.get("ANAMIKA_KEY_DIR", "/keys")) if env.get("ANAMIKA_KEY_MODE") == "dir" else CdhClient()
     result = run_job(env["ANAMIKA_JOB"], phase, store, kbs, choice=env.get("ANAMIKA_CHOICE") or None,
-                     ner=settings_from_env(env), vault_prefix=env.get("ANAMIKA_VAULT_PREFIX", "vaults"))
+                     ner=settings_from_env(env), vault_prefix=env.get("ANAMIKA_VAULT_PREFIX", ""))
     return 0 if result["ok"] else 1
 
 

@@ -39,6 +39,20 @@ def derive(k_user: bytes, label: str) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=f"anamika/v1 {label}".encode()).derive(k_user)
 
 
+def job_key(k_user: bytes, kind: str, name: str) -> bytes:
+    """Per-job column key: HKDF-SHA256(K_user, salt="", info="anamika/v1 job-key <kind> <name>", 32).
+
+    contracts/bundle/README.md, "Column keys and token vaults". Derived (not random) so every executor
+    and both explore_k phases (measure, apply) hash a value identically, yet different for every job
+    because K_user is. Always 32 bytes; a user of a shorter key takes the first N bytes.
+    anamika-ray derives the same bytes (tests pin one shared vector in both repos).
+    """
+    if len(k_user) != 32:
+        raise BundleError("K_user must be 32 bytes")
+    info = f"anamika/v1 job-key {kind} {name}".encode()
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=info).derive(k_user)
+
+
 def vault_key(vault_master: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=b"anamika/v1 vault").derive(vault_master)
 

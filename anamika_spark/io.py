@@ -269,13 +269,15 @@ class JobIO:
 
 
 # -- token vaults ------------------------------------------------------------
-def vault_path(vault_id: str, version: int, prefix: str = "vaults") -> str:
+def vault_path(vault_id: str, version: int, prefix: str = "") -> str:
+    """vaults/{vault_id}/v{version}.enc, under `prefix` (ANAMIKA_VAULT_PREFIX; empty = the container root)."""
     if not re.match(r"^[A-Za-z0-9-]{1,64}$", vault_id):  # becomes part of a blob path
         raise IoError("INVALID_INPUT", "vault id")
-    return f"{prefix}/{vault_id}/v{version}.enc"
+    base = prefix.strip("/")
+    return f"{base + '/' if base else ''}vaults/{vault_id}/v{version}.enc"
 
 
-def read_vault(store: BlobStore, vault_master: bytes, vault_id: str, version: int, prefix: str = "vaults") -> Dict[str, Any]:
+def read_vault(store: BlobStore, vault_master: bytes, vault_id: str, version: int, prefix: str = "") -> Dict[str, Any]:
     """Open vault version `version`. Version 0 is the empty vault and has no object."""
     if version == 0:
         return {"vault_id": vault_id, "version": 0, "entries": {}}
@@ -290,7 +292,7 @@ def read_vault(store: BlobStore, vault_master: bytes, vault_id: str, version: in
 
 
 def write_vault(store: BlobStore, vault_master: bytes, vault_id: str, version: int, column: str,
-                entries: Dict[str, str], prefix: str = "vaults") -> None:
+                entries: Dict[str, str], prefix: str = "") -> None:
     """Commit a NEW vault version. Never overwrites: a version that exists means two jobs forked the vault
     (the AO's lock should prevent that), and silently replacing it would lose tokens."""
     path = vault_path(vault_id, version, prefix)

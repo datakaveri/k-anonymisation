@@ -28,7 +28,7 @@ import urllib.request
 from typing import Callable, Dict, Mapping, Optional, Protocol
 
 
-from .bundle import Keys
+from .bundle import Keys, job_key
 
 CDH_BASE = "http://127.0.0.1:8006/cdh/resource"
 _JOB = re.compile(r"^[a-z0-9-]{6,64}$")
@@ -165,6 +165,11 @@ class KeyStore:
             self._user = _as_32(self._source.get(self.job, "user-key"), "user-key")
             self._derived = Keys.from_user_key(self._user)
         return self._derived
+
+    def job_key(self, kind: str, name: str) -> bytes:
+        """The contract's per-job key for (kind, name), derived from K_user; 32 bytes."""
+        self.keys  # fetches and caches K_user
+        return job_key(self._user, kind, name)
 
     def slot(self, slot: str) -> bytes:
         """A saved key or vault key released at key-NN (32 bytes for HMAC salts, AES and vault keys)."""
