@@ -61,7 +61,7 @@ pub(crate) fn parse_tokenization_config(entry: &Value) -> Result<TokenizationCon
 ///
 /// Supports both pseudo-encryption (XOR keystream, `format_preserving: false`)
 /// and format-preserving general encryption (`format_preserving: true`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct EncryptConfigLite {
     /// Target CSV column name.
     pub(crate) column: String,

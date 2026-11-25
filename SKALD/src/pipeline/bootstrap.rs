@@ -795,6 +795,14 @@ fn parse_l_diversity(
 pub fn parse_runtime_config(config_path: &Path) -> Result<RuntimeConfig, PipelineError> {
     let raw = fs::read_to_string(config_path)?;
     let root: Value = serde_json::from_str(&raw)?;
+    parse_runtime_config_value(&root, config_path)
+}
+
+/// [`parse_runtime_config`] for a config that is already parsed JSON — the
+/// library entry point, where the config arrives as text from a caller that
+/// has no file. `source` only labels error messages and `source_json_config`.
+pub fn parse_runtime_config_value(root: &Value, source: &Path) -> Result<RuntimeConfig, PipelineError> {
+    let config_path = source;
 
     let data_type = root.get("data_type").and_then(Value::as_str).ok_or_else(|| {
         validation("CONFIG_MISSING_FIELD", "Required field 'data_type' is absent", &config_path.display().to_string())
