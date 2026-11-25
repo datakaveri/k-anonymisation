@@ -65,7 +65,9 @@ def cli_outputs():
     4.1.0 output. Either way it is the command line, not a second opinion."""
     binary = _cli_binary()
     if binary is None:
-        return lambda case: os.path.join(CORPUS, "expected", case)
+        # A generator fixture must yield: a bare `return value` here left the fixture without a value.
+        yield lambda case: os.path.join(CORPUS, "expected", case)
+        return
     spec = importlib.util.spec_from_file_location("run_cli", os.path.join(CORPUS, "run_cli.py"))
     run_cli = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(run_cli)
