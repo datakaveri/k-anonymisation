@@ -113,11 +113,14 @@ def test_saved_key_slot_not_released(spark, tmp_path):
     assert_failed(store, job, "KEY_UNAVAILABLE")
 
 
-def test_multi_table_bundles_are_refused(spark, tmp_path):
+def test_multi_table_bundles_with_no_way_to_merge_them_are_refused(spark, tmp_path):
+    """Several tables are merged as SKALD merges a workbook (test_joins.py). Tables with no join in the config and
+    no column in common would be pasted side by side by row position, which a distributed job does not reproduce."""
     job, store, kbs = setup_case(tmp_path, CASE, tag="mt")
-    def split(m):  # a valid two-table manifest: the last part moves to a second table
+
+    def split(m):  # a valid two-table manifest: the last part moves to a second table, under other column names
         t = m["tables"][0]
-        m["tables"].append({"name": "t2", "header": t["header"], "parts": [t["parts"].pop()]})
+        m["tables"].append({"name": "t2", "header": [f"other{i}" for i in range(len(t["header"]))], "parts": [t["parts"].pop()]})
 
     reseal_manifest(store, job, split)
     assert run(spark, tmp_path, job, kbs, "all") == {"ok": False, "code": "INVALID_INPUT"}

@@ -1,0 +1,150 @@
+{
+  "log_file": "<ROOT>/output/pipeline.log",
+  "outputs": {
+    "chunk_count": 1,
+    "database_sink": null,
+    "final_output_path": "<ROOT>/output/anonymized.csv",
+    "format_matched_output_path": "<ROOT>/output/anonymized.xlsx",
+    "pass": "preprocess_only",
+    "preprocessing": {
+      "encrypt_fpe:phone": 24,
+      "hashing_with_salt:id": 24,
+      "suppress:name": 24
+    },
+    "restored_workbook_path": "<ROOT>/output/anonymized.xlsx",
+    "sample_generalized_rows": [
+      {
+        "age": "50",
+        "beds": "40",
+        "blood": "B+",
+        "district": "Central",
+        "gender": "M",
+        "hospital_x": "Northgate",
+        "hospital_y": "City General",
+        "id": "744ec2b6951bf24ae528bfb12179173e231937010246ec96c2687b3b567ff608",
+        "note": "",
+        "phone": "6199086063",
+        "pin": "560100"
+      },
+      {
+        "age": "50",
+        "beds": "50",
+        "blood": "B+",
+        "district": "East",
+        "gender": "M",
+        "hospital_x": "Northgate",
+        "hospital_y": "Lakeside",
+        "id": "744ec2b6951bf24ae528bfb12179173e231937010246ec96c2687b3b567ff608",
+        "note": "",
+        "phone": "6199086063",
+        "pin": "560100"
+      },
+      {
+        "age": "50",
+        "beds": "60",
+        "blood": "B+",
+        "district": "West",
+        "gender": "M",
+        "hospital_x": "Northgate",
+        "hospital_y": "St Mary",
+        "id": "744ec2b6951bf24ae528bfb12179173e231937010246ec96c2687b3b567ff608",
+        "note": "",
+        "phone": "6199086063",
+        "pin": "560100"
+      },
+      {
+        "age": "50",
+        "beds": "70",
+        "blood": "B+",
+        "district": "North",
+        "gender": "M",
+        "hospital_x": "Northgate",
+        "hospital_y": "Northgate",
+        "id": "744ec2b6951bf24ae528bfb12179173e231937010246ec96c2687b3b567ff608",
+        "note": "",
+        "phone": "6199086063",
+        "pin": "560100"
+      },
+      {
+        "age": "18",
+        "beds": "40",
+        "blood": "A+",
+        "district": "Central",
+        "gender": "M",
+        "hospital_x": "City General",
+        "hospital_y": "City General",
+        "id": "7665191ce129908970618a76f5057150ae82cd7071b6a940bf638b34febb912f",
+        "note": "stable",
+        "phone": "2601313525",
+        "pin": "560100"
+      },
+      {
+        "age": "18",
+        "beds": "50",
+        "blood": "A+",
+        "district": "East",
+        "gender": "M",
+        "hospital_x": "City General",
+        "hospital_y": "Lakeside",
+        "id": "7665191ce129908970618a76f5057150ae82cd7071b6a940bf638b34febb912f",
+        "note": "stable",
+        "phone": "2601313525",
+        "pin": "560100"
+      },
+      {
+        "age": "18",
+        "beds": "60",
+        "blood": "A+",
+        "district": "West",
+        "gender": "M",
+        "hospital_x": "City General",
+        "hospital_y": "St Mary",
+        "id": "7665191ce129908970618a76f5057150ae82cd7071b6a940bf638b34febb912f",
+        "note": "stable",
+        "phone": "2601313525",
+        "pin": "560100"
+      },
+      {
+        "age": "18",
+        "beds": "70",
+        "blood": "A+",
+        "district": "North",
+        "gender": "M",
+        "hospital_x": "City General",
+        "hospital_y": "Northgate",
+        "id": "7665191ce129908970618a76f5057150ae82cd7071b6a940bf638b34febb912f",
+        "note": "stable",
+        "phone": "2601313525",
+        "pin": "560100"
+      },
+      {
+        "age": "32",
+        "beds": "40",
+        "blood": "AB-",
+        "district": "Central",
+        "gender": "F",
+        "hospital_x": "City General",
+        "hospital_y": "City General",
+        "id": "8b4d7d5551d0ac0d36bf613ab84f7a34e4b77e8da0c0e70b19e9a106876aa00d",
+        "note": "",
+        "phone": "7717958908",
+        "pin": "560095"
+      },
+      {
+        "age": "32",
+        "beds": "50",
+        "blood": "AB-",
+        "district": "East",
+        "gender": "F",
+        "hospital_x": "City General",
+        "hospital_y": "Lakeside",
+        "id": "8b4d7d5551d0ac0d36bf613ab84f7a34e4b77e8da0c0e70b19e9a106876aa00d",
+        "note": "",
+        "phone": "7717958908",
+        "pin": "560095"
+      }
+    ]
+  },
+  "phase": "done",
+  "status": "success"
+}

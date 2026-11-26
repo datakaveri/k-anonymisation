@@ -7,11 +7,15 @@ Each case runs in a scratch copy, because the command line rewrites the key
 files it is given. Run-specific text (paths, timings) is removed from
 status.json so two builds can be compared byte for byte.
 """
-import json, os, re, shutil, subprocess, sys, tempfile
+import csv, io, json, os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)  # tests load this file by path, so its sibling module is not on sys.path
+from xlsx_min import read_xlsx  # noqa: E402
+
 CASES = os.path.join(HERE, "cases")
 KEEP = ["anonymized.csv", "equivalence_class_stats.json", "top_ola2_nodes.json", "parameter_grid.csv"]
+RESTORED = "anonymized.xlsx"  # what restore_sheets writes; kept as one sheet.<name>.csv per sheet
 
 
 def clean_status(raw, root):
@@ -27,7 +31,10 @@ def run_case(binary, case, out_root):
     try:
         os.makedirs(os.path.join(work, "data"))
         os.makedirs(os.path.join(work, "config"))
-        shutil.copy(os.path.join(CASES, case, "data.csv"), os.path.join(work, "data", "data.csv"))
+        # A case is one CSV, or (the join cases) one workbook.
+        for fn in ("data.csv", "data.xlsx"):
+            if os.path.exists(os.path.join(CASES, case, fn)):
+                shutil.copy(os.path.join(CASES, case, fn), os.path.join(work, "data", fn))
         shutil.copy(os.path.join(CASES, case, "config.json"), os.path.join(work, "config", "config.json"))
         shutil.copytree(os.path.join(CASES, case, "testkeys"), os.path.join(work, "keys"))
         p = subprocess.run([binary, "--root", work], capture_output=True, text=True)
@@ -38,6 +45,13 @@ def run_case(binary, case, out_root):
         for fn in KEEP:
             if os.path.exists(os.path.join(out, fn)):
                 shutil.copy(os.path.join(out, fn), os.path.join(dest, fn))
+        cfg = json.load(open(os.path.join(CASES, case, "config.json")))
+        if cfg[cfg["data_type"]].get("restore_sheets") and os.path.exists(os.path.join(out, RESTORED)):
+            for name, rows in read_xlsx(os.path.join(out, RESTORED)):
+                buf = io.StringIO(newline="")
+                csv.writer(buf, lineterminator="\n").writerows(rows)
+                with open(os.path.join(dest, f"sheet.{name}.csv"), "w", newline="") as f:
+                    f.write(buf.getvalue())
         status = os.path.join(out, "status.json")
         if os.path.exists(status):
             with open(status) as f, open(os.path.join(dest, "status.json"), "w") as g:

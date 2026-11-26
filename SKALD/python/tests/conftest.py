@@ -12,7 +12,9 @@ import pytest
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKALD = os.path.dirname(os.path.dirname(HERE))
 CORPUS = os.path.join(SKALD, "conformance")
-CASES = sorted(os.listdir(os.path.join(CORPUS, "cases")))
+# The single-table cases (one CSV each); the join_* cases are workbooks, run by spark/tests/test_joins.py.
+CASES = sorted(c for c in os.listdir(os.path.join(CORPUS, "cases"))
+               if os.path.exists(os.path.join(CORPUS, "cases", c, "data.csv")))
 
 
 def read_strings(path):

@@ -16,6 +16,11 @@ is the release version; tags are `v<version>`.
   a salt made up on the spot. An optional redactor cleans the strings the config releases as `free_text` before
   the document is built. `tokenization` (one shared random vault) is refused. The command line is unchanged.
 - Synthetic FHIR and nested JSON corpus (`SKALD/conformance/documents`).
+- **Multi-table bundles on Spark** (`spark/anamika_spark/joins.py`). A bundle's tables are merged as the command
+  line merges a workbook (`sheet_joins`, else stack same-schema sheets, else join on shared columns), anonymised, and
+  with `restore_sheets` split back into one output table per sheet; output equals the CLI's byte for byte. Seven
+  workbook cases (`conformance/cases/join_*`, recorded from the CLI) join the corpus; the command-line test now
+  also compares each restored sheet.
 
 ## [4.2.0] — 2026-11-26
 

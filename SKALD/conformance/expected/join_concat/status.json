@@ -1,0 +1,444 @@
+{
+  "log_file": "<ROOT>/output/pipeline.log",
+  "outputs": {
+    "anonymisation_summary": {
+      "allowed_suppressions": 6,
+      "class_size_max": 11,
+      "class_size_mean": 8.0,
+      "class_size_median": 7,
+      "class_size_min": 5,
+      "classes_failing_k": 1,
+      "classes_failing_l": 0,
+      "dm_star": 474,
+      "equivalence_classes": 7,
+      "k": 5,
+      "l": null,
+      "published_suppressed_records": 0,
+      "removed_records": 4,
+      "sensitive_attributes": null,
+      "suppressed_records": 4,
+      "suppression_limit": 0.1,
+      "t_closeness": "not implemented",
+      "total_records": 60
+    },
+    "chunk_count": 1,
+    "database_sink": null,
+    "equivalence_class_stats": {
+      "10": 1,
+      "11": 1,
+      "5": 1,
+      "7": 3,
+      "9": 1
+    },
+    "equivalence_space": 99200.0,
+    "final_output_path": "<ROOT>/output/anonymized.csv",
+    "final_rf": [
+      32,
+      100,
+      2,
+      2
+    ],
+    "flow": "DIRECT_Z",
+    "format_matched_output_path": "<ROOT>/output/anonymized.xlsx",
+    "initial_ri": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "interval_qi_count": 0,
+    "lattice_size": 126,
+    "lowest_dm_star": 474,
+    "max_equivalence_classes": null,
+    "n_approx": 60,
+    "n_log2_n": 354.41343573651113,
+    "nodes_evaluated": 36,
+    "num_equivalence_classes": 7,
+    "output_path": "anonymized.csv",
+    "parameter_grid": [
+      {
+        "best_node": [
+          62,
+          1,
+          2,
+          3
+        ],
+        "dm_star": 536,
+        "feasible": true,
+        "generalization_node": {
+          "age": 62,
+          "blood": 3,
+          "gender": 2,
+          "pin": 1
+        },
+        "k": 5,
+        "num_equivalence_classes": 7,
+        "suppression_count": 0,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          62,
+          1,
+          2,
+          3
+        ],
+        "dm_star": 536,
+        "feasible": true,
+        "generalization_node": {
+          "age": 62,
+          "blood": 3,
+          "gender": 2,
+          "pin": 1
+        },
+        "k": 5,
+        "num_equivalence_classes": 7,
+        "suppression_count": 0,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          32,
+          100,
+          2,
+          2
+        ],
+        "dm_star": 474,
+        "feasible": true,
+        "generalization_node": {
+          "age": 32,
+          "blood": 2,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 5,
+        "num_equivalence_classes": 7,
+        "suppression_count": 4,
+        "suppression_limit": 0.1
+      },
+      {
+        "best_node": [
+          62,
+          100,
+          2,
+          2
+        ],
+        "dm_star": 914,
+        "feasible": true,
+        "generalization_node": {
+          "age": 62,
+          "blood": 2,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 10,
+        "num_equivalence_classes": 4,
+        "suppression_count": 0,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          62,
+          100,
+          2,
+          2
+        ],
+        "dm_star": 914,
+        "feasible": true,
+        "generalization_node": {
+          "age": 62,
+          "blood": 2,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 10,
+        "num_equivalence_classes": 4,
+        "suppression_count": 0,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          62,
+          100,
+          2,
+          2
+        ],
+        "dm_star": 914,
+        "feasible": true,
+        "generalization_node": {
+          "age": 62,
+          "blood": 2,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 10,
+        "num_equivalence_classes": 4,
+        "suppression_count": 0,
+        "suppression_limit": 0.1
+      },
+      {
+        "best_node": [
+          62,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 3600,
+        "feasible": true,
+        "generalization_node": {
+          "age": 62,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 50,
+        "num_equivalence_classes": 1,
+        "suppression_count": 0,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [
+          62,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 3600,
+        "feasible": true,
+        "generalization_node": {
+          "age": 62,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 50,
+        "num_equivalence_classes": 1,
+        "suppression_count": 0,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [
+          62,
+          100,
+          2,
+          3
+        ],
+        "dm_star": 3600,
+        "feasible": true,
+        "generalization_node": {
+          "age": 62,
+          "blood": 3,
+          "gender": 2,
+          "pin": 100
+        },
+        "k": 50,
+        "num_equivalence_classes": 1,
+        "suppression_count": 0,
+        "suppression_limit": 0.1
+      },
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 100,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.0
+      },
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 100,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.01
+      },
+      {
+        "best_node": [],
+        "dm_star": -1,
+        "feasible": false,
+        "generalization_node": {},
+        "k": 100,
+        "num_equivalence_classes": 0,
+        "suppression_count": -1,
+        "suppression_limit": 0.1
+      }
+    ],
+    "pass": "no_bounds",
+    "preprocessing": {
+      "encrypt_fpe:phone": 60,
+      "hashing_with_salt:id": 60,
+      "suppress:name": 60
+    },
+    "quasi_identifier_count": 4,
+    "removed_records": 4,
+    "restored_workbook_path": null,
+    "sample_generalized_rows": [
+      {
+        "age": "[50-81]",
+        "blood": "B",
+        "gender": "Any",
+        "hospital": "Northgate",
+        "id": "744ec2b6951bf24ae528bfb12179173e231937010246ec96c2687b3b567ff608",
+        "note": "",
+        "phone": "6199086063",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[18-49]",
+        "blood": "A",
+        "gender": "Any",
+        "hospital": "City General",
+        "id": "7665191ce129908970618a76f5057150ae82cd7071b6a940bf638b34febb912f",
+        "note": "stable",
+        "phone": "2601313525",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[18-49]",
+        "blood": "AB",
+        "gender": "Any",
+        "hospital": "City General",
+        "id": "8b4d7d5551d0ac0d36bf613ab84f7a34e4b77e8da0c0e70b19e9a106876aa00d",
+        "note": "",
+        "phone": "7717958908",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[18-49]",
+        "blood": "O",
+        "gender": "Any",
+        "hospital": "",
+        "id": "8d0395a7c302e0cdb6506fa6779f2ccaea33055ee1ed840283dc66225531f7fd",
+        "note": "stable",
+        "phone": "4994569316",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[18-49]",
+        "blood": "B",
+        "gender": "Any",
+        "hospital": "St Mary",
+        "id": "cf4a48a037a20f2c8ca332b2e985d84e83c1913589e88c33ed95c90b5bc8b355",
+        "note": "referred",
+        "phone": "8234466185",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[50-81]",
+        "blood": "AB",
+        "gender": "Any",
+        "hospital": "City General",
+        "id": "283bebb39677054d073340828738bea3c8e0af012fbc8e111c961e202c7f49d9",
+        "note": "referred",
+        "phone": "1929196105",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[18-49]",
+        "blood": "O",
+        "gender": "Any",
+        "hospital": "City General",
+        "id": "bc291f908e6712eaa9d3f0f00c212b21379b07beefac5e03e6651bdc9e9646cb",
+        "note": "",
+        "phone": "3741845749",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[18-49]",
+        "blood": "B",
+        "gender": "Any",
+        "hospital": "Northgate",
+        "id": "8f86c3fa5222066251c5458a4f9f4deaa7406cbd54366f75f0cfc6a635eb9301",
+        "note": "",
+        "phone": "5505438118",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[50-81]",
+        "blood": "B",
+        "gender": "Any",
+        "hospital": "Lakeside",
+        "id": "b27eaae2063cf1b472873779e15132b90f765813332dde78a6262505257714cd",
+        "note": "",
+        "phone": "0876347789",
+        "pin": "[560001-560100]"
+      },
+      {
+        "age": "[50-81]",
+        "blood": "O",
+        "gender": "Any",
+        "hospital": "Northgate",
+        "id": "3ec028cd01f1ab5f7b7ab12bd04a813e62c55ffcd39058d7d164ce81635697a0",
+        "note": "",
+        "phone": "4398501427",
+        "pin": "[560001-560100]"
+      }
+    ],
+    "source_config": "<ROOT>/config/config.json",
+    "suppressed_records": 4,
+    "top_ola2_nodes": [
+      {
+        "dm_star": 474,
+        "node": [
+          32,
+          100,
+          2,
+          2
+        ],
+        "num_equivalence_classes": 7,
+        "suppression_count": 4
+      },
+      {
+        "dm_star": 487,
+        "node": [
+          8,
+          100,
+          2,
+          3
+        ],
+        "num_equivalence_classes": 7,
+        "suppression_count": 3
+      },
+      {
+        "dm_star": 500,
+        "node": [
+          62,
+          100,
+          1,
+          2
+        ],
+        "num_equivalence_classes": 7,
+        "suppression_count": 2
+      },
+      {
+        "dm_star": 504,
+        "node": [
+          62,
+          100,
+          2,
+          1
+        ],
+        "num_equivalence_classes": 7,
+        "suppression_count": 4
+      },
+      {
+        "dm_star": 536,
+        "node": [
+          62,
+          1,
+          2,
+          3
+        ],
+        "num_equivalence_classes": 7,
+        "suppression_count": 0
+      }
+    ],
+    "total_records": 60
+  },
+  "phase": "done",
+  "status": "success"
+}

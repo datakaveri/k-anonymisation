@@ -142,10 +142,13 @@ fn run(case: &str, n: usize, reverse: bool) -> Outcome {
     }
 }
 
+/// The single-table cases (a CSV each). The `join_*` cases are workbooks: the batch API has no join, the
+/// Spark job does it (spark/tests/test_joins.py) and the command-line conformance test covers them here.
 fn cases() -> Vec<String> {
     let mut v: Vec<String> = fs::read_dir(corpus().join("cases"))
         .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into())
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|c| corpus().join("cases").join(c).join("data.csv").exists())
         .collect();
     v.sort();
     v

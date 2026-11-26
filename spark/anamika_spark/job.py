@@ -30,9 +30,10 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import pyarrow as pa
 import skald_core as sk
 
-from . import logscrub
+from . import joins, logscrub
 from .bundle import Keys
 from .errors import JobError, code_of, coded_iter
 from .io import IoError, JobIO, input_from_spec, read_vault, store_from_spec, write_vault
@@ -182,6 +183,123 @@ def _publish_stage(spec: ExecSpec):
     return run
 
 
+# ---------------------------------------------------------------- multi-table stages
+def _table_read_stage(spec: ExecSpec, bc_io):
+    """mapInArrow: part numbers in, one table's rows out (c0..cN strings, __id = part << 32 | row in part),
+    so the order of the file is carried by a column and survives any shuffle."""
+
+    @coded_iter
+    def run(it):
+        logscrub.install()
+        io = _worker_io(spec, bc_io.value)
+        names = [f"c{i}" for i in range(len(spec.header))] + [joins.ID]
+        for b in it:
+            for n in b.column("part").to_pylist():
+                data = io.read_part(n, spec.part_count)
+                entry = spec.entries[n]
+                verify_part(data, entry)
+                batch = parse_csv(data, spec.header)
+                if batch.num_rows != entry["rows"]:
+                    raise JobError("PARTS_MISMATCH")
+                ids = pa.array([(n << 32) | i for i in range(batch.num_rows)], pa.int64())
+                yield pa.RecordBatch.from_arrays(list(batch.columns) + [ids], names=names)
+
+    return run
+
+
+def _pack_stage(header: List[str]):
+    """mapInArrow over the merged, sorted table: each Spark partition becomes one (partition, rows, ipc)
+    row, which is the unit the k-anonymity stages already take (a part: number + Arrow IPC bytes)."""
+
+    @coded_iter
+    def run(it):
+        from pyspark import TaskContext  # noqa: PLC0415
+
+        batches = [b for b in it if b.num_rows]
+        if batches:
+            table = pa.Table.from_batches(batches).combine_chunks()
+            data = table.select([f"c{i}" for i in range(len(header))]).rename_columns(header)
+            out = data.to_batches()[0] if data.num_rows else None
+        else:
+            out = None
+        rows = out.num_rows if out is not None else 0
+        yield pa.RecordBatch.from_arrays(
+            [pa.array([TaskContext.get().partitionId()], pa.int64()), pa.array([rows], pa.int64()),
+             pa.array([to_ipc(out) if out is not None else b""], pa.binary())], names=["pid", "rows", "ipc"])
+
+    return run
+
+
+def _ner_stage(spec: ExecSpec):
+    """NER over the merged table (a multi-table bundle redacts after the join, on the merged columns)."""
+
+    @coded_iter
+    def run(it):
+        logscrub.install()
+        for n, ipc in it:
+            yield n, to_ipc(redact_batch(from_ipc(ipc), spec.ner_cols, spec.ner))
+
+    return run
+
+
+def _finish_stage(gen, decision):
+    """Finish each part and keep it as the CSV round trip gives it back (what the final k check tallies and
+    what the split reads), with its tally."""
+
+    @coded_iter
+    def run(it):
+        logscrub.install()
+        for item in it:
+            batch = from_ipc(item[1])
+            if gen is not None:
+                batch = gen.finish(batch, decision)
+            names = batch.schema.names
+            data = write_csv(batch)
+            back = parse_csv(data, names) if data else batch
+            yield item[0], to_ipc(back), (gen.tally(back) if gen is not None else None), back.num_rows
+
+    return run
+
+
+def _expand_stage(header: List[str]):
+    """mapInArrow: (part, ipc) rows back into table rows with __id = part << 32 | row."""
+
+    @coded_iter
+    def run(it):
+        names = [f"c{i}" for i in range(len(header))] + [joins.ID]
+        for b in it:
+            for n, blob in zip(b.column("part").to_pylist(), b.column("ipc").to_pylist()):
+                batch = from_ipc(bytes(blob))
+                ids = pa.array([(n << 32) | i for i in range(batch.num_rows)], pa.int64())
+                yield pa.RecordBatch.from_arrays(list(batch.columns) + [ids], names=names)
+
+    return run
+
+
+def _write_sheet_stage(spec: ExecSpec, bc_io, offset: int, total: int, width: int):
+    """mapInArrow over one split sheet (range-partitioned and sorted by first occurrence): the Spark
+    partition index is the sheet's part number; seal it under apply/pending/ and report its digest."""
+
+    @coded_iter
+    def run(it):
+        import hashlib as _h  # noqa: PLC0415 - closure is pickled by value
+        from pyspark import TaskContext  # noqa: PLC0415
+
+        logscrub.install()
+        batches = [b for b in it if b.num_rows]
+        if not batches:
+            return
+        table = pa.Table.from_batches(batches).combine_chunks()
+        data = write_csv(table.select([f"c{i}" for i in range(width)]).to_batches()[0])
+        n = offset + TaskContext.get().partitionId()
+        _worker_io(spec, bc_io.value).write_pending(n, total, data)
+        yield pa.RecordBatch.from_arrays(
+            [pa.array([n], pa.int64()), pa.array([table.num_rows], pa.int64()), pa.array([len(data)], pa.int64()),
+             pa.array([_h.sha256(data).hexdigest()], pa.string())], names=["part", "rows", "bytes", "sha"])
+
+    return run
+
+
 # ---------------------------------------------------------------- driver
 def _verify(tally, k: int) -> int:
     """The final check over the written CSV. A seam so a test can force a failure."""
@@ -205,6 +323,7 @@ def _grid_cells(model, hist) -> List[Dict[str, Any]]:
 class Job:
     def __init__(self, job: str, phase: str, store_spec: Dict[str, str], kbs: KeySource, spark, *,
                  choice: Optional[str] = None, ner: Optional[NerSettings] = None, vault_prefix: str = ""):
+        self.jp = self.restore = None
         if phase not in PHASES:
             raise JobError("INVALID_INPUT")
         self.job, self.phase, self.store_spec, self.spark = job, phase, store_spec, spark
@@ -254,20 +373,21 @@ class Job:
         manifest = self.jio.read_manifest()
         if manifest["application"] != "kanon":
             raise JobError("INVALID_INPUT")
-        if len(manifest["tables"]) != 1:
-            # SKALD's sheet_joins runs in its Rust pipeline over whole sheets; skald_core has no join,
-            # so a multi-table bundle is refused rather than anonymised table by table (a join key
-            # would then disagree between outputs).
-            raise JobError("INVALID_INPUT")
         n = manifest["part_count"]
         if self.jio.list_parts() != list(range(n)):
             raise JobError("PARTS_MISMATCH")  # a part left out or added
         self.jio.discard_phase(self.out_dir)  # a retry's leftovers
 
-        table = manifest["tables"][0]
+        tables = manifest["tables"]
         cfg = manifest["config"]
         plan = sk.Plan(json.dumps(cfg))
         section = cfg.get(cfg.get("data_type", ""), {})
+        # Several tables: SKALD's own merge (sheet_joins, else stack, else join on shared columns) and, with
+        # restore_sheets, the split back. A single table is its own plan and changes nothing below.
+        self.jp = joins.plan_tables([(t["name"], t["header"]) for t in tables], joins.parse_sheet_joins(section))
+        self.restore = None
+        if len(tables) > 1 and section.get("restore_sheets") is True and self.jp.restore and len(self.jp.restore) > 1:
+            self.restore = self.jp.restore  # SKALD skips the split when only one sheet would come out
         qis = plan.has_quasi_identifiers
         if self.phase == "measure" and not qis:
             raise JobError("INVALID_INPUT")
@@ -275,20 +395,24 @@ class Job:
             raise JobError("INVALID_INPUT")  # an apply job exists only because a choice was approved
 
         slices = max(1, min(n, 4 * self.sc.defaultParallelism))
-        spec = ExecSpec(self.job, self.store_spec, table["header"], {p["part"]: p for p in table["parts"]}, n, plan,
-                        ner_columns(manifest), self.ner)
-        if spec.ner_cols and self.ner is None:
+        ner_cols = ner_columns(manifest)
+        if ner_cols and self.ner is None:
             raise JobError("INVALID_INPUT")  # the manifest asks for NER and no model is configured
-
         # Keys: saved ones from the slots, the rest derived from K_user (same on every executor and in both
         # explore_k phases), then broadcast. They are never written by this code; spark.io.encryption
         # (session.py) covers what Spark itself spills. generate_keys only validates completeness.
-        skeys = sk.generate_keys(plan, job_keys(plan, manifest, self.kstore))
+        skeys = sk.generate_keys(plan, job_keys(plan, manifest, self.kstore, self.jp))
         bc_io = self.sc.broadcast({"input": keys.input, "output": keys.output})
         vaults = self._open_vaults(manifest, plan)
         cached = []
         try:
-            raw = self.sc.parallelize(list(range(n)), slices).mapPartitions(_read_stage(spec, bc_io))
+            if len(tables) == 1:
+                table = tables[0]
+                spec = ExecSpec(self.job, self.store_spec, table["header"], {p["part"]: p for p in table["parts"]}, n,
+                                plan, ner_cols, self.ner)
+                raw = self.sc.parallelize(list(range(n)), slices).mapPartitions(_read_stage(spec, bc_io))
+            else:
+                raw, spec = self._joined(manifest, plan, bc_io, slices, ner_cols, cached)
             vault_state = {c: dict(v["entries"]) for c, v in vaults.items()}
             if plan.tokenized_columns():
                 raw = raw.persist(_storage())
@@ -304,6 +428,45 @@ class Job:
             for r in cached:
                 r.unpersist()
 
+    def _joined(self, manifest, plan, bc_io, slices, ner_cols, cached):
+        """The merged table of a multi-table bundle as the pipeline's usual parts RDD (number, Arrow IPC),
+        plus an ExecSpec for it. Every table is read as a DataFrame whose rows carry their file position,
+        joined as SKALD does (joins.py), numbered by that position, and cut into parts by Spark partition."""
+        from pyspark.sql import functions as F  # noqa: PLC0415
+        from pyspark.sql.types import BinaryType, LongType, StringType, StructField, StructType  # noqa: PLC0415
+
+        n, jp = manifest["part_count"], self.jp
+        frames = {}
+        for t in manifest["tables"]:
+            spec_t = ExecSpec(self.job, self.store_spec, t["header"], {p["part"]: p for p in t["parts"]}, n, plan)
+            schema = StructType([StructField(f"c{i}", StringType()) for i in range(len(t["header"]))]
+                                + [StructField(joins.ID, LongType())])
+            nums = [(p["part"],) for p in t["parts"]]
+            seed = self.spark.createDataFrame(nums, "part long").repartition(max(1, min(len(nums), slices)))
+            frames[t["name"]] = seed.mapInArrow(_table_read_stage(spec_t, bc_io), schema)
+        merged = joins.join_frames(self.spark, jp, frames, _storage())
+        if jp.mode in ("concat",):
+            # Stacked tables are unioned, not sorted: put them in file order and number them again.
+            merged = merged.orderBy(joins.ID).withColumn(joins.ID, F.monotonically_increasing_id()).persist(_storage())
+        total_bytes = sum(p["plaintext_bytes"] for t in manifest["tables"] for p in t["parts"])
+        # Parts of about 32 MB of input text, at least one Spark partition per core. A join that fans rows
+        # out makes the merged table larger than its inputs; parts then run bigger than that.
+        want = max(self.sc.defaultParallelism, -(-total_bytes // (32 << 20)))
+        merged = merged.repartitionByRange(want, joins.ID).sortWithinPartitions(joins.ID)
+        packed = merged.mapInArrow(_pack_stage(jp.columns), StructType([
+            StructField("pid", LongType()), StructField("rows", LongType()), StructField("ipc", BinaryType())]))
+        raw = (packed.rdd.filter(lambda r: r.rows > 0).zipWithIndex().map(lambda t: (t[1], bytes(t[0].ipc)))
+               .persist(_storage()))
+        cached.append(raw)
+        parts = raw.count()
+        if parts == 0:
+            raise JobError("INVALID_INPUT")  # the join produced no rows
+        spec = ExecSpec(self.job, self.store_spec, jp.columns, {}, parts, plan, ner_cols, self.ner)
+        if ner_cols:
+            raw = raw.mapPartitions(_ner_stage(spec)).persist(_storage())
+            cached.append(raw)
+        return raw, spec
+
     def _issue_tokens(self, spec, plan, raw, skeys, vaults, vault_state):
         """SKALD's token recipe: gather distinct values, issue on the driver, ship the vault to executors."""
         bc_pre = self.sc.broadcast({"keys": skeys, "vault": vault_state})
@@ -318,7 +481,7 @@ class Job:
         """{column: {spec, entries, master, mode}} for the vaults the manifest lists."""
         out: Dict[str, Dict[str, Any]] = {}
         tokenised = set(plan.tokenized_columns())
-        for v in vault_specs(manifest):
+        for v in vault_specs(manifest, self.jp):
             if v["column"] not in tokenised:
                 raise JobError("MANIFEST_INVALID")
             try:
@@ -386,12 +549,15 @@ class Job:
     def _write_grid_only(self, spec, manifest, model, cells) -> Dict[str, Any]:
         """`all` with a pass1 config: SKALD's CLI writes only the grid, so there are no output parts."""
         summary = {"summary_version": 1, "job_id": self.job, "kind": "rows", "part_count": 0,
-                   "tables": [{"name": manifest["tables"][0]["name"], "header": spec.header, "parts": []}],
+                   "tables": [{"name": self.jp.root, "header": spec.header, "parts": []}],
                    "extra": {"runtime": RUNTIME, "phase": self.phase, "grid": cells}}
         self.jio.write_summary("apply", summary)
         return summary
 
     def _apply(self, spec, bc_io, rdd, gen, decision, k, manifest, vault_state, vaults, keys, *, rows_in=None, node=None):
+        if self.restore:
+            return self._apply_restored(spec, bc_io, rdd, gen, decision, k, manifest, vault_state, vaults, keys,
+                                        rows_in=rows_in, node=node)
         sc, n = self.sc, spec.part_count
         results = rdd.mapPartitions(_write_stage(spec, bc_io, gen, decision)).collect()
         metas = sorted((m for batch, _ in results for m in batch), key=lambda m: m["part"])
@@ -408,15 +574,99 @@ class Job:
         slices = max(1, min(n, 4 * sc.defaultParallelism))
         sc.parallelize(list(range(n)), slices).mapPartitions(_publish_stage(spec)).count()
 
-        total_in = rows_in if rows_in is not None else sum(e["rows"] for e in spec.entries.values())
         rows_out = sum(m["rows"] for m in metas)
+        # Without a k check nothing is suppressed, so the rows read are the rows written (a merged table has
+        # no per-part manifest entries to sum).
+        total_in = rows_in if rows_in is not None else (sum(e["rows"] for e in spec.entries.values()) or rows_out)
         summary: Dict[str, Any] = {
             "summary_version": 1, "job_id": self.job, "kind": "rows", "part_count": n,
             "rows_in": total_in, "rows_out": rows_out, "suppressed": total_in - rows_out,
             "suppression_rate": (total_in - rows_out) / total_in if total_in else 0,
-            "tables": [{"name": manifest["tables"][0]["name"], "header": header,
+            "tables": [{"name": self.jp.root, "header": header,
                         "parts": [{k2: m[k2] for k2 in ("part", "rows", "plaintext_bytes", "plaintext_sha256")} for m in metas]}],
             "extra": {"runtime": RUNTIME, "phase": self.phase, "ner": bool(spec.ner_cols)},
+        }
+        if k is not None:
+            summary["k"] = k
+            summary["extra"].update(min_class_size=min_class, generalization_node=list(node), decision=decision.summary())
+            if self.choice:
+                summary["extra"]["choice"] = self.choice
+        self.jio.write_summary("apply", summary)
+        if self.phase != "measure":
+            self._commit_vaults(vaults, vault_state)
+        return summary
+
+    def _apply_restored(self, spec, bc_io, rdd, gen, decision, k, manifest, vault_state, vaults, keys, *,
+                        rows_in=None, node=None):
+        """restore_sheets: anonymise the merged table, then write one output table per input sheet, as SKALD's
+        write_restored_workbook does: the sheet's own columns under their original names, rows de-duplicated
+        on the anonymised values (a join fans one original row out into several merged rows), each at its
+        first occurrence. Output parts are numbered across the sheets in sheet order, so the summary's
+        part_count is known before the first one is sealed (every part's AAD contains it)."""
+        from pyspark.sql import functions as F  # noqa: PLC0415
+        from pyspark.sql.types import LongType, StringType, StructField, StructType  # noqa: PLC0415
+
+        sc, n_j, jp, sheets = self.sc, spec.part_count, self.jp, self.restore
+        fin = rdd.mapPartitions(_finish_stage(gen, decision)).persist(_storage())
+        try:
+            min_class = None
+            if gen is not None:
+                tally = fin.map(lambda x: x[2]).treeReduce(_merge)
+                min_class = _verify(tally, k)  # raises K_CHECK_FAILED before anything is written
+            joined_rows = fin.map(lambda x: x[3]).sum()
+            # The anonymised table's columns: techniques drop some (suppress), and the split gives a column
+            # that is gone an empty value, as SKALD's write_restored_workbook does.
+            names = fin.map(lambda x: from_ipc(x[1]).schema.names).first()
+            expand = StructType([StructField(f"c{i}", StringType()) for i in range(len(names))]
+                                + [StructField(joins.ID, LongType())])
+            table = (self.spark.createDataFrame(fin.map(lambda x: (int(x[0]), bytearray(x[1]))), "part long, ipc binary")
+                     .mapInArrow(_expand_stage(names), expand))
+            per_part = max(1, -(-joined_rows // n_j))
+            frames, offset = [], 0
+            for sc_cols in sheets:
+                df = joins.dedupe_sheet(F, table, sc_cols.columns, names).persist(_storage())
+                cached_df = df
+                cnt = df.count()
+                parts = max(1, min(n_j, -(-cnt // per_part)))
+                frames.append((sc_cols, cached_df, cnt, offset, parts))
+                offset += parts
+            total = offset
+            out_schema = StructType([StructField("part", LongType()), StructField("rows", LongType()),
+                                     StructField("bytes", LongType()), StructField("sha", StringType())])
+            out_spec = ExecSpec(self.job, self.store_spec, [], {}, total, spec.plan)
+            written = {}
+            try:
+                for sc_cols, df, cnt, off, parts in frames:
+                    width = len(sc_cols.columns)
+                    ranged = df.repartitionByRange(parts, joins.ID).sortWithinPartitions(joins.ID)
+                    stage = _write_sheet_stage(out_spec, bc_io, off, total, width)
+                    for r in ranged.mapInArrow(stage, out_schema).collect():
+                        written[r.part] = {"part": r.part, "rows": r.rows, "plaintext_bytes": r.bytes, "plaintext_sha256": r.sha}
+            finally:
+                for _, df, *_rest in frames:
+                    df.unpersist()
+            import hashlib as _h  # noqa: PLC0415
+
+            empty = _h.sha256(b"").hexdigest()
+            for p in range(total):  # a part no row fell into is still a part: empty, sealed like the others
+                if p not in written:
+                    self.jio.write_pending(p, total, b"")
+                    written[p] = {"part": p, "rows": 0, "plaintext_bytes": 0, "plaintext_sha256": empty}
+            sc.parallelize(list(range(total)), max(1, min(total, 4 * sc.defaultParallelism))).mapPartitions(
+                _publish_stage(out_spec)).count()
+        finally:
+            fin.unpersist()
+
+        total_in = rows_in if rows_in is not None else joined_rows
+        suppressed = total_in - joined_rows
+        tables = [{"name": c.sheet, "header": [orig for _, orig in c.columns],
+                   "parts": [written[p] for p in range(off, off + parts)]} for c, _, _, off, parts in frames]
+        summary: Dict[str, Any] = {
+            "summary_version": 1, "job_id": self.job, "kind": "rows", "part_count": total,
+            "rows_in": total_in, "rows_out": joined_rows, "suppressed": suppressed,
+            "suppression_rate": suppressed / total_in if total_in else 0, "tables": tables,
+            "extra": {"runtime": RUNTIME, "phase": self.phase, "ner": bool(spec.ner_cols), "joined_rows": joined_rows,
+                      "tables_in": len(jp.tables), "restored_from": jp.root},
         }
         if k is not None:
             summary["k"] = k

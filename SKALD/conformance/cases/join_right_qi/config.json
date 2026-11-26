@@ -1,0 +1,101 @@
+{
+  "data_type": "tabular",
+  "tabular": {
+    "output_path": "anonymized.csv",
+    "suppress": [
+      "name"
+    ],
+    "hashing_with_salt": [
+      "id"
+    ],
+    "shared_hash_salts": true,
+    "encrypt": [
+      {
+        "phone": {
+          "format_preserving": true
+        }
+      }
+    ],
+    "quasi_identifiers": {
+      "numerical": [
+        {
+          "column": "age"
+        },
+        {
+          "column": "pin"
+        }
+      ],
+      "categorical": [
+        {
+          "column": "gender"
+        },
+        {
+          "column": "blood"
+        }
+      ]
+    },
+    "size": {
+      "age": 2,
+      "pin": 10
+    },
+    "categorical_hierarchies": {
+      "blood": {
+        "A+": [
+          "A",
+          "*"
+        ],
+        "A-": [
+          "A",
+          "*"
+        ],
+        "B+": [
+          "B",
+          "*"
+        ],
+        "B-": [
+          "B",
+          "*"
+        ],
+        "O+": [
+          "O",
+          "*"
+        ],
+        "O-": [
+          "O",
+          "*"
+        ],
+        "AB+": [
+          "AB",
+          "*"
+        ],
+        "AB-": [
+          "AB",
+          "*"
+        ]
+      },
+      "gender": {
+        "M": [
+          "Any"
+        ],
+        "F": [
+          "Any"
+        ]
+      }
+    },
+    "k_anonymize": {
+      "k": 5
+    },
+    "suppression_limit": 0.1,
+    "sheet_joins": [
+      {
+        "left": "patients",
+        "right": "visits",
+        "on": [
+          "id"
+        ],
+        "how": "right"
+      }
+    ],
+    "restore_sheets": true
+  }
+}

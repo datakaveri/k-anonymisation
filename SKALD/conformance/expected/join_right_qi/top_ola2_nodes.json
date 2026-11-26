@@ -1,0 +1,57 @@
+[
+  {
+    "node": [
+      32,
+      100,
+      2,
+      2
+    ],
+    "dm_star": 962,
+    "num_equivalence_classes": 7,
+    "suppression_count": 6
+  },
+  {
+    "node": [
+      60,
+      100,
+      1,
+      2
+    ],
+    "dm_star": 992,
+    "num_equivalence_classes": 8,
+    "suppression_count": 2
+  },
+  {
+    "node": [
+      8,
+      100,
+      2,
+      3
+    ],
+    "dm_star": 1034,
+    "num_equivalence_classes": 7,
+    "suppression_count": 4
+  },
+  {
+    "node": [
+      16,
+      100,
+      1,
+      3
+    ],
+    "dm_star": 1067,
+    "num_equivalence_classes": 7,
+    "suppression_count": 5
+  },
+  {
+    "node": [
+      60,
+      100,
+      2,
+      1
+    ],
+    "dm_star": 1070,
+    "num_equivalence_classes": 7,
+    "suppression_count": 6
+  }
+]

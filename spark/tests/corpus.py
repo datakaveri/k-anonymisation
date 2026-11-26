@@ -4,7 +4,10 @@ import json
 
 from conftest import CORPUS
 
-CASES = sorted(p.name for p in (CORPUS / "cases").iterdir())
+_ALL = sorted(p.name for p in (CORPUS / "cases").iterdir())
+# One CSV per case (the single-table flow), or one workbook per case (the join flow, test_joins.py).
+CASES = [c for c in _ALL if (CORPUS / "cases" / c / "data.csv").exists()]
+JOIN_CASES = [c for c in _ALL if (CORPUS / "cases" / c / "data.xlsx").exists()]
 _KINDS = {"tabular_hash_salts.json": "hmac_salt", "symmetric_keys.json": "aes_key", "fpe_encrypt_keys.json": "fpe_key"}
 
 

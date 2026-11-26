@@ -1,0 +1,31 @@
+{
+  "data_type": "tabular",
+  "tabular": {
+    "output_path": "anonymized.csv",
+    "suppress": [
+      "name"
+    ],
+    "hashing_with_salt": [
+      "id"
+    ],
+    "shared_hash_salts": true,
+    "encrypt": [
+      {
+        "phone": {
+          "format_preserving": true
+        }
+      }
+    ],
+    "sheet_joins": [
+      {
+        "left": "patients",
+        "right": "hospitals",
+        "on": [
+          "hospital"
+        ],
+        "how": "cross"
+      }
+    ],
+    "restore_sheets": true
+  }
+}

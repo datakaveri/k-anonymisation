@@ -47,7 +47,12 @@ fn the_command_line_reproduces_every_recorded_output() {
         fs::create_dir_all(work.join("data")).unwrap();
         fs::create_dir_all(work.join("config")).unwrap();
         let src = corpus().join("cases").join(&case);
-        fs::copy(src.join("data.csv"), work.join("data/data.csv")).unwrap();
+        // One CSV, or (the join cases) one workbook.
+        for data in ["data.csv", "data.xlsx"] {
+            if src.join(data).exists() {
+                fs::copy(src.join(data), work.join("data").join(data)).unwrap();
+            }
+        }
         fs::copy(src.join("config.json"), work.join("config/config.json")).unwrap();
         copy_dir(&src.join("testkeys"), &work.join("keys"));
 
@@ -58,6 +63,20 @@ fn the_command_line_reproduces_every_recorded_output() {
         for e in fs::read_dir(&expected).unwrap() {
             let name = e.unwrap().file_name().to_string_lossy().to_string();
             let want = fs::read_to_string(expected.join(&name)).unwrap();
+            // `sheet.<name>.csv` is one sheet of the workbook `restore_sheets` writes, as CSV.
+            if let Some(sheet) = name.strip_prefix("sheet.").and_then(|n| n.strip_suffix(".csv")) {
+                let book = skald_ola2::pipeline::multitabular::read_xlsx_sheets(&work.join("output/anonymized.xlsx"))
+                    .unwrap_or_else(|e| panic!("{case}: restored workbook: {e}"));
+                let (_, restored) =
+                    book.into_iter().find(|(n, _)| n == sheet).unwrap_or_else(|| panic!("{case}: no sheet {sheet}"));
+                let mut got = String::new();
+                for row in std::iter::once(&restored.columns).chain(restored.rows.iter()) {
+                    got.push_str(&skald_ola2::pipeline::bootstrap::csv_row_to_line(row));
+                    got.push('\n');
+                }
+                assert_eq!(got, want, "{case}: sheet {sheet}");
+                continue;
+            }
             let got =
                 fs::read_to_string(work.join("output").join(&name)).unwrap_or_else(|_| panic!("{case}: no {name}"));
             if name == "status.json" {
