@@ -129,13 +129,91 @@ class AzureBlobStore:
         return sorted(b.name for b in self._c.list_blobs(name_starts_with=prefix))
 
 
+class AnonymousBlobStore:
+    """Read-only access to a publicly readable container, with NO credential at all.
+
+    Flow B: the owner leaves their (already encrypted) bundle in a container with anonymous read, and
+    `ANAMIKA_INPUT_ANONYMOUS=1` says so. Using an anonymous client, not DefaultAzureCredential, means the
+    pod's managed identity is never presented to an endpoint the owner controls, and a URL that carries
+    a SAS or any query string is refused rather than quietly turned into a credential.
+    """
+
+    def __init__(self, container_url: str):
+        if "?" in container_url or "#" in container_url:
+            raise IoError("BAD_STORE", "anonymous input url must not carry a query")
+        from azure.storage.blob import ContainerClient  # type: ignore
+
+        self._c = ContainerClient.from_container_url(container_url)
+
+    def get(self, path: str) -> bytes:
+        from azure.core.exceptions import ResourceNotFoundError  # type: ignore
+
+        try:
+            return self._c.download_blob(path).readall()
+        except ResourceNotFoundError:
+            raise IoError("NOT_FOUND", path) from None
+
+    def put(self, path: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+        raise IoError("READ_ONLY", path)
+
+    def delete(self, path: str) -> None:
+        raise IoError("READ_ONLY", path)
+
+    def list(self, prefix: str) -> List[str]:
+        return sorted(b.name for b in self._c.list_blobs(name_starts_with=prefix))
+
+
+def split_container_url(url: str):
+    """https://<account>.blob.core.windows.net/<container>/<prefix>/ -> (container_url, prefix)."""
+    m = re.match(r"^(https://[A-Za-z0-9.-]+/[^/?#]+)(?:/([^?#]*))?$", url)
+    if not m:
+        raise IoError("BAD_STORE", "input url")
+    prefix = (m.group(2) or "").strip("/")
+    if ".." in prefix.split("/") or "//" in prefix:
+        raise IoError("BAD_STORE", "input url")
+    return m.group(1), prefix
+
+
+def input_spec_from_env(env) -> Optional[Dict[str, str]]:
+    """The optional `input` part of a store spec, from ANAMIKA_INPUT_URL (flow B).
+
+    Absent: the job's input is staging/{job}/ in the main store (flow A). Present without
+    ANAMIKA_INPUT_ANONYMOUS the credential would be a SAS from KBS, which this runtime does not
+    implement yet, so that combination fails closed. ANAMIKA_INPUT_DIR (+ ANAMIKA_INPUT_PREFIX) is the
+    local-directory equivalent for tests and local runs.
+    """
+    if env.get("ANAMIKA_INPUT_DIR"):
+        return {"kind": "local", "root": env["ANAMIKA_INPUT_DIR"], "prefix": env.get("ANAMIKA_INPUT_PREFIX", "").strip("/")}
+    url = env.get("ANAMIKA_INPUT_URL")
+    if not url:
+        return None
+    if env.get("ANAMIKA_INPUT_ANONYMOUS") != "1":
+        raise IoError("UNSUPPORTED", "flow B input with a storage credential")
+    container, prefix = split_container_url(url)
+    return {"kind": "azure-anon", "url": container, "prefix": prefix}
+
+
+def with_input(store_spec: Dict[str, str], env) -> Dict[str, str]:
+    """store_spec plus the flow B input location, if the environment names one."""
+    inp = input_spec_from_env(env)
+    return {**store_spec, "input": inp} if inp else store_spec
+
+
 def store_from_spec(spec: Dict[str, str]) -> BlobStore:
     """Rebuild a store inside a worker from a small picklable description."""
     if spec["kind"] == "local":
         return LocalDirStore(spec["root"])
     if spec["kind"] == "azure":
         return AzureBlobStore(spec["url"])
+    if spec["kind"] == "azure-anon":
+        return AnonymousBlobStore(spec["url"])
     raise IoError("BAD_STORE")
+
+
+def input_from_spec(spec: Dict[str, Any]):
+    """(store, prefix) for flow B input, or None to read staging/{job}/ from the main store."""
+    inp = spec.get("input")
+    return (store_from_spec(inp), inp.get("prefix", "")) if inp else None
 
 
 _REQUIRED = ("bundle_version", "job_id", "application", "kind", "source_format", "part_count", "config")
@@ -182,13 +260,27 @@ def _json(body: Dict[str, Any]) -> bytes:
 class JobIO:
     """One job's objects. `keys` is only needed for the roles actually used (a worker holds input+output)."""
 
-    def __init__(self, store: BlobStore, job: str, keys: Keys):
+    def __init__(self, store: BlobStore, job: str, keys: Keys, input=None):
         self.store, self.job, self.keys = store, job, keys
         self.root = f"staging/{job}"
+        # Where manifest.enc and the input parts are read from. Default (flow A): the job's staging
+        # prefix in the main store. Flow B: the owner's prefix in the owner's container, as
+        # (store, prefix). Everything the job WRITES stays under self.root in the main store.
+        if input is None:
+            self.in_store, self.in_root = store, self.root
+        else:
+            self.in_store, self.in_root = input[0], input[1].strip("/")
+
+    @classmethod
+    def from_spec(cls, store_spec: Dict[str, Any], job: str, keys: Keys) -> "JobIO":
+        return cls(store_from_spec(store_spec), job, keys, input_from_spec(store_spec))
+
+    def _in(self, name: str) -> str:
+        return f"{self.in_root}/{name}" if self.in_root else name
 
     # -- reading -----------------------------------------------------------
     def read_manifest(self) -> Dict[str, Any]:
-        raw = self.store.get(f"{self.root}/manifest.enc")
+        raw = self.in_store.get(self._in("manifest.enc"))
         try:
             plain = bundle.open_(self.keys.manifest, raw, bundle.aad_manifest(self.job))
             return validate_manifest(json.loads(plain), self.job)
@@ -198,15 +290,16 @@ class JobIO:
     def list_parts(self) -> List[int]:
         """Part numbers present under staging/{job}/ (top level only)."""
         found = []
-        for name in self.store.list(self.root + "/"):
-            rel = name[len(self.root) + 1 :]
+        base = self._in("")
+        for name in self.in_store.list(base):
+            rel = name[len(base) :]
             m = _PART.match(rel)
             if m and "/" not in rel:
                 found.append(int(m.group(1)))
         return sorted(found)
 
     def read_part(self, n: int, total: int) -> bytes:
-        raw = self.store.get(f"{self.root}/{bundle.part_name(n)}.enc")
+        raw = self.in_store.get(self._in(f"{bundle.part_name(n)}.enc"))
         try:
             return bundle.open_(self.keys.input, raw, bundle.aad_input(self.job, n, total))
         except BundleError:

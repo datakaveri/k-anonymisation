@@ -10,6 +10,7 @@
 #   CHOICE            the approved grid cell id for PHASE=apply after explore_k, else empty (Spec.Choice)
 #   IMAGE             registry/repo of the anamika-spark image; IMAGE_DIGEST the sha256:... it is pinned to
 #   STORE_URL         https://<account>.blob.core.windows.net/<container>   (the job's staging container)
+#   INPUT_URL, INPUT_ANONYMOUS   flow B only (Spec env ANAMIKA_INPUT_URL / _ANONYMOUS); empty for flow A
 #   EXECUTORS         executor count (Spec.Executors); the AO runs `local[*]` jobs another way, see README
 #   DRIVER_MEMORY / EXECUTOR_MEMORY / EXECUTOR_CORES   sizing
 #   INIT_DATA_B64     base64(gzip(init data TOML)) naming JOB_ID and IMAGE_DIGEST, so KBS releases keys
@@ -59,6 +60,9 @@ spec:
       - { name: ANAMIKA_PHASE, value: "${PHASE}" }
       - { name: ANAMIKA_CHOICE, value: "${CHOICE}" }
       - { name: ANAMIKA_STORE_URL, value: "${STORE_URL}" }
+      # Flow B only (empty values are ignored): the owner's prefix and "1" when it is read anonymously.
+      - { name: ANAMIKA_INPUT_URL, value: "${INPUT_URL}" }
+      - { name: ANAMIKA_INPUT_ANONYMOUS, value: "${INPUT_ANONYMOUS}" }
       - { name: ANAMIKA_NER_MODEL_REF, value: "${NER_MODEL_REF}" }
       - { name: ANAMIKA_NER_SHA256, value: "${NER_SHA256}" }
       # The pod's managed identity reaches Blob; no account key anywhere (azure-identity picks these up).

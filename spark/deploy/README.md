@@ -10,6 +10,12 @@ Templates only. The Co-ordinator (its own repo, not changed from here) renders t
 | `sparkapplication.template.yaml` | Spark Operator `SparkApplication`, `runtimeClassName: kata-remote`, init data, memory-backed volumes |
 | `main.py` | the `mainApplicationFile` spark-submit needs |
 
+**Flow B egress.** A job whose `ANAMIKA_INPUT_URL` is set reads the data owner's Blob account directly, so its
+driver and executors need egress to that endpoint (TCP 443). The per-job NetworkPolicy (same shape as
+`workloads/ray/deploy/networkpolicy.yaml` in anamika-control-plane) does not allow it by default: the Co-ordinator
+must add one allowlist entry for the host in `ANAMIKA_INPUT_URL` for that job and remove it with the job, never a
+`*.blob.core.windows.net` wildcard. Outputs still go to `ANAMIKA_STORE_URL` `staging/{job}/`.
+
 ## What the Co-ordinator must provide per job
 
 KBS resources at `anamika/{job}/...` (the AO writes `user-key` and `key-NN`; the Co-ordinator's own policy
@@ -33,6 +39,7 @@ Env vars the driver reads (`anamika_spark/run.py`). The Co-ordinator's `Spec` fi
 | `ANAMIKA_PHASE` (or `PHASE`) | `Spec.Phase` | `all` = measure then apply in one job; `measure` and `apply` = the two jobs of explore_k |
 | `ANAMIKA_CHOICE` | `Spec.Choice` | the approved grid cell id (apply after explore_k). Opaque: passed back untouched |
 | `ANAMIKA_STORE_URL` | `Spec.InputURI`'s container | `https://<account>.blob.core.windows.net/<container>`; objects live under `staging/{job}/` |
+| `ANAMIKA_INPUT_URL`, `ANAMIKA_INPUT_ANONYMOUS` | Spec env | flow B only: the owner's `https://.../<container>/<prefix>/` holding `manifest.enc` and the parts, read with no credential when `ANAMIKA_INPUT_ANONYMOUS=1` (the only mode implemented; with a credential the job fails closed). Absent: input is `staging/{job}/` of `ANAMIKA_STORE_URL`. Outputs always go to `ANAMIKA_STORE_URL` |
 | `ANAMIKA_KEY_MODE` | | `cdh` (default) or `dir` (files in `ANAMIKA_KEY_DIR`; NOT confidential, development only) |
 | `ANAMIKA_SPARK_MASTER` | | `local[*]` for the single-VM path; unset on Kubernetes |
 | `ANAMIKA_DRIVER_MEMORY`, `ANAMIKA_LOCAL_DIR` | | local mode only |

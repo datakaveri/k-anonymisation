@@ -35,7 +35,7 @@ import skald_core as sk
 from . import logscrub
 from .bundle import Keys
 from .errors import JobError, code_of, coded_iter
-from .io import IoError, JobIO, read_vault, store_from_spec, write_vault
+from .io import IoError, JobIO, input_from_spec, read_vault, store_from_spec, write_vault
 from .kbs import KeySource, KeyStore, KeyUnavailable
 from .keymap import job_keys, vault_specs
 from .ner import NerSettings, ner_columns, redact_batch
@@ -62,7 +62,7 @@ class ExecSpec:
 
 def _worker_io(spec: ExecSpec, secrets: Dict[str, bytes]) -> JobIO:
     # An executor holds only the input and output keys; manifest and summary keys stay on the driver.
-    return JobIO(store_from_spec(spec.store), spec.job, Keys(secrets["input"], b"", secrets["output"], b""))
+    return JobIO.from_spec(spec.store, spec.job, Keys(secrets["input"], b"", secrets["output"], b""))
 
 
 def _merge(a, b):
@@ -173,7 +173,7 @@ def _write_stage(spec: ExecSpec, bc_io, gen, decision):
 def _publish_stage(spec: ExecSpec):
     @coded_iter
     def run(it):
-        io = JobIO(store_from_spec(spec.store), spec.job, Keys(b"", b"", b"", b""))
+        io = JobIO.from_spec(spec.store, spec.job, Keys(b"", b"", b"", b""))
         for n in it:
             io.publish_output(n)
         return
@@ -222,7 +222,7 @@ class Job:
         except KeyUnavailable:
             self._best_effort_status("KEY_UNAVAILABLE")
             return {"ok": False, "code": "KEY_UNAVAILABLE"}
-        self.jio = JobIO(self.store, self.job, keys)
+        self.jio = JobIO(self.store, self.job, keys, input_from_spec(self.store_spec))
         try:
             summary = self._run(keys)
         except BaseException as e:  # noqa: BLE001 - every failure must end in a status object
