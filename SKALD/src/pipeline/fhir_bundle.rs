@@ -36,8 +36,8 @@
 
 use crate::pipeline::bootstrap::{PipelineError, io_err, validation};
 use crate::pipeline::nested_json::{
-    Action, Census, Predicate, Resolver, Rule, apply_action, decide_at, decide_in, display_path, json_files,
-    parse_action, parse_policy_rules, privacy_rank, wildcard_match, write_census,
+    Action, Census, FreeTextPass, Predicate, Resolver, Rule, apply_action, decide_at, decide_in, display_path,
+    json_files, parse_action, parse_policy_rules, privacy_rank, wildcard_match, write_census,
 };
 use crate::pipeline::preprocess::crypto::{generate_random_salt_hex, hash_key, keyed_hash, write_secret_file};
 use crate::pipeline::preprocess::masking::{MaskingConfigLite, parse_masking_config};
@@ -508,6 +508,13 @@ pub struct Salts {
     /// Decoded salts: each column's HMAC key. Stored as 64 hex chars.
     by_column: BTreeMap<String, [u8; 32]>,
     created: usize,
+    /// Set by [`Salts::provided`]: the caller derived every key, so a column
+    /// it did not supply is an error, never a salt invented on the spot.
+    strict: bool,
+    /// Columns asked for under `strict` that were not supplied.
+    missing: std::collections::BTreeSet<String>,
+    /// See [`FreeTextPass`].
+    pub free_text: FreeTextPass,
 }
 
 impl Salts {
@@ -516,12 +523,29 @@ impl Salts {
         if let Some(k) = self.by_column.get(column) {
             return *k;
         }
+        if self.strict {
+            // Nothing is released from a walk that used this: the caller
+            // checks `missing()` and fails the document.
+            self.missing.insert(column.to_string());
+            return [0; 32];
+        }
         // The OS RNG is checked when the run starts, so this cannot fail later,
         // and a fresh salt is always 64 hex chars.
         let key = generate_random_salt_hex().and_then(|s| hash_key(&s, column)).expect("OS RNG checked at startup");
         self.by_column.insert(column.to_string(), key);
         self.created += 1;
         key
+    }
+
+    /// Exactly these salts (column -> HMAC key), for a caller that derives them
+    /// per job instead of keeping a salt file.
+    pub fn provided(by_column: BTreeMap<String, [u8; 32]>) -> Salts {
+        Salts { by_column, strict: true, ..Default::default() }
+    }
+
+    /// Columns a strict walk needed and was not given, sorted.
+    pub fn missing(&self) -> Vec<String> {
+        self.missing.iter().cloned().collect()
     }
 
     fn load(path: &Path) -> Result<Salts, PipelineError> {
@@ -546,7 +570,7 @@ impl Salts {
                 .ok_or_else(|| validation("CONFIG_INVALID_VALUE", "fhir_bundle salt file holds an empty salt", col))?;
             by_column.insert(col.clone(), hash_key(salt, &format!("{}: {col}", path.display()))?);
         }
-        Ok(Salts { by_column, created: 0 })
+        Ok(Salts { by_column, ..Default::default() })
     }
 
     fn save(&self, path: &Path) -> Result<(), PipelineError> {
@@ -1124,6 +1148,7 @@ impl Walker<'_> {
                     Some(Value::String(self.salts.hash(&matched_by, &canonical)))
                 }
             }
+            Action::FreeText => Some(self.salts.free_text.leaf(leaf)),
             // The key argument is only read by `Hash`, handled above.
             other => apply_action(other, leaf, &self.cfg.masking, None),
         };
@@ -1131,9 +1156,13 @@ impl Walker<'_> {
         // The sweep: a value released as-is must not contain an identifier
         // this same bundle suppressed or pseudonymised somewhere else.
         let released_verbatim = matches!(action, Action::Keep | Action::FreeText);
+        // Free text is swept as it will be released: when a caller cleans it first
+        // (`FreeTextPass`), the cleaned text is what must not hold an identifier.
+        // Without a pass `result` is the leaf itself, so nothing changes.
+        let released = if action == Action::FreeText { result.as_ref().unwrap_or(leaf) } else { leaf };
         if released_verbatim
             && self.cfg.propagation_enabled
-            && let Some(text) = leaf.as_str()
+            && let Some(text) = released.as_str()
             && let Some(src) = self.needles.hit(text)
         {
             let by = format!("propagated:{src}");
@@ -1261,6 +1290,35 @@ fn input_stem(file: &Path) -> &str {
         .map(|ext| name.len() - ext.len())
         .unwrap_or(name.len());
     &name[..stem_len]
+}
+
+/// The salt columns a policy can hash under, which is what a caller deriving
+/// keys per job must supply: the resource-id column, the output-name column
+/// when names are pseudonymised, every `hashing_with_salt` path rule, and every
+/// hashing code rule (`code:<glob>` / `coding:<system|code>`). Names are
+/// exactly the columns `fhir_bundle_salts.json` holds after a CLI run.
+pub fn salt_columns(cfg: &FhirBundleConfig) -> Vec<String> {
+    let mut cols = vec![ID_COLUMN.to_string()];
+    if cfg.output_names == OutputNames::Pseudonym {
+        cols.push(OUTPUT_NAME_COLUMN.to_string());
+    }
+    cols.extend(cfg.rules.iter().filter(|r| r.action == Action::Hash).map(|r| r.pattern.clone()));
+    for scope in &cfg.code_scopes {
+        cols.extend(scope.rules.iter().filter(|r| r.action == Action::Hash).map(|r| format!("code:{}", r.pattern)));
+        cols.extend(scope.codings.iter().filter(|(_, a)| *a == Action::Hash).map(|(k, _)| format!("coding:{k}")));
+    }
+    cols.sort();
+    cols.dedup();
+    cols
+}
+
+/// The file name a bundle is written under, as the command line names it.
+pub fn output_file_name(cfg: &FhirBundleConfig, salts: &mut Salts, input_name: &str) -> String {
+    let file = Path::new(input_name);
+    match cfg.output_names {
+        OutputNames::Input => output_name(file),
+        OutputNames::Pseudonym => pseudonymous_output_name(&salts.for_column(OUTPUT_NAME_COLUMN), file),
+    }
 }
 
 /// The output file name for one bundle: `<input stem>_anonymised.fhir.json`,

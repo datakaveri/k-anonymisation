@@ -5,6 +5,18 @@ All notable changes to SKALD are recorded here. The format follows
 [Semantic Versioning](https://semver.org/). The version in `SKALD/Cargo.toml`
 is the release version; tags are `v<version>`.
 
+## [Unreleased]
+
+### Added
+
+- **Per-document API for FHIR bundles and nested JSON** (`skald_ola2::batch::documents`, Python
+  `skald_core.FhirPlan` / `NestedPlan`). Neither flow has dataset-wide state that shapes an output, so one
+  document is anonymised from the config and the keys alone and gives the command line's bytes. Keys are passed
+  in (`required_keys()` lists the names SKALD files them under); a missing key is `KEY_MATERIAL_MISSING`, never
+  a salt made up on the spot. An optional redactor cleans the strings the config releases as `free_text` before
+  the document is built. `tokenization` (one shared random vault) is refused. The command line is unchanged.
+- Synthetic FHIR and nested JSON corpus (`SKALD/conformance/documents`).
+
 ## [4.2.0] — 2026-11-26
 
 SKALD can now be driven one batch at a time, so a distributed job (Spark

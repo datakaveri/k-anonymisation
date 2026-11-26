@@ -844,6 +844,47 @@ pub(crate) fn hash_token(key: &[u8; 32], value: &str) -> String {
     keyed_hash(key, value.as_bytes())
 }
 
+/// Two-pass hook for text a caller cleans before it is released (`free_text`).
+///
+/// `free_text` releases a value as it is because an upstream pass (NER) is
+/// assumed to have cleaned it. A caller that runs that pass itself, such as a
+/// Ray worker with an NER client, cannot know the leaves in advance (which
+/// paths release as free text depends on the rules, predicates and resources),
+/// so the walk tells it: `Collect` leaves every value unchanged and records the
+/// free-text strings in walk order, the caller cleans the list, and `Replace`
+/// walks again handing the cleaned strings back in the same order. The walk is
+/// deterministic, so the Nth leaf of the second pass is the Nth of the first.
+///
+/// It rides with the run's key state ([`KeyStore`], `fhir_bundle::Salts`) so the
+/// walkers keep their signatures; `Off` (the default) changes nothing.
+#[derive(Debug, Default, Clone)]
+pub enum FreeTextPass {
+    #[default]
+    Off,
+    Collect(Vec<String>),
+    Replace(std::collections::VecDeque<String>),
+}
+
+impl FreeTextPass {
+    /// What a free-text leaf becomes. Only non-empty strings take part.
+    pub(crate) fn leaf(&mut self, value: &Value) -> Value {
+        let Value::String(text) = value else { return value.clone() };
+        if text.trim().is_empty() {
+            return value.clone();
+        }
+        match self {
+            FreeTextPass::Off => value.clone(),
+            FreeTextPass::Collect(seen) => {
+                seen.push(text.clone());
+                value.clone()
+            }
+            // Running out means the two walks disagreed: keep nothing rather
+            // than release text that was never cleaned.
+            FreeTextPass::Replace(next) => Value::String(next.pop_front().unwrap_or_default()),
+        }
+    }
+}
+
 /// Applies one action to one leaf. `None` means "remove this key".
 ///
 /// `matched_by` is the pattern that chose `action`; the reversible techniques
@@ -869,6 +910,7 @@ fn apply(
         Action::Encrypt { format_preserving } => {
             Some(Value::String(keys.encrypt(matched_by, *format_preserving, &normalize_identifier(&text))?))
         }
+        Action::FreeText => Some(keys.free_text.leaf(value)),
         other => apply_action(other, value, &cfg.masking, Some(&keys.hash_key)),
     }
 }
@@ -981,12 +1023,26 @@ pub struct KeyStore {
     vaults: BTreeMap<String, TokenVault>,
     symmetric: BTreeMap<String, String>,
     fpe: BTreeMap<String, String>,
+    /// See [`FreeTextPass`].
+    pub free_text: FreeTextPass,
 }
 
 impl KeyStore {
     /// A store holding only a hash key, with empty vaults and no keys yet.
     pub fn with_hash_key(hash_key: [u8; 32]) -> KeyStore {
         KeyStore { hash_key, ..Default::default() }
+    }
+
+    /// A store holding exactly the keys given (hash key, `encrypt` master keys by
+    /// pattern as hex): what a caller that derives them, instead of reading a key
+    /// directory, hands in. The caller must supply a key for every `encrypt`
+    /// pattern; a missing one would be generated at random on first use.
+    pub fn with_keys(
+        hash_key: [u8; 32],
+        symmetric: BTreeMap<String, String>,
+        fpe: BTreeMap<String, String>,
+    ) -> KeyStore {
+        KeyStore { hash_key, symmetric, fpe, ..Default::default() }
     }
 
     /// Reads whatever vault and keys earlier runs left in `dir`.

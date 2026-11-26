@@ -22,9 +22,13 @@
 //!    [`Tally::decide`], then [`Generalizer::finish`] on every batch.
 //! 8. [`Generalizer::tally`] on the written rows and [`Tally::verify`] — the
 //!    final k check.
+//!
+//! FHIR bundles and nested JSON have no such steps: each document is
+//! anonymised on its own from the config and the keys, see [`documents`].
 
 #[cfg(feature = "arrow")]
 pub mod arrow_io;
+pub mod documents;
 pub mod generalise;
 pub mod histogram;
 pub mod model;
@@ -35,6 +39,7 @@ pub mod table;
 pub use crate::pipeline::preprocess::{
     KeyKind, KeyMaterial, KeyPolicy, MemoryVault, Preprocessor, TokenPolicy, TokenVault,
 };
+pub use documents::{DocKind, DocOutput, DocPlan};
 pub use generalise::{Decision, Generalizer, Tally};
 pub use histogram::{Cells, Histogram};
 pub use model::Model;

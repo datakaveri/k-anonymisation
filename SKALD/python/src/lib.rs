@@ -19,7 +19,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use skald_ola2::batch::arrow_io::{batch_from_table, table_from_batch};
 use skald_ola2::batch::{
-    Decision, Generalizer, Histogram, KeyKind, KeyMaterial, KeyPolicy, MemoryVault, Model, Plan, Preprocessor,
+    DocKind, DocPlan, Decision, Generalizer, Histogram, KeyKind, KeyMaterial, KeyPolicy, MemoryVault, Model, Plan, Preprocessor,
     QiColumns, Stats, Table, Tally, TokenPolicy,
 };
 use skald_ola2::pipeline::bootstrap::PipelineError;
@@ -631,6 +631,71 @@ fn _decision_from_bytes(data: &[u8]) -> PyResult<PyDecision> {
     Ok(PyDecision { inner: Decision::from_bytes(data).map_err(err)? })
 }
 
+// ── Per-document flows ───────────────────────────────────────────────────────
+
+/// Python's view of [`DocPlan`]. Two classes (`FhirPlan`, `NestedPlan`) share this body.
+macro_rules! doc_plan_class {
+    ($py_ty:ident, $name:literal, $kind:expr) => {
+        #[pyclass(name = $name, module = "skald_core")]
+        struct $py_ty {
+            inner: DocPlan,
+        }
+
+        #[pymethods]
+        impl $py_ty {
+            #[new]
+            fn new(config_json: &str) -> PyResult<Self> {
+                Ok(Self { inner: DocPlan::from_json(config_json, $kind).map_err(err)? })
+            }
+            #[getter]
+            fn config_json(&self) -> &str {
+                &self.inner.json
+            }
+            /// `[(kind, name)]` of every key the config can use. `kind` is
+            /// `hmac_salt` (32 bytes), `aes_key` or `fpe_key` (16 bytes).
+            fn required_keys(&self) -> Vec<(String, String)> {
+                self.inner.required_keys().into_iter().map(|(k, n)| (k.as_str().to_string(), n)).collect()
+            }
+            /// The path globs whose released text is `free_text`.
+            fn free_text_paths(&self) -> Vec<String> {
+                self.inner.free_text_paths()
+            }
+            /// The name the command line writes the document under.
+            fn output_name(&self, keys: &Bound<'_, PyDict>, input_name: &str) -> PyResult<String> {
+                self.inner.output_name(&keys_from_py(keys)?, input_name).map_err(err)
+            }
+            /// `(output bytes, audit)` for one document. `redact`, if given, takes the
+            /// list of free-text strings and returns the cleaned list.
+            #[pyo3(signature = (keys, document, redact=None))]
+            fn apply<'py>(
+                &self,
+                py: Python<'py>,
+                keys: &Bound<'py, PyDict>,
+                document: &[u8],
+                redact: Option<Bound<'py, PyAny>>,
+            ) -> PyResult<(Bound<'py, PyBytes>, Py<PyAny>)> {
+                let keys = keys_from_py(keys)?;
+                let mut call = |texts: Vec<String>| -> Result<Vec<String>, PipelineError> {
+                    let cb = redact.as_ref().expect("only called when present");
+                    cb.call1((texts,))
+                        .and_then(|r| r.extract::<Vec<String>>())
+                        .map_err(|_| skald_ola2::pipeline::bootstrap::validation("NER_FAILED", "the redactor failed", ""))
+                };
+                let out = if redact.is_some() {
+                    self.inner.apply(&keys, document, Some(&mut call))
+                } else {
+                    self.inner.apply(&keys, document, None)
+                }
+                .map_err(err)?;
+                Ok((PyBytes::new(py, &out.bytes), to_py_json(py, &out.audit)?))
+            }
+        }
+    };
+}
+
+doc_plan_class!(PyFhirPlan, "FhirPlan", DocKind::Fhir);
+doc_plan_class!(PyNestedPlan, "NestedPlan", DocKind::Nested);
+
 #[pymodule]
 fn skald_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SkaldError", m.py().get_type::<SkaldError>())?;
@@ -643,6 +708,8 @@ fn skald_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGeneralizer>()?;
     m.add_class::<PyTally>()?;
     m.add_class::<PyDecision>()?;
+    m.add_class::<PyFhirPlan>()?;
+    m.add_class::<PyNestedPlan>()?;
     m.add_function(wrap_pyfunction!(generate_keys, m)?)?;
     m.add_function(wrap_pyfunction!(_stats_from_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(_model_from_state, m)?)?;

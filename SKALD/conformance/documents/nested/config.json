@@ -1,0 +1,56 @@
+{
+  "data_type": "nested",
+  "nested": {
+    "nested_json": true,
+    "dry_run": false,
+    "input_path": "data/nested",
+    "output_path": "nested",
+    "output_directory": "output",
+    "default_action": "suppress",
+    "keep": [
+      "total_pages",
+      "pages[].page_number",
+      "pages[].total_pages",
+      "pages[].document",
+      "**.hospital_state",
+      "**.diagnosis"
+    ],
+    "suppress": [
+      "**.patient_name",
+      "**.address",
+      "**.gps_*"
+    ],
+    "hashing_with_salt": [
+      "case_id",
+      "**.mobile_number"
+    ],
+    "free_text": [
+      "**.nurse_remarks"
+    ],
+    "masking": [
+      {
+        "column": "**.pincode",
+        "masking_char": "*",
+        "apply_order": [
+          "characters"
+        ],
+        "characters_to_mask": [
+          4,
+          5,
+          6
+        ]
+      }
+    ],
+    "encrypt": [
+      "**.aadhaar_number",
+      {
+        "**.ration_card": {
+          "format_preserving": true
+        }
+      }
+    ],
+    "filename": [
+      "pages[].link"
+    ]
+  }
+}

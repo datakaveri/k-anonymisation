@@ -1,0 +1,101 @@
+{
+  "data_type": "fhir",
+  "fhir": {
+    "fhir_bundle": true,
+    "dry_run": false,
+    "input_path": "data/fhir",
+    "output_path": "fhir",
+    "output_directory": "output",
+    "default_action": "suppress",
+    "keep": [
+      "Bundle.type",
+      "**.status",
+      "**.meta.tag[].system",
+      "**.meta.tag[].code",
+      "**.coding[].system",
+      "**.coding[].code",
+      "**.coding[].display",
+      "**.code.text",
+      "**.type.text",
+      "**.category[].text",
+      "Observation.valueQuantity.*",
+      "Patient.gender",
+      "DocumentReference.content[].attachment.title"
+    ],
+    "suppress": [
+      "Patient.name.**",
+      "Organization.name",
+      "Organization.alias",
+      "**.attachment.url",
+      "**.text.div",
+      "**.identifier[].system",
+      "Patient.identifier[].value"
+    ],
+    "hashing_with_salt": [
+      "Claim.identifier[].value",
+      "**.meta.source"
+    ],
+    "free_text": [
+      "DiagnosticReport.conclusion"
+    ],
+    "masking": [
+      {
+        "column": "Patient.birthDate",
+        "masking_char": "*",
+        "apply_order": [
+          "characters"
+        ],
+        "characters_to_mask": [
+          6,
+          7,
+          8,
+          9,
+          10
+        ]
+      },
+      {
+        "column": "Patient.telecom[].value",
+        "masking_char": "*",
+        "apply_order": [
+          "regex"
+        ],
+        "regex_patterns": [
+          {
+            "regex": "^(.*?)(.{0,4})$",
+            "mask_groups": {
+              "1": "full"
+            }
+          }
+        ]
+      }
+    ],
+    "drop_resources": [
+      "Organization"
+    ],
+    "code_rules": {
+      "suppress": [
+        "gps_*"
+      ],
+      "free_text": [
+        "nurse_remarks"
+      ],
+      "hashing_with_salt": [
+        "*uhid*"
+      ],
+      "keep": [
+        "hemoglobin"
+      ]
+    },
+    "propagation": {
+      "enabled": true,
+      "min_length": 6,
+      "from": [
+        "Patient.name.**",
+        "Patient.telecom[].value"
+      ]
+    },
+    "hash_strip_prefixes": [
+      "urn:example:"
+    ]
+  }
+}
