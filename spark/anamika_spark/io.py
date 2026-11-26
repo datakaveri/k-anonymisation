@@ -7,7 +7,7 @@ Layout (contracts/bundle/README.md):
                   apply/part-NNNNN.enc   apply/summary.enc    apply/status.json
     vaults/{vault_id}/v{version}.enc      (token vaults; path prefix is configurable)
 
-Vendored from anamika-ray (the store classes are identical, so both should later move to one
+Vendored from anamika-control-plane workloads/ray (the store classes are identical, so both should later move to one
 shared `anamika-bundle` package); the JobIO half is rows- and phase-oriented here.
 
 BlobStore is the only thing that touches storage. AzureBlobStore is the

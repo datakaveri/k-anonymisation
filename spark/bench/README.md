@@ -6,8 +6,8 @@
 export SKALD_BIN=.../skald_pipeline
 .venv-skald/bin/python k-anonymisation/SKALD/bench/harness.py --rows 100000 --engines cli,batch,external \
     --batches 8 --external-name anamika-spark \
-    --external-cmd ".venv-skald/bin/python anamika-spark/bench/spark_external.py {input} {output}"
-.venv-skald/bin/python anamika-spark/bench/spark_external.py --corpus     # conformance corpus, byte compare
+    --external-cmd ".venv-skald/bin/python spark/bench/spark_external.py {input} {output}"
+.venv-skald/bin/python spark/bench/spark_external.py --corpus     # conformance corpus, byte compare
 ```
 
 It packs the CSV into a bundle (the harness's CONFIG and fixed test keys become manifest and key slots), runs

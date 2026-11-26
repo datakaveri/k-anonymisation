@@ -1,4 +1,4 @@
-# anamika-spark: the driver and executor image (one image, both roles).
+# spark/ (anamika_spark): the driver and executor image (one image, both roles).
 #
 # Target: < 1 GB, no model weights (review item R4: NER models are a pinned Blob folder fetched at run
 # time and verified by hash, so the image digest in the init data stays the same when a model changes).
@@ -6,10 +6,10 @@
 # + pyarrow ~170 MB + skald_core (release) ~30 MB + the rest ~30 MB = ~870 MB uncompressed.
 #
 # Build the skald_core wheel first, from the SKALD repo, inside the same Debian release:
-#     maturin build --release -m k-anonymisation/SKALD/python/Cargo.toml -o anamika-spark/wheels
+#     maturin build --release -m k-anonymisation/SKALD/python/Cargo.toml -o k-anonymisation/spark/wheels
 # and add the NER library only if jobs will use it:   --build-arg WITH_NER=1  (copy anamika_ner next to this file)
 #
-#     docker build -f deploy/Dockerfile -t anamika-spark:dev .
+#     (run from k-anonymisation/spark)  docker build -f deploy/Dockerfile -t anamika-spark:dev .
 # The Co-ordinator pins the DIGEST of the pushed image (not the tag) in the init data.
 
 FROM python:3.12-slim-bookworm

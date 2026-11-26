@@ -17,7 +17,7 @@ b = base64.b64decode
 
 
 def test_matches_control_plane_copy_when_present():
-    cp = Path(os.environ.get("ANAMIKA_CONTROL_PLANE", HERE.parents[1] / "anamika-control-plane")) / "contracts/bundle/vectors.json"
+    cp = Path(os.environ.get("ANAMIKA_CONTROL_PLANE", HERE.parents[2] / "anamika-control-plane")) / "contracts/bundle/vectors.json"
     if not cp.exists():
         pytest.skip("control-plane repo not checked out beside this one")
     assert json.loads(cp.read_text()) == V, "fixture drifted from contracts/bundle/vectors.json: re-copy it and re-run"

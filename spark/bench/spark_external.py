@@ -2,9 +2,9 @@
 """SKALD harness `external` engine: pack a CSV into a bundle, run the Spark job in local mode, unpack.
 
     python3 SKALD/bench/harness.py --rows 100000 --engines cli,external --external-name anamika-spark \
-        --external-cmd ".venv-skald/bin/python anamika-spark/bench/spark_external.py {input} {output}"
+        --external-cmd ".venv-skald/bin/python spark/bench/spark_external.py {input} {output}"
 
-    python3 anamika-spark/bench/spark_external.py --corpus        # every conformance case vs the recorded CLI output
+    python3 spark/bench/spark_external.py --corpus        # every conformance case vs the recorded CLI output
 
 What it does: the harness's config and fixed test keys (SKALD/bench/harness.py CONFIG and KEYS) become the
 manifest and key slots, the CSV is cut into parts and sealed with the bundle code, `run_job(phase=all)`

@@ -15,7 +15,7 @@ from anamika_spark.kbs import KeyStore
 from anamika_spark.testkit import K_USER, fake_kbs, pack_rows, read_result
 from helpers import run
 
-# One vector shared with anamika-ray (tests/test_keystore_vector.py there): both must give this hex.
+# One vector shared with workloads/ray in anamika-control-plane (tests/test_kbs.py there): both must give this hex.
 # K_user = bytes(range(32)), kind "hmac_salt", name "regno".
 SHARED_VECTOR = "e137bd0f483f538f32cc2c6b8a1a82ce9c4a3ee25b1fe642424abe46ec4308d7"
 

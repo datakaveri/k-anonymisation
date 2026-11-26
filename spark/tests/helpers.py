@@ -5,7 +5,7 @@ import corpus
 from anamika_spark.job import run_job
 from anamika_spark.testkit import fake_kbs, pack_rows, read_result
 
-CONTRACT = Path(__file__).resolve().parents[2] / "anamika-control-plane" / "contracts" / "schemas"
+CONTRACT = Path(__file__).resolve().parents[3] / "anamika-control-plane" / "contracts" / "schemas"
 
 
 def job_id(name, tag=""):

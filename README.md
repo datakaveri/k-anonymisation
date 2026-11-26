@@ -5,6 +5,12 @@ Implements the OLA-1 / OLA-2 lattice algorithms for optimal generalization with 
 
 ---
 
+## Layout
+
+`SKALD/` is the Rust k-anonymity engine; `spark/` is the distributed (PySpark) job that runs SKALD's core over an
+encrypted bundle for the Anamika confidential-compute flow (see `spark/README.md`). It lives here, not in its own
+repo, because it is SKALD-specific and tracks SKALD's core wheel; its history was kept (`git subtree`).
+
 ## What it does
 
 1. Reads one table: a CSV, JSON (array of flat objects) or Excel file (`.xlsx`/`.xls`, including multi-sheet workbooks joined into one table), or a PostgreSQL table or query

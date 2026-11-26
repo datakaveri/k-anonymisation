@@ -45,7 +45,7 @@ def job_key(k_user: bytes, kind: str, name: str) -> bytes:
     contracts/bundle/README.md, "Column keys and token vaults". Derived (not random) so every executor
     and both explore_k phases (measure, apply) hash a value identically, yet different for every job
     because K_user is. Always 32 bytes; a user of a shorter key takes the first N bytes.
-    anamika-ray derives the same bytes (tests pin one shared vector in both repos).
+    workloads/ray in the control-plane repo derives the same bytes (tests pin one shared vector in both places).
     """
     if len(k_user) != 32:
         raise BundleError("K_user must be 32 bytes")

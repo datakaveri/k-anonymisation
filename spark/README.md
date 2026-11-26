@@ -1,7 +1,7 @@
-# anamika-spark
+# spark/ (anamika-spark)
 
 The Spark k-anonymity job of the Anamika keys-only architecture: SKALD's Rust core (`skald_core`) on PySpark,
-reading and writing the encrypted bundle in Blob. Part of the "new: anamika-spark" repo; the AO and
+reading and writing the encrypted bundle in Blob. Lives in the k-anonymisation repo as `spark/`, beside `SKALD/` (the Python package is still `anamika_spark`); the AO and
 Co-ordinator launch it (see `deploy/README.md`), the Ray image does the file jobs.
 
 ```
@@ -46,17 +46,17 @@ Executor failures cross Spark as `ANAMIKA_CODE=<CODE>` only, so a library error 
 ## Tests
 
 ```
-cd anamika-compute && .venv-skald/bin/python -m pytest anamika-spark/tests -q
+cd k-anonymisation/spark && ../../.venv-skald/bin/python -m pytest tests -q
 ```
 
-Spark `local[2]`, 1 GB driver. Corpus tests need the SKALD repo beside this one; the CLI-reference tests need a
+Spark `local[2]`, 1 GB driver. Corpus tests use `../SKALD` (same repo; `SKALD_DIR` overrides); the CLI-reference tests need a
 `skald_pipeline` binary (`SKALD_BIN`, or `SKALD/target/{release,debug}`), the NER tests need `anamika_ner`
 (`ANAMIKA_NER_SRC`). Absent pieces skip, not fail.
 
 ## Vendored code
 
-`bundle.py`, `kbs.py`, `logscrub.py` and the store classes in `io.py` come from `anamika-ray` and pass the same
-`vectors.json`. Both repos should later depend on one shared `anamika-bundle` Python package so the copies cannot drift.
+`bundle.py`, `kbs.py`, `logscrub.py` and the store classes in `io.py` are vendored from `anamika-control-plane` `workloads/ray` (`anamika_ray`) and pass the same
+`vectors.json`. Both should later depend on one shared `anamika-bundle` Python package so the copies cannot drift.
 
 ## Benchmark
 

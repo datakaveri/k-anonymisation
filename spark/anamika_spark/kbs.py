@@ -1,6 +1,6 @@
 """Fetch a job's keys inside the confidential pod (the Spark DRIVER only).
 
-Vendored from anamika-ray (same vector tests); both should later move to one shared
+Vendored from anamika-control-plane workloads/ray (same vector tests); both should later move to one shared
 `anamika-bundle` Python package so the three copies cannot drift.
 
 Inside a kata pod the Confidential Data Hub (CDH) listens on 127.0.0.1:8006 and
