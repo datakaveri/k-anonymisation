@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anamika-spark"
+version = "0.1.0"
+description = "PySpark k-anonymity job for the Anamika keys-only architecture (SKALD core on Spark, encrypted bundle in Blob)"
+requires-python = ">=3.10"
+# skald_core is a private wheel built from k-anonymisation/SKALD/python (maturin), not on PyPI.
+dependencies = ["cryptography>=41", "pyarrow>=14", "pyspark>=4.0"]
+
+[project.optional-dependencies]
+azure = ["azure-storage-blob>=12.19", "azure-identity>=1.15"]
+test = ["pytest", "jsonschema"]
+
+[tool.setuptools]
+packages = ["anamika_spark"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

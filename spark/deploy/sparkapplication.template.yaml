@@ -1,0 +1,88 @@
+# SparkApplication template for the Spark Operator (sparkoperator.k8s.io/v1beta2).
+#
+# A TEMPLATE: the Co-ordinator (separate repo, not changed from here) renders the ${VARIABLES} later. Every
+# value is a name, address or digest: nothing secret belongs in a pod spec, because anyone with cluster
+# access can read it. Keys come from KBS inside the attested guest (CDH on 127.0.0.1:8006).
+#
+# Variables
+#   JOB_ID            the job id (^[a-z0-9-]{6,64}$); also the Kubernetes name suffix
+#   PHASE             all | measure | apply   (Co-ordinator Spec.Phase)
+#   CHOICE            the approved grid cell id for PHASE=apply after explore_k, else empty (Spec.Choice)
+#   IMAGE             registry/repo of the anamika-spark image; IMAGE_DIGEST the sha256:... it is pinned to
+#   STORE_URL         https://<account>.blob.core.windows.net/<container>   (the job's staging container)
+#   EXECUTORS         executor count (Spec.Executors); the AO runs `local[*]` jobs another way, see README
+#   DRIVER_MEMORY / EXECUTOR_MEMORY / EXECUTOR_CORES   sizing
+#   INIT_DATA_B64     base64(gzip(init data TOML)) naming JOB_ID and IMAGE_DIGEST, so KBS releases keys
+#                     only to a guest running exactly this image for exactly this job
+#   AZURE_CLIENT_ID   client id of the user-assigned managed identity that can read/write the staging container
+#   NER_MODEL_REF, NER_SHA256   only when the manifest needs NER (otherwise delete these two env lines)
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: anamika-${JOB_ID}-${PHASE}
+  labels: { app: anamika-spark, anamika/job: "${JOB_ID}", anamika/phase: "${PHASE}" }
+spec:
+  type: Python
+  mode: cluster
+  pythonVersion: "3"
+  image: ${IMAGE}@${IMAGE_DIGEST}
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: local:///opt/anamika/main.py
+  sparkVersion: "4.3.0"
+  restartPolicy: { type: Never }            # a retry is a NEW contract id (anamika-{job}-{phase}-a{n}), not an in-place restart
+  timeToLiveSeconds: 300
+  sparkConf:
+    # Authoritative copy of the R1/R2 settings lives in spark-defaults.conf inside the image; repeated here
+    # for the two that must never be absent even if the image's conf is replaced.
+    spark.authenticate: "true"
+    spark.ui.enabled: "false"
+    spark.eventLog.enabled: "false"
+  volumes:
+    - name: anamika-run                     # RPC secret and Spark local dir: RAM inside the guest
+      emptyDir: { medium: Memory, sizeLimit: 2Gi }
+  driver:
+    cores: 1
+    memory: ${DRIVER_MEMORY}
+    serviceAccount: anamika-spark
+    runtimeClassName: kata-remote           # confidential VM (if the Operator's CRD lacks this field, use spark.kubernetes.driver.podTemplateFile)
+    annotations:
+      io.katacontainers.config.hypervisor.cc_init_data: "${INIT_DATA_B64}"
+    labels: { anamika/role: driver }
+    initContainers:
+      - name: spark-secret
+        image: ${IMAGE}@${IMAGE_DIGEST}
+        command: ["python", "-m", "anamika_spark.initsecret"]
+        env: [ { name: ANAMIKA_JOB, value: "${JOB_ID}" } ]
+        volumeMounts: [ { name: anamika-run, mountPath: /run/anamika } ]
+    env:
+      - { name: ANAMIKA_JOB, value: "${JOB_ID}" }
+      - { name: ANAMIKA_PHASE, value: "${PHASE}" }
+      - { name: ANAMIKA_CHOICE, value: "${CHOICE}" }
+      - { name: ANAMIKA_STORE_URL, value: "${STORE_URL}" }
+      - { name: ANAMIKA_NER_MODEL_REF, value: "${NER_MODEL_REF}" }
+      - { name: ANAMIKA_NER_SHA256, value: "${NER_SHA256}" }
+      # The pod's managed identity reaches Blob; no account key anywhere (azure-identity picks these up).
+      - { name: AZURE_CLIENT_ID, value: "${AZURE_CLIENT_ID}" }
+    volumeMounts: [ { name: anamika-run, mountPath: /run/anamika } ]
+    securityContext: { runAsNonRoot: true, allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
+  executor:
+    instances: ${EXECUTORS}
+    cores: ${EXECUTOR_CORES}
+    memory: ${EXECUTOR_MEMORY}
+    runtimeClassName: kata-remote
+    annotations:
+      io.katacontainers.config.hypervisor.cc_init_data: "${INIT_DATA_B64}"
+    labels: { anamika/role: executor }
+    initContainers:
+      - name: spark-secret
+        image: ${IMAGE}@${IMAGE_DIGEST}
+        command: ["python", "-m", "anamika_spark.initsecret"]
+        env: [ { name: ANAMIKA_JOB, value: "${JOB_ID}" } ]
+        volumeMounts: [ { name: anamika-run, mountPath: /run/anamika } ]
+    env:
+      - { name: ANAMIKA_JOB, value: "${JOB_ID}" }
+      - { name: ANAMIKA_NER_MODEL_REF, value: "${NER_MODEL_REF}" }
+      - { name: ANAMIKA_NER_SHA256, value: "${NER_SHA256}" }
+      - { name: AZURE_CLIENT_ID, value: "${AZURE_CLIENT_ID}" }
+    volumeMounts: [ { name: anamika-run, mountPath: /run/anamika } ]
+    securityContext: { runAsNonRoot: true, allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
